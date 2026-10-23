@@ -33,6 +33,7 @@ use crate::net::{ConnectionId, ControlLine, ControlState, WorkerId};
 use crate::reply::{DeferSlot, Link, Reply, SlotState, WAKE_REPLY, Waker};
 use crate::service::{BodyPolicy, Finished, HeadAction, Outcome, RequestEnd};
 
+pub(crate) mod session;
 #[cfg(all(test, feature = "http1"))]
 mod tests;
 
@@ -67,7 +68,6 @@ pub(crate) enum Timeout {
     /// The park deadline of a deferred reply.
     Park,
     /// Any transport deadline (idle, read, write).
-    #[allow(dead_code)] // raised by the net-io session (waits for net-io 0.3)
     Transport,
 }
 
@@ -97,7 +97,7 @@ pub(crate) trait Io {
 /// One listener's runtime facts.
 #[derive(Debug, Clone)]
 pub(crate) struct ListenerRuntime {
-    #[allow(dead_code)] // reported to the observer by the net-io session (waits for net-io 0.3)
+    #[allow(dead_code)] // reported to the observer with listener events (0.4)
     pub(crate) name: String,
     pub(crate) profile: ProfileId,
     pub(crate) proxy: Option<ProxySource>,

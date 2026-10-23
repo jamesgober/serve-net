@@ -606,6 +606,47 @@ pub struct Handler<F> {
     f: F,
 }
 
+/// Starts an HTTP/1.1 server and returns it running: one direct TCP listener
+/// per resolved address (`http-0`, `http-1`, ...), the default limits,
+/// keep-alive, workers, and hooks, and net-io's `AllowAll` gate.
+///
+/// ```no_run
+/// let server = serve_net::http("127.0.0.1:8080", |req, reply| {
+///     match req.path() {
+///         "/" => { reply.html(200, "<h1>It works</h1>"); }
+///         _ => { reply.text(404, "not found"); }
+///     }
+/// })?;
+/// server.wait();
+/// # Ok::<(), serve_net::ServeError>(())
+/// ```
+///
+/// # Errors
+///
+/// [`ServeError::Bind`](crate::ServeError::Bind) naming the address;
+/// [`ServeError::Config`](crate::ServeError::Config) with
+/// `RuleId::AddressResolve` when the address resolved to nothing.
+pub fn http<A, F>(addr: A, handler: F) -> Result<crate::Running, crate::ServeError>
+where
+    A: std::net::ToSocketAddrs,
+    F: Fn(&HttpRequest<'_>, &mut HttpReply) + Send + Sync + 'static,
+{
+    let addrs: Vec<std::net::SocketAddr> = addr
+        .to_socket_addrs()
+        .map(Iterator::collect)
+        .unwrap_or_default();
+    let mut builder = crate::Server::builder();
+    if addrs.is_empty() {
+        // Resolves to nothing: validation names the rule.
+        let none: &[std::net::SocketAddr] = &[];
+        builder = builder.listener(crate::ListenerSpec::tcp("http-0", none));
+    }
+    for (i, a) in addrs.iter().enumerate() {
+        builder = builder.listener(crate::ListenerSpec::tcp(&format!("http-{i}"), *a));
+    }
+    builder.serve(Handler { f: handler })
+}
+
 /// Turns a closure into an [`HttpService`] where a type is expected; the
 /// closure needs no annotations.
 ///

@@ -498,7 +498,7 @@ impl SimIo {
         SimIo {
             now,
             connection: SIM_CONNECTION,
-            worker: WorkerId::from_index(0),
+            worker: WorkerId::first(),
             written: Vec::with_capacity(16 * 1024),
             budget: None,
             deadline: None,

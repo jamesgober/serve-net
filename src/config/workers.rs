@@ -17,7 +17,6 @@ pub struct Workers {
 }
 
 /// The blocking pool's default thread count.
-#[allow(dead_code)] // read when the server binds through net-io (waits for net-io 0.3)
 pub(crate) const BLOCKING_DEFAULT: u16 = 256;
 
 impl Workers {
@@ -52,7 +51,6 @@ impl Workers {
     }
 
     /// The thread count the blocking pool runs with.
-    #[allow(dead_code)] // read when the server binds through net-io (waits for net-io 0.3)
     pub(crate) fn blocking_threads(&self) -> u16 {
         self.count.unwrap_or(BLOCKING_DEFAULT)
     }

@@ -4,10 +4,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::validate::{self, Draft};
-use crate::config::{KeepAlive, Limits, ListenerSpec, Profile, ProfileId, ProfileTable, Workers};
-use crate::error::{ConfigErrors, ConfigWarning};
+use crate::config::{
+    KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId, ProfileTable, Workers,
+};
+use crate::conn::session::{Factory, Runtime};
+use crate::conn::{ListenerRuntime, Shared};
+use crate::engine::{Family, Service};
+use crate::error::{ConfigErrors, ConfigWarning, ServeError};
 use crate::hooks::{Admit, Checkpoint, DefaultHooks, Dispatch, HookSet, Hooks, Observer};
 use crate::net::ControlLine;
+#[cfg(feature = "http1")]
+use crate::running::Running;
+use crate::running::{Bound, DrainSwitch, Merged};
 
 /// The entry point for Tier 2.
 ///
@@ -258,6 +266,21 @@ impl<H: Hooks> ServerBuilder<H> {
     }
 }
 
+impl<A: Admit, D: Dispatch, K: Checkpoint, O: Observer, C: ControlLine>
+    ServerBuilder<HookSet<A, D, K, O, C>>
+{
+    /// `build`, `bind`, and `open` in one call.
+    ///
+    /// # Errors
+    ///
+    /// [`ServeError::Config`] from validation, then as [`Built::bind`] and
+    /// [`Bound::open`].
+    #[cfg(feature = "http1")]
+    pub fn serve<S: crate::HttpService + 'static>(self, service: S) -> Result<Running, ServeError> {
+        self.build()?.bind(service)?.open()
+    }
+}
+
 impl<H> core::fmt::Debug for ServerBuilder<H> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ServerBuilder")
@@ -269,7 +292,7 @@ impl<H> core::fmt::Debug for ServerBuilder<H> {
 
 /// A validated configuration: nothing bound, no thread started.
 #[must_use]
-#[allow(dead_code)] // the fields are read by `bind` (waits for net-io 0.3)
+#[allow(dead_code)] // `keep_alive` and `accept_failure_window` are read by reload and health (0.4)
 pub struct Built<H: Hooks = DefaultHooks> {
     pub(crate) listeners: Vec<ListenerSpec>,
     pub(crate) profiles: ProfileTable,
@@ -293,6 +316,168 @@ impl<H: Hooks> Built<H> {
     #[must_use]
     pub fn profiles(&self) -> &ProfileTable {
         &self.profiles
+    }
+}
+
+impl<A: Admit, D: Dispatch, K: Checkpoint, O: Observer, C: ControlLine>
+    Built<HookSet<A, D, K, O, C>>
+{
+    /// Builds net-io's server for `service`: every listener is bound and the
+    /// workers start with the door closed.
+    ///
+    /// # Errors
+    ///
+    /// [`ServeError::Bind`] naming the listener, [`ServeError::Start`].
+    #[cfg(feature = "http1")]
+    pub fn bind<S: crate::HttpService + 'static>(self, service: S) -> Result<Bound, ServeError> {
+        self.bind_family(crate::HttpFamily, service)
+    }
+
+    /// As [`bind`](Self::bind), for a custom protocol family.
+    ///
+    /// # Errors
+    ///
+    /// As `bind`.
+    pub fn bind_family<F: Family, S: Service<F> + 'static>(
+        self,
+        family: F,
+        service: S,
+    ) -> Result<Bound, ServeError> {
+        let Built {
+            listeners,
+            profiles,
+            limits,
+            workers,
+            drain_deadline,
+            hooks,
+            ..
+        } = self;
+        // On the blocking driver every open connection holds a thread, and
+        // net-io refuses at accept once every thread is busy, so the busy
+        // refusal can only be written when the pool covers the soft cap plus
+        // its headroom (D-043, D-044).
+        let asked = workers.blocking_threads();
+        let soft = limits.max_connections.unwrap_or_else(|| {
+            let t = u32::from(asked);
+            t.saturating_sub(limits.headroom_for(t)).max(1)
+        });
+        let hard = soft.saturating_add(limits.headroom_for(soft));
+        let threads = u16::try_from(hard).unwrap_or(u16::MAX).max(asked);
+
+        let mut admit = hooks.admit;
+        admit.prepare(threads, &profiles);
+        let runtime_listeners = listeners
+            .iter()
+            .map(|l| ListenerRuntime {
+                name: l.name.clone(),
+                profile: l.profile,
+                proxy: l.ingress.proxy().cloned(),
+                declared_scheme: l.scheme,
+            })
+            .collect();
+        let listener_caps: Vec<Option<u32>> = listeners.iter().map(|l| l.max_connections).collect();
+        let profile_caps: Vec<Option<u32>> =
+            profiles.iter().map(|p| p.budget.max_connections).collect();
+        let rt = Arc::new(Runtime::new(
+            Some(soft),
+            &listener_caps,
+            &profile_caps,
+            threads,
+        ));
+
+        let mut global = net_io::Limits::builder()
+            .max_connections(hard)
+            .drain_timeout(drain_deadline);
+        if listeners.iter().any(|l| l.ingress.proxy().is_some()) {
+            // Behind a front end every connection comes from the front end,
+            // so net-io's per-source cap would cap the whole site. net-io 0.3
+            // applies the cap server-wide only, so it is lifted for the
+            // server (D-046).
+            global = global.max_per_source(hard, net_io::PrefixPolicy::DEFAULT);
+        }
+        let global = global.build().map_err(ServeError::Start)?;
+        let merged = Arc::new(Merged::new(Arc::clone(&hooks.control)));
+        let mut net = net_io::ServerBuilder::new()
+            .driver(workers.kind())
+            .workers(threads)
+            .limits(global)
+            .control(Arc::clone(&merged));
+        for spec in &listeners {
+            let ListenerSource::Tcp(addr) = spec.source else {
+                return Err(ServeError::Bind {
+                    listener: spec.name.clone(),
+                    source: net_io::NetError::NoAddresses,
+                });
+            };
+            let compiled = profiles.compiled(spec.profile);
+            let behind = spec.ingress.proxy().is_some();
+            let idle = compiled.map_or_else(
+                || KeepAlive::new().idle_for(behind),
+                |c| c.keep_alive.idle_for(behind),
+            );
+            let stall = compiled.map_or(limits.write_stall, |c| c.limits.write_stall);
+            let mut own = net_io::Limits::builder()
+                .idle_timeout(idle)
+                .write_timeout(stall);
+            if let Some(n) = spec.backlog {
+                own = own.backlog(n);
+            }
+            let listener_hard = spec
+                .max_connections
+                .map_or(hard, |n| n.saturating_add(limits.headroom_for(n)).min(hard));
+            if spec.max_connections.is_some() {
+                own = own.max_per_listener(listener_hard);
+            }
+            let own = own.build().map_err(ServeError::Start)?;
+            net = net.listener(net_io::ListenerSpec::tcp(addr).name(&spec.name).limits(own));
+        }
+        let shared = Arc::new(Shared::<F, S, HookSet<A, D, K, O, C>> {
+            family,
+            service,
+            admit,
+            dispatch: hooks.dispatch,
+            checkpoint: hooks.checkpoint,
+            observer: hooks.observer,
+            control: hooks.control,
+            profiles,
+            listeners: runtime_listeners,
+        });
+        let factory = Factory {
+            shared,
+            rt: Arc::clone(&rt),
+        };
+        let server = net
+            .sessions(factory)
+            .gate(net_io::AllowAll)
+            .build()
+            .map_err(|e| bind_error(&listeners, e))?;
+        let names = listeners.into_iter().map(|l| l.name).collect();
+        Ok(Bound::new(
+            server,
+            names,
+            merged as Arc<dyn DrainSwitch>,
+            rt,
+        ))
+    }
+}
+
+/// Names the listener a net-io bind error is about.
+fn bind_error(listeners: &[ListenerSpec], e: net_io::NetError) -> ServeError {
+    use net_io::NetError;
+    let addr = match &e {
+        NetError::Bind { addr, .. }
+        | NetError::AddrInUse { addr }
+        | NetError::AddrNotAvailable { addr } => Some(*addr),
+        NetError::PermissionDenied { .. } => None,
+        _ => return ServeError::Start(e),
+    };
+    let named = listeners
+        .iter()
+        .find(|l| matches!(l.source, ListenerSource::Tcp(a) if Some(a) == addr))
+        .or(listeners.first());
+    ServeError::Bind {
+        listener: named.map_or_else(String::new, |l| l.name.clone()),
+        source: e,
     }
 }
 

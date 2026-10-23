@@ -1,5 +1,5 @@
 //! loom models of serve-net's concurrency primitives. Run with
-//! `RUSTFLAGS="--cfg loom" cargo test --lib --release loom_tests`.
+//! `RUSTFLAGS="--cfg serve_net_loom" cargo test --lib --release loom_tests`.
 
 use std::sync::Arc;
 
@@ -9,7 +9,7 @@ use crate::config::{Budget, KeepAlive, Limits, Profile, ProfileId, ProfileTable}
 use crate::engine::Family;
 use crate::hooks::{Admit, InFlightCap};
 use crate::http::{HttpFamily, HttpReply};
-use crate::net::{ConnectionId, WorkerId};
+use crate::net::ConnectionId;
 use crate::reply::{DeferSlot, Link, PostFail, SlotState, Waker};
 use crate::snapshot::Snapshot;
 
@@ -104,24 +104,17 @@ fn loom_in_flight_shared_cap_is_exact() {
         let other = {
             let cap = Arc::clone(&cap);
             let env = env.clone();
-            thread::spawn(move || {
-                cap.admit(WorkerId::from_index(1), &env)
-                    .ok()
-                    .map(|a| (a, env))
-            })
+            thread::spawn(move || cap.admit_at(1, &env).ok().map(|a| (a, env)))
         };
-        let mine = cap.admit(WorkerId::from_index(0), &env).ok();
+        let mine = cap.admit_at(0, &env).ok();
         let theirs = other.join().unwrap();
         assert!(mine.is_some() != theirs.is_some(), "exactly one admission");
         if let Some(a) = mine {
-            cap.release(WorkerId::from_index(0), &env, a);
+            cap.release_at(0, &env, a);
         }
         if let Some((a, e)) = theirs {
-            cap.release(WorkerId::from_index(1), &e, a);
+            cap.release_at(1, &e, a);
         }
-        assert!(
-            cap.admit(WorkerId::from_index(0), &env).is_ok(),
-            "the slot came back"
-        );
+        assert!(cap.admit_at(0, &env).is_ok(), "the slot came back");
     });
 }

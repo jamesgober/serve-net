@@ -201,7 +201,18 @@ impl Admit for InFlightCap {
     }
 
     fn admit(&self, worker: WorkerId, env: &Envelope) -> Result<Admitted, Shed> {
-        let Some(shard) = self.shards.get(usize::from(worker.get())) else {
+        self.admit_at(worker.get(), env)
+    }
+
+    fn release(&self, worker: WorkerId, env: &Envelope, admitted: Admitted) {
+        self.release_at(worker.get(), env, admitted);
+    }
+}
+
+impl InFlightCap {
+    /// `admit` for the worker with this index.
+    pub(crate) fn admit_at(&self, worker: u16, env: &Envelope) -> Result<Admitted, Shed> {
+        let Some(shard) = self.shards.get(usize::from(worker)) else {
             // Not prepared: fail closed.
             return Err(Shed {
                 retry_after: Some(self.base),
@@ -218,7 +229,7 @@ impl Admit for InFlightCap {
         match self.caps.get(p).copied().unwrap_or(ProfileCap::None) {
             ProfileCap::None => {}
             ProfileCap::Shares => {
-                let share = self.shares[p * usize::from(self.workers) + usize::from(worker.get())];
+                let share = self.shares[p * usize::from(self.workers) + usize::from(worker)];
                 let count = &shard.profiles[p];
                 let c = count.load(Ordering::Relaxed);
                 if c >= share {
@@ -251,8 +262,9 @@ impl Admit for InFlightCap {
         Ok(Admitted { token })
     }
 
-    fn release(&self, worker: WorkerId, env: &Envelope, admitted: Admitted) {
-        let Some(shard) = self.shards.get(usize::from(worker.get())) else {
+    /// `release` for the worker with this index.
+    pub(crate) fn release_at(&self, worker: u16, env: &Envelope, admitted: Admitted) {
+        let Some(shard) = self.shards.get(usize::from(worker)) else {
             return;
         };
         let now = shard.in_flight.load(Ordering::Relaxed);
@@ -316,15 +328,15 @@ mod tests {
     fn test_in_flight_cap_per_worker_boundary() {
         let mut cap = InFlightCap::new().per_worker(2);
         cap.prepare(1, &table(&[None]));
-        let w = WorkerId::from_index(0);
-        let a = cap.admit(w, &env(0)).unwrap();
-        let b = cap.admit(w, &env(0)).unwrap();
-        let shed = cap.admit(w, &env(0)).unwrap_err();
+        let w = 0;
+        let a = cap.admit_at(w, &env(0)).unwrap();
+        let b = cap.admit_at(w, &env(0)).unwrap();
+        let shed = cap.admit_at(w, &env(0)).unwrap_err();
         assert!(shed.retry_after.unwrap() >= Duration::from_secs(1));
         assert!(shed.retry_after.unwrap() < Duration::from_secs(2));
-        cap.release(w, &env(0), a);
-        assert!(cap.admit(w, &env(0)).is_ok());
-        cap.release(w, &env(0), b);
+        cap.release_at(w, &env(0), a);
+        assert!(cap.admit_at(w, &env(0)).is_ok());
+        cap.release_at(w, &env(0), b);
     }
 
     #[test]
@@ -333,13 +345,13 @@ mod tests {
         cap.prepare(8, &table(&[Some(3)]));
         let mut held = Vec::new();
         for k in 0..3u16 {
-            held.push((k, cap.admit(WorkerId::from_index(k), &env(0)).unwrap()));
+            held.push((k, cap.admit_at(k, &env(0)).unwrap()));
         }
         // Any worker is refused once the profile is full.
-        assert!(cap.admit(WorkerId::from_index(7), &env(0)).is_err());
+        assert!(cap.admit_at(7, &env(0)).is_err());
         let (k, a) = held.pop().unwrap();
-        cap.release(WorkerId::from_index(k), &env(0), a);
-        assert!(cap.admit(WorkerId::from_index(7), &env(0)).is_ok());
+        cap.release_at(k, &env(0), a);
+        assert!(cap.admit_at(7, &env(0)).is_ok());
     }
 
     #[test]
@@ -348,7 +360,7 @@ mod tests {
         cap.prepare(4, &table(&[Some(18)]));
         let mut total = 0;
         for k in 0..4u16 {
-            while cap.admit(WorkerId::from_index(k), &env(0)).is_ok() {
+            while cap.admit_at(k, &env(0)).is_ok() {
                 total += 1;
             }
         }
@@ -358,18 +370,18 @@ mod tests {
     #[test]
     fn test_in_flight_cap_unprepared_fails_closed() {
         let cap = InFlightCap::new();
-        assert!(cap.admit(WorkerId::from_index(0), &env(0)).is_err());
+        assert!(cap.admit_at(0, &env(0)).is_err());
     }
 
     #[test]
     fn test_in_flight_cap_counters_return_to_zero() {
         let mut cap = InFlightCap::new().per_worker(10);
         cap.prepare(2, &table(&[Some(1), None]));
-        let w = WorkerId::from_index(1);
-        let a = cap.admit(w, &env(0)).unwrap();
-        let b = cap.admit(w, &env(1)).unwrap();
-        cap.release(w, &env(0), a);
-        cap.release(w, &env(1), b);
+        let w = 1;
+        let a = cap.admit_at(w, &env(0)).unwrap();
+        let b = cap.admit_at(w, &env(1)).unwrap();
+        cap.release_at(w, &env(0), a);
+        cap.release_at(w, &env(1), b);
         assert_eq!(cap.shards[1].in_flight.load(Ordering::Relaxed), 0);
         assert_eq!(cap.shared[0].load(Ordering::Relaxed), 0);
     }
@@ -380,10 +392,10 @@ mod tests {
             .per_worker(1)
             .retry_after(Duration::from_secs(5));
         cap.prepare(1, &table(&[None]));
-        let w = WorkerId::from_index(0);
-        let _held = cap.admit(w, &env(0)).unwrap();
+        let w = 0;
+        let _held = cap.admit_at(w, &env(0)).unwrap();
         for _ in 0..1000 {
-            let r = cap.admit(w, &env(0)).unwrap_err().retry_after.unwrap();
+            let r = cap.admit_at(w, &env(0)).unwrap_err().retry_after.unwrap();
             assert!(
                 r >= Duration::from_secs(5) && r < Duration::from_secs(10),
                 "{r:?}"

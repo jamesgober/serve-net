@@ -93,7 +93,7 @@ jobs:
     name: Loom models
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: "--cfg loom -D warnings"
+      RUSTFLAGS: "--cfg serve_net_loom -D warnings"
       LOOM_MAX_PREEMPTIONS: "3"
     steps:
       - uses: actions/checkout@v5

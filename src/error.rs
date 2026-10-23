@@ -313,6 +313,15 @@ impl std::error::Error for ConfigErrors {}
 pub enum ServeError {
     /// The configuration was refused; every error is listed.
     Config(ConfigErrors),
+    /// A listener could not be bound.
+    Bind {
+        /// The listener's name.
+        listener: String,
+        /// Why: in use, permission, or not on this host.
+        source: net_io::NetError,
+    },
+    /// net-io could not start its workers or open the door.
+    Start(net_io::NetError),
     /// The operation needs a server that is not draining.
     Draining,
 }
@@ -321,6 +330,10 @@ impl fmt::Display for ServeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ServeError::Config(errors) => write!(f, "{errors}"),
+            ServeError::Bind { listener, source } => {
+                write!(f, "listener `{listener}` could not be bound: {source}")
+            }
+            ServeError::Start(source) => write!(f, "the server could not start: {source}"),
             ServeError::Draining => {
                 f.write_str("the server is draining; start a new server instead")
             }
@@ -332,6 +345,7 @@ impl std::error::Error for ServeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ServeError::Config(errors) => Some(errors),
+            ServeError::Bind { source, .. } | ServeError::Start(source) => Some(source),
             ServeError::Draining => None,
         }
     }

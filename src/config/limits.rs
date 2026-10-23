@@ -183,7 +183,6 @@ impl Limits {
 
     /// The headroom of net-io's hard cap above `soft`.
     #[must_use]
-    #[allow(dead_code)] // read when the server binds through net-io (waits for net-io 0.3)
     pub(crate) fn headroom_for(&self, soft: u32) -> u32 {
         match self.hard_cap_headroom {
             Some(n) => n,

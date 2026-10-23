@@ -24,6 +24,17 @@
 - Counting-allocator tests (zero allocations per request in steady state),
   property tests, four fuzz targets with a CI smoke job, loom models with a
   CI job, and criterion benchmarks.
+- The server over net-io 0.3: `serve_net::http`, `Built::bind`,
+  `bind_family`, `Bound`, `ServerBuilder::serve`, `Running` (`local_addr`,
+  `close_door`, `drain`, `drain_handle`, `wait`, `server_handle`),
+  `DrainHandle`, `DrainReport`, `ServeError::Bind` and `Start`; soft
+  connection caps answered with 503; loopback socket tests.
+
+### Changed
+
+- The net-io items serve-net names (`ConnectionId`, `WorkerId`, `Lane`,
+  `Cidr`, `TrustedProxies`, `ControlLine`, `ControlState`, `DriverKind`, and
+  the rest) are now re-exported from net-io instead of defined here.
 
 ---
 

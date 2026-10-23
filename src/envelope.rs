@@ -132,7 +132,7 @@ pub(crate) mod tests {
             client: ClientInfo::direct("127.0.0.1:1".parse().unwrap(), false),
             arrived: now,
             deadline: now,
-            worker: WorkerId::from_index(0),
+            worker: WorkerId::first(),
             user_word: 0,
         }
     }
