@@ -626,13 +626,26 @@ fn test_drain_sets_close_signal() {
 }
 
 #[test]
-fn test_pressure_closes_keep_alive_on_blocking() {
+fn test_idle_flood_blocking_pool_shortens_keep_alive() {
+    // FR-58, T-4: above 75% busy the next idle wait is 2 s; above 90% replies close.
     let (mut c, mut io) = conn(Counting::default(), Profile::new(ProfileId(0)));
     c.on_open(&mut io, false);
+    io.pressure = 0.74;
+    assert_eq!(c.on_data(&mut io, GET).1, Step::Read);
+    assert_eq!(io.idle_timeout, None);
     io.pressure = 0.8;
+    assert_eq!(c.on_data(&mut io, GET).1, Step::Read);
+    assert_eq!(io.idle_timeout, Some(Duration::from_secs(2)));
+    io.pressure = 0.5;
+    assert_eq!(c.on_data(&mut io, GET).1, Step::Read);
+    assert_eq!(
+        io.idle_timeout, None,
+        "the listener's idle timeout is restored"
+    );
+    io.pressure = 0.95;
     let (_, step) = c.on_data(&mut io, GET);
     assert_eq!(step, Step::Close);
-    assert!(replies(&io.written)[0].closes);
+    assert!(replies(&io.written).last().unwrap().closes);
 }
 
 #[test]

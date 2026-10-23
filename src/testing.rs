@@ -24,9 +24,7 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
-#[cfg(test)]
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::Finished;
 use crate::client::{ClientInfo, Scheme};
@@ -470,6 +468,8 @@ pub(crate) struct SimIo {
     pub(crate) phase: Phase,
     pub(crate) draining: bool,
     pub(crate) pressure: f32,
+    /// The per-connection idle override the machine last set.
+    pub(crate) idle_timeout: Option<Duration>,
     pub(crate) wakes: Arc<SimWaker>,
 }
 
@@ -505,6 +505,7 @@ impl SimIo {
             phase: Phase::Idle,
             draining: false,
             pressure: 0.0,
+            idle_timeout: None,
             wakes: Arc::new(SimWaker::default()),
         }
     }
@@ -539,6 +540,9 @@ impl Io for SimIo {
     }
     fn set_phase(&mut self, phase: Phase) {
         self.phase = phase;
+    }
+    fn set_idle_timeout(&mut self, timeout: Option<Duration>) {
+        self.idle_timeout = timeout;
     }
     fn push(&mut self, bytes: &[u8]) -> usize {
         let n = match &mut self.budget {

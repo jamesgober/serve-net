@@ -1731,7 +1731,7 @@ How long a connection stays open between requests.
 
 - **Idle timeout.** Between requests a connection closes without a response after `idle`. The default depends on the listener's ingress: 20 s on direct listeners (browsers hold many idle connections; a blocking worker is held while idle) and 60 s behind a proxy or FastCGI front end, because the backend must outlive the front end's reuse window or the front end reuses a connection the backend is closing and answers 502 (behind Apache, keep `ProxyPass ... ttl=` below it).
 - **Requests per connection** and **age**: the response that reaches `max_requests`, and the first response after `max_age`, carry the close signal; an idle connection past its age is closed.
-- **Under pressure** (blocking driver, where every connection holds a thread): above 75% of threads busy the idle timeout of a connection returning to idle is `under_pressure`; above 90% every response carries the close signal. Until net-io offers a per-connection idle override, serve-net sets the close signal from 75%, which frees threads sooner at the cost of reconnects (dev/PLAN.md section 8.10).
+- **Under pressure** (blocking driver, where every connection holds a thread): above 75% of threads busy the idle timeout of a connection returning to idle is `under_pressure`; above 90% every response carries the close signal. The shortened idle is net-io's per-connection idle override, set at each response.
 
 P0, Tier 2, `0.3.0`.
 

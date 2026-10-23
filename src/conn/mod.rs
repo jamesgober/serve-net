@@ -79,6 +79,9 @@ pub(crate) trait Io {
     fn set_exchange_deadline(&mut self, at: Option<Instant>);
     /// Which transport deadlines run.
     fn set_phase(&mut self, phase: Phase);
+    /// This connection's idle timeout from its next idle wait; `None`
+    /// restores the listener's (net-io `SessionContext::set_idle_timeout`).
+    fn set_idle_timeout(&mut self, timeout: Option<Duration>);
     /// Hands as much of `bytes` as the output budget allows; returns the count.
     fn push(&mut self, bytes: &[u8]) -> usize;
     /// Whether the server is draining.
@@ -145,6 +148,8 @@ struct Request {
 
 /// The pressure above which keep-alive adapts (blocking driver).
 const PRESSURE_SHORTEN: f32 = 0.75;
+/// The pressure above which every reply carries the close signal.
+const PRESSURE_CLOSE: f32 = 0.9;
 /// Output capacity a connection starts with: every refusal and a typical
 /// small reply fit without growing it.
 const OUT_INITIAL: usize = 1024;
@@ -1013,7 +1018,19 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         }
         let k = self.keep_alive();
         let now = io.now();
-        let pressured = !k.under_pressure.is_zero() && io.pressure() >= PRESSURE_SHORTEN;
+        // Keep-alive under pressure (FR-58): above PRESSURE_SHORTEN the next
+        // idle wait is `under_pressure`; above PRESSURE_CLOSE the reply closes.
+        let pressure = if k.under_pressure.is_zero() {
+            0.0
+        } else {
+            io.pressure()
+        };
+        let pressured = pressure >= PRESSURE_CLOSE;
+        io.set_idle_timeout(if pressure >= PRESSURE_SHORTEN {
+            Some(k.under_pressure)
+        } else {
+            None
+        });
         let mut close = !k.on
             || outcome == Outcome::Close
             || u64::from(self.seq) >= u64::from(k.max_requests)
