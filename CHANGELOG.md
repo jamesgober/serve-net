@@ -13,6 +13,53 @@
 
 ---
 
+## [0.2.0] - 2026-10-23
+
+The design lock: the public API is written down in full and the design
+behind it recorded, reconciled with net-io's own 0.2 design lock. Still no
+functional code; `0.3.0` is the first working server and waits for net-io
+`0.3.0`.
+
+### Added
+
+- `docs/API.md`: every public item from `0.3.0` to `1.0.0` with its
+  signature, behaviour, errors, cost target, grade, tier, the version that
+  ships it, and examples. Tier 1 is `http`, `http_behind_proxy`, and
+  `fastcgi`; Tier 2 is `Server::builder()`; Tier 3 covers custom protocol
+  engines and families, admission, dispatch, revocation checkpoints,
+  observation, readiness, and live tables.
+- `dev/PLAN.md`: the requirements (FR-1 to FR-69, NFR-1 to NFR-24), what
+  net-io does and what serve-net does, the connection state machine, ingress
+  normalization and the trusted walk, admission and lanes, the control line,
+  drain and restarts, reload, 40 threats each with its defence, test, and
+  cost, 26 validation rules, performance targets, the testing plan, the
+  enterprise and distributed requirements, upstream requests, and decisions
+  D-006 to D-035.
+- `dev/ROADMAP.md`: core (0.3), extended (0.4), feature complete (0.5),
+  optimisation (0.6), hardening (0.7), alpha (0.8), beta (0.9), stable
+  (1.0), with the upstream version each one needs.
+
+### Changed
+
+- serve-net is now the public, generic engine that applications wrap: the
+  fixed security pipeline and the service core were removed from its scope
+  (the wrapping application builds them on serve-net's hooks), and the
+  connection gate is installed on net-io by the owner.
+- serve-net runs on net-io's server: its per-connection engine is a net-io
+  session, and net-io owns accepting, worker threads, the door, transport
+  deadlines, hard caps, kill, and drain mechanics.
+- `dev/DIRECTIVES.md`: the project invariants were rewritten as hand-off
+  order invariants.
+- The crate description, README, and crate documentation were brought in
+  line with the new scope.
+
+### Removed
+
+- CGI mode. Services run as persistent processes; FastCGI covers shared
+  hosting.
+
+---
+
 ## [0.1.0] - 2026-10-13
 
 The scaffold and the plan. No functional code yet.
@@ -25,5 +72,6 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/jamesgober/serve-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/serve-net/releases/tag/v0.1.0

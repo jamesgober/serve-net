@@ -12,7 +12,7 @@ This library is built and maintained to a production standard and treated as a f
 
 ## 1. What this is
 
-serve-net is the network service engine: listeners and workers over net-io, the per-connection engine, the protocol engine slot, ingress normalization, the fixed pipeline slots with connection-gate checkpoints, responses through the egress check, drain, and the service core. It is not the web framework and does no routing. See `PLAN.md` sections 1 and 2.
+serve-net is the network service engine: named listeners over net-io's server, ingress normalization into one request per protocol family, the per-connection engine (a net-io session) with a slot for any sans-IO protocol engine, request deadlines, keep-alive, admission, the hand-off to the service through a few hooks, drain, and readiness. It is not the web framework, does no routing, and runs no security pipeline of its own: the application that wraps it builds that on its hooks. See `PLAN.md` sections 1, 2, and 8.2.
 
 ---
 
@@ -49,17 +49,19 @@ serve-net is the network service engine: listeners and workers over net-io, the 
 
 ## 4. Project-specific invariants
 
-- Every accepted connection passes the connection-gate door before a byte is read.
-- Pipeline slots run in their fixed order; a refusal in any slot runs no later slot.
-- A connection-gate checkpoint runs between every pair of slots.
-- Every response is written through the egress check.
-- Every ingress mode yields an identical request for the same input.
-- Proxy, FastCGI, and CGI listeners never bind to a public address without explicit override.
+- No request byte beyond the head is processed before `Admit` admitted the request; a slow or half-sent head never holds an admission slot.
+- The hand-off order is fixed: control checkpoint, `head`, `Admit`, `Checkpoint`, 100-continue, body, `Dispatch`, the service call; a refusal at any step runs no later step.
+- `done` runs exactly once for every request that reached `head`, on every path.
+- A reply is pushed into net-io's output whole before it is written, so the gate's egress check and a `Checkpoint` denial never split a reply.
+- Every connection ends with exactly one `EndReason`.
+- Every HTTP ingress mode yields an identical request and `ClientInfo` for the same input.
+- Proxy and FastCGI listeners never bind to a public address without an override that names its reason.
+- Client facts from a front end are believed only from trusted peers; when the check cannot run, the request is refused.
 
 ---
 
 ## 5. Writing style
 
 - Plain, specific, human prose in every shipping file. No marketing voice.
-- Banned in shipping files: "comprehensive", "robust", "seamless", "leverage", and the em-dash character (U+2014) in prose.
+- Banned in shipping files: the four marketing words listed in `REPS.md` (section on writing), emoji, and the em-dash character (U+2014) in prose. Public files name no private product.
 - Commits: imperative present tense, descriptive subject line.
