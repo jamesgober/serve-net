@@ -44,14 +44,18 @@ path = "src/lib.rs"
 # FEATURE FLAGS
 # #################################
 [features]
-default = []
+default = ["http1"]
+# The HTTP family over http-net: HttpService, HttpRequest, HttpReply,
+# engine::Http1, the Tier 1 functions, and the testing helpers.
+http1 = ["dep:http-net"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-# None in 0.2.0 (design lock). From 0.3.0: net-io (required) and http-net
-# (feature http1), each at a published version; see dev/PLAN.md section 3.2.
+# First-party crates at published versions only (dev/PLAN.md section 3.2).
+# net-io (required) is added the day net-io 0.3 is published.
+http-net = { version = "0.6", default-features = false, optional = true }
 
 
 # DEV DEPENDENCIES

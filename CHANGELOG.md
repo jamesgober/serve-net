@@ -11,6 +11,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- The 0.3 core that does not need net-io's code, on branch `feature/0.3-core`
+  (not released; it waits for net-io 0.3): forwarded-header ingress with the
+  right-to-left trusted walk, client normalization, configuration and its
+  validation rules, the builder, the engine and family traits, the HTTP/1.1
+  engine over http-net 0.6, the HTTP request and reply types, deferred
+  replies, admission (`InFlightCap`), checkpoints, observation, snapshots,
+  the connection state machine, and `testing` helpers that run a service
+  without sockets.
+
 ---
 
 ## [0.2.0] - 2026-10-23

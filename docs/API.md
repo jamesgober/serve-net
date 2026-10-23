@@ -1046,6 +1046,7 @@ The FastCGI ingress options. `REMOTE_ADDR` is believed only because only trusted
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClientInfo { /* private */ }
 impl ClientInfo {
+    pub fn direct(peer: SocketAddr, tls: bool) -> ClientInfo;   // a client that connected itself (custom families, tests)
     pub fn addr(&self) -> Option<IpAddr>;               // None only when a walk ended at unknown or an obfuscated id
     pub fn port(&self) -> u16;                          // 0 when not known
     pub fn socket_addr(&self) -> Option<SocketAddr>;    // addr and port together
@@ -1258,7 +1259,7 @@ Feature `http1` (and `fastcgi`, which produces the same types). Every HTTP ingre
 ### `HttpService`
 
 ```rust
-pub trait HttpService: Send + Sync + 'static {
+pub trait HttpService: Send + Sync {
     const WORK: WorkClass = WorkClass::Quick;
 
     fn head(&self, head: &HttpHead<'_>, env: &mut Envelope) -> HeadAction {
@@ -1288,7 +1289,7 @@ The contract between serve-net and an HTTP service, in the order serve-net calls
 | `upgraded` | after a 101 the service asked for | own the new conversation | |
 | `done` | exactly once per request that reached `head`, on every path, after the last reply byte was handed to net-io or the request ended any other way | return per-request resources, record metrics | fail (it returns `()`) |
 
-`WORK` says how the service behaves ([`WorkClass`](#workclass)); [`Dispatch`](#dispatch-inline) implementations use it. A service reports failure through the reply (a status) or `Outcome::Close`; a panic is handled per [`catch_service_panics`](#serverbuilder-configuration).
+A service used by a running server must also be `'static` (it moves to the worker threads); `bind` requires it. The traits themselves do not, so `testing::respond` can borrow a service (D-038). `WORK` says how the service behaves ([`WorkClass`](#workclass)); [`Dispatch`](#dispatch-inline) implementations use it. A service reports failure through the reply (a status) or `Outcome::Close`; a panic is handled per [`catch_service_panics`](#serverbuilder-configuration).
 
 | Grade | Tier | Version | Cost |
 |---|---|---|---|
@@ -2366,8 +2367,12 @@ pub trait Engine: Send + 'static {
 
     fn feed(&mut self, bytes: &[u8]) -> usize;                 // copies what fits; returns the count taken
     fn feed_eof(&mut self);
-    fn poll(&mut self) -> Result<EngineEvent<'_, Self::Head<'_>>, EngineError>;
-    fn head(&self) -> Option<Self::Head<'_>>;                  // the current request's head again
+    fn poll(&mut self) -> Result<EngineEvent<'_>, EngineError>;
+    fn head(&self) -> Option<Self::Head<'_>>;                  // the current request's head
+    fn declared_length(&self) -> Option<u64>;                  // the current request's declared body length
+    fn expects_continue(&self) -> bool { false }
+    fn head_len(&self) -> usize { 0 }                          // bytes of the current head, for accounting
+    fn keep_alive(&self) -> bool;                              // can the connection carry another request
     fn progress(&self) -> EngineProgress;
     fn send_continue(&mut self, out: &mut OutBuf) -> Result<(), EngineError> { let _ = out; Ok(()) }
     fn refuse(&mut self, refusal: &Refusal, out: &mut OutBuf);  // never fails: an engine that cannot write closes
@@ -2380,14 +2385,14 @@ pub trait Engine: Send + 'static {
 
 #[non_exhaustive]
 #[derive(Debug)]
-pub enum EngineEvent<'a, H> { Head(H), Body(&'a [u8]), BodyEnd, NeedInput, AwaitingReply, Upgraded, Closed }
+pub enum EngineEvent<'a> { Head, Body(&'a [u8]), BodyEnd, NeedInput, AwaitingReply, Upgraded, Closed }
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EngineProgress { Idle, Head, Body, AwaitingReply, WritingReply, Upgraded, Closed }
 ```
 
-A sans-IO protocol engine: bytes in, events out; replies in, bytes out. serve-net does every read and write: it feeds the engine from net-io's input buffer, polls until `NeedInput` (or `AwaitingReply`, `Upgraded`, `Closed`), and writes what the engine encoded. `progress` drives the deadlines (`Head` starts the head deadline, `Body` the body under the request deadline). The shape follows http-net's `ServerConn`, ws-net's `Connection`, and fcgi-net's responder, which all feed and poll. P0, Tier 3, `0.3.0`.
+A sans-IO protocol engine: bytes in, events out; replies in, bytes out. `EngineEvent::Head` carries no value: the head is read with `head()`, so the event's borrow of the engine ends before serve-net reads it (D-036). serve-net does every read and write: it feeds the engine from net-io's input buffer, polls until `NeedInput` (or `AwaitingReply`, `Upgraded`, `Closed`), and writes what the engine encoded. `progress` drives the deadlines (`Head` starts the head deadline, `Body` the body under the request deadline). The shape follows http-net's `ServerConn`, ws-net's `Connection`, and fcgi-net's responder, which all feed and poll. P0, Tier 3, `0.3.0`.
 
 ### `EngineError`, `Refusal`, `RefusalKind`
 
@@ -2428,15 +2433,20 @@ pub trait Family: Send + Sync + 'static {
     type Engine: Engine;
     type Head<'a>;                      // the head view a service sees
     type Request<'a>;                   // the request a service answers
-    type Parts: Send + 'static;         // the reply data a service fills
+    type Parts: Default + Send + 'static;   // the reply data a service fills
 
-    fn engine(&self, profile: &Profile) -> Self::Engine;
-    fn head<'a>(&self, raw: <Self::Engine as Engine>::Head<'a>, client: &'a ClientInfo) -> Self::Head<'a>;
+    fn engine(&self, profile: &Profile, limits: &Limits) -> Self::Engine;
+    fn head<'a>(&self, raw: <Self::Engine as Engine>::Head<'a>, cx: &HeadContext<'_>)
+        -> Result<(Self::Head<'a>, ClientInfo), EngineError>;           // the view and the request's client
     fn request<'a>(&self, head: Self::Head<'a>, body: &'a [u8]) -> Self::Request<'a>;
     fn new_parts(&self) -> Self::Parts;
-    fn clear_parts(&self, parts: &mut Self::Parts);
-    fn respond(&self, engine: &mut Self::Engine, parts: &mut Self::Parts, out: &mut OutBuf) -> Result<(), EngineError>;
+    fn clear_parts(&self, parts: &mut Self::Parts, wipe: bool);
+    fn respond(&self, engine: &mut Self::Engine, parts: &mut Self::Parts, unix_secs: u64, out: &mut OutBuf)
+        -> Result<u16, EngineError>;                                    // the status written
 }
+
+pub struct HeadContext<'c> { /* the connection's client and the listener's ingress rules */ }
+impl HeadContext<'_> { pub fn client(&self) -> &ClientInfo; }
 
 pub struct Reply<F: Family> { /* F::Parts and the link to its connection */ }
 impl<F: Family> Reply<F> {
@@ -2456,7 +2466,7 @@ A family is a set of engines that produce the same request view; that is what ma
 ### `Service`
 
 ```rust
-pub trait Service<F: Family>: Send + Sync + 'static {
+pub trait Service<F: Family>: Send + Sync {
     const WORK: WorkClass = WorkClass::Quick;
     fn head(&self, head: &F::Head<'_>, env: &mut Envelope) -> HeadAction { let _ = (head, env); HeadAction::Proceed }
     fn call(&self, request: &F::Request<'_>, env: &Envelope, reply: &mut Reply<F>) -> Outcome;

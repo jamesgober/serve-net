@@ -18,6 +18,55 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+// Without the HTTP family nothing drives the connection machine until the
+// net-io session does (dev/ROADMAP.md, v0.3.0, wire-up items).
+#![cfg_attr(not(feature = "http1"), allow(dead_code))]
+
+mod client;
+mod config;
+mod conn;
+pub mod engine;
+mod envelope;
+mod error;
+mod forwarded;
+mod hooks;
+#[cfg(feature = "http1")]
+mod http;
+mod net;
+mod reply;
+mod server;
+mod service;
+mod snapshot;
+#[cfg(feature = "http1")]
+pub mod testing;
+
+pub use client::{ClientInfo, IngressKind, Scheme};
+pub use config::{
+    Budget, EngineChoice, ForwardedSource, Ingress, KeepAlive, Limits, ListenerSource,
+    ListenerSpec, MissingHeader, Profile, ProfileId, ProfileTable, ProxySource, UnknownClient,
+    Workers,
+};
+pub use envelope::{Envelope, RequestSeq};
+pub use error::{ConfigError, ConfigErrors, ConfigWarning, EndReason, RuleId, ServeError, Subject};
+pub use hooks::{
+    Admit, Admitted, Checkpoint, CheckpointAt, DefaultHooks, Dispatch, HookSet, Hooks, InFlightCap,
+    Inline, NoCheckpoint, NoObserver, Observer, Shed, Verdict,
+};
+#[cfg(feature = "http1")]
+pub use http::{
+    Fields, Handler, HttpBody, HttpFamily, HttpHead, HttpParts, HttpReply, HttpRequest,
+    HttpService, handler,
+};
+#[cfg(feature = "http1")]
+pub use http_net::{Method, Version};
+pub use net::{
+    AddrError, Cidr, ConnectionId, ControlLine, ControlState, DriverKind, Lane, NoControl,
+    ProxyVersions, SimpleControl, TrustedProxies, WorkerId,
+};
+pub use reply::{CompleteError, Reply, ReplyToken};
+pub use server::{Built, Server, ServerBuilder};
+pub use service::{BodyPolicy, Finished, HeadAction, Outcome, RequestEnd, WorkClass};
+pub use snapshot::{Snapshot, SnapshotReader};
 
 /// Crate version string, populated by Cargo at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
