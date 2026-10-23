@@ -226,6 +226,152 @@ impl TestReply {
     }
 }
 
+/// One keep-alive connection to a service, kept across requests, for tests of
+/// keep-alive, pipelining, and per-connection behaviour.
+///
+/// ```
+/// use serve_net::testing::TestConnection;
+///
+/// let mut conn = TestConnection::new(serve_net::handler(|req, reply| { reply.text(200, req.path()); }));
+/// let replies = conn.send(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+/// assert_eq!(replies.len(), 2);
+/// assert_eq!(replies[1].text(), "/b");
+/// assert!(conn.is_open());
+/// ```
+pub struct TestConnection<S: HttpService> {
+    conn: Conn<HttpFamily, S, DefaultHooks>,
+    io: SimIo,
+    open: bool,
+}
+
+impl<S: HttpService> TestConnection<S> {
+    /// A connection from 127.0.0.1:40000 to `service` with the default profile.
+    pub fn new(service: S) -> Self {
+        Self::with_profile(service, Profile::new(ProfileId(0)))
+    }
+
+    /// A connection whose requests run under `profile`.
+    pub fn with_profile(service: S, profile: Profile) -> Self {
+        Self::build(service, profile, None)
+    }
+
+    /// A connection from a proxy at 127.0.0.1 configured with `source`, so
+    /// forwarded headers decide the client of each request; requests run
+    /// under `profile`.
+    pub fn behind(service: S, source: ProxySource, profile: Profile) -> Self {
+        Self::build(service, profile, Some(source))
+    }
+
+    fn build(service: S, mut profile: Profile, proxy: Option<ProxySource>) -> Self {
+        profile.id = ProfileId(0);
+        let (shared, _) = shared(service, profile, proxy, Scheme::Http);
+        let mut io = SimIo::new(Instant::now());
+        let client = ClientInfo::direct(SocketAddr::from(([127, 0, 0, 1], 40000)), false);
+        let mut conn = Conn::new(shared, 0, io.connection, client, io.now, io.worker);
+        let open = conn.on_open(&mut io, false) == Step::Read;
+        TestConnection { conn, io, open }
+    }
+
+    /// Sends `bytes` and returns every reply they produced.
+    pub fn send(&mut self, bytes: &[u8]) -> Vec<TestReply> {
+        let mut out = Vec::new();
+        self.send_into(bytes, &mut out);
+        let mut replies = Vec::new();
+        let mut rest = out.as_slice();
+        while !rest.is_empty() {
+            let reply = TestReply::parse(rest, false);
+            let used = reply_len(rest).max(1);
+            replies.push(reply);
+            rest = &rest[used.min(rest.len())..];
+        }
+        replies
+    }
+
+    /// Sends `bytes` and appends the raw bytes written to `out`. Allocates
+    /// nothing once the connection and `out` have warmed up.
+    pub fn send_into(&mut self, bytes: &[u8], out: &mut Vec<u8>) {
+        let mut input = bytes;
+        let mut step = Step::Read;
+        while self.open {
+            match step {
+                Step::Close | Step::Abort => {
+                    self.open = false;
+                    self.conn.on_close(false);
+                }
+                Step::Write => step = self.conn.on_writable(&mut self.io),
+                Step::Park { .. } => match self.io.take_wake() {
+                    Some((token, value)) => step = self.conn.on_wake(&mut self.io, token, value),
+                    None => break,
+                },
+                Step::Read if input.is_empty() => break,
+                Step::Read => {
+                    let (n, next) = self.conn.on_data(&mut self.io, input);
+                    input = &input[n.min(input.len())..];
+                    step = next;
+                    if n == 0 && next == Step::Read {
+                        break;
+                    }
+                }
+            }
+        }
+        out.extend_from_slice(&self.io.written);
+        self.io.written.clear();
+    }
+
+    /// Whether the connection is still open.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+}
+
+impl<S: HttpService> Drop for TestConnection<S> {
+    fn drop(&mut self) {
+        if self.open {
+            self.open = false;
+            self.conn.on_close(true);
+        }
+    }
+}
+
+impl<S: HttpService> core::fmt::Debug for TestConnection<S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TestConnection")
+            .field("open", &self.open)
+            .finish()
+    }
+}
+
+/// The length of the first response in `bytes` (head plus content-length body).
+fn reply_len(bytes: &[u8]) -> usize {
+    let mut fields = [http_net::FieldSpan::default(); 128];
+    let asked = http_net::Asked {
+        head: false,
+        connect: false,
+    };
+    let mut at = 0;
+    loop {
+        let Ok(http_net::Parsed::Complete { head, len }) = http_net::parse_response_head(
+            &bytes[at..],
+            &http_net::Limits::new(),
+            asked,
+            &mut fields,
+        ) else {
+            return bytes.len();
+        };
+        let view = head.view();
+        if view.is_informational() {
+            at += len;
+            continue;
+        }
+        let n = match view.framing() {
+            http_net::BodyFraming::Length(n) => usize::try_from(n).unwrap_or(usize::MAX),
+            _ => 0,
+        };
+        return at.saturating_add(len).saturating_add(n);
+    }
+}
+
 /// Lets the machine borrow a service for the length of a test.
 struct ByRef<'s, S>(&'s S);
 
@@ -353,7 +499,7 @@ impl SimIo {
             now,
             connection: SIM_CONNECTION,
             worker: WorkerId::from_index(0),
-            written: Vec::new(),
+            written: Vec::with_capacity(16 * 1024),
             budget: None,
             deadline: None,
             phase: Phase::Idle,

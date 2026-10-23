@@ -787,3 +787,87 @@ fn test_reply_with_crlf_in_value_becomes_500() {
     assert_eq!(reply.status, 500);
     assert!(reply.header("set-cookie").is_none());
 }
+
+mod props {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn request() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            Just(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec()),
+            Just(b"POST /p HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabc".to_vec()),
+            Just(b"POST /c HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n".to_vec()),
+            Just(b"PUT /e HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 1\r\n\r\nz".to_vec()),
+            Just(b"GET /x HTTP/1.0\r\n\r\n".to_vec()),
+            Just(b"HEAD / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec()),
+            Just(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n".to_vec()),
+            proptest::collection::vec(any::<u8>(), 0..64),
+        ]
+    }
+
+    struct S(Arc<Counting>);
+    impl HttpService for S {
+        fn head(&self, h: &HttpHead<'_>, e: &mut Envelope) -> HeadAction {
+            HttpService::head(&*self.0, h, e)
+        }
+        fn call(&self, r: &HttpRequest<'_>, e: &Envelope, o: &mut HttpReply) -> Outcome {
+            HttpService::call(&*self.0, r, e, o)
+        }
+        fn done(&self, e: &Envelope, f: &Finished) {
+            HttpService::done(&*self.0, e, f);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Invariants 1 and 6 under arbitrary input split at arbitrary points
+        /// and a small output budget: no panic, `done` once per `head`, no
+        /// more replies than requests that reached `head` plus one refusal.
+        #[test]
+        fn test_machine_invariants_hold_for_any_input(
+            reqs in proptest::collection::vec(request(), 1..6),
+            cuts in proptest::collection::vec(1usize..40, 1..20),
+            budget in proptest::option::of(1usize..300),
+        ) {
+            let svc = Arc::new(Counting::default());
+            let (mut c, mut io) = conn(S(svc.clone()), Profile::new(ProfileId(0)));
+            let input: Vec<u8> = reqs.concat();
+            let mut step = c.on_open(&mut io, false);
+            let mut at = 0;
+            let mut cut = cuts.iter().copied().cycle();
+            let mut eof = false;
+            let mut guard = 0;
+            while !matches!(step, Step::Close | Step::Abort) && guard < 10_000 {
+                guard += 1;
+                io.budget = budget;
+                step = match step {
+                    Step::Write => c.on_writable(&mut io),
+                    Step::Park { .. } => c.on_timeout(&mut io, Timeout::Park),
+                    Step::Read if at < input.len() => {
+                        let end = (at + cut.next().unwrap_or(1)).min(input.len());
+                        let (n, next) = c.on_data(&mut io, &input[at..end]);
+                        prop_assert!(n <= end - at);
+                        at += n;
+                        next
+                    }
+                    Step::Read if !eof => {
+                        eof = true;
+                        c.on_peer_closed(&mut io)
+                    }
+                    Step::Read => c.on_timeout(&mut io, Timeout::Exchange),
+                    other => other,
+                };
+            }
+            prop_assert!(guard < 10_000, "the machine did not finish");
+            c.on_close(true);
+            let heads = svc.heads.load(Ordering::Relaxed);
+            let calls = svc.calls.load(Ordering::Relaxed);
+            let dones = svc.dones.load(Ordering::Relaxed);
+            prop_assert_eq!(heads, dones, "done exactly once per head");
+            prop_assert!(calls <= heads);
+            let replies = String::from_utf8_lossy(&io.written).matches("HTTP/1.1 ").count() as u32;
+            prop_assert!(replies <= heads * 2 + 1, "{} replies for {} heads", replies, heads);
+        }
+    }
+}

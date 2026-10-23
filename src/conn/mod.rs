@@ -145,6 +145,9 @@ struct Request {
 
 /// The pressure above which keep-alive adapts (blocking driver).
 const PRESSURE_SHORTEN: f32 = 0.75;
+/// Output capacity a connection starts with: every refusal and a typical
+/// small reply fit without growing it.
+const OUT_INITIAL: usize = 1024;
 /// Output capacity kept after a reply.
 const OUT_RETAIN: usize = 16 * 1024;
 /// Body capacity kept between requests.
@@ -244,7 +247,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             request: None,
             body: Vec::new(),
             reply: Reply::new(parts),
-            out: OutBuf::new(),
+            out: OutBuf {
+                bytes: Vec::with_capacity(OUT_INITIAL),
+            },
             out_sent: 0,
             seq: 0,
             accepted_at: now,
@@ -549,7 +554,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             self.state = State::Closed;
             return Step::Close;
         }
-        let _ = self.engine.shrink_idle();
+        // The engine keeps its buffer between requests: releasing it here would
+        // cost an allocation per keep-alive request. Idle memory is returned
+        // through per-worker engine pools with the reactor driver (0.5).
         io.set_exchange_deadline(None);
         io.set_phase(Phase::Idle);
         Step::Read
@@ -697,6 +704,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 client: &self.client,
                 proxy: listener.and_then(|l| l.proxy.as_ref()),
                 declared_scheme: listener.map_or(Scheme::Http, |l| l.declared_scheme),
+                resolved: None,
             };
             match self.engine.head() {
                 None => None,
@@ -897,6 +905,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 client: &self.client,
                 proxy: listener.and_then(|l| l.proxy.as_ref()),
                 declared_scheme: listener.map_or(Scheme::Http, |l| l.declared_scheme),
+                resolved: Some(self.env.client),
             };
             let discard = self
                 .request
@@ -904,7 +913,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 .is_some_and(|r| matches!(r.policy, BodyPolicy::Discard { .. }));
             match self.engine.head() {
                 None => None,
-                // Deterministic: the same head gives the same view it gave `on_head`.
+                // The client resolved at the head is reused: no second walk.
                 Some(raw) => match shared.family.head(raw, &cx) {
                     Err(_) => None,
                     Ok((head, _)) => {

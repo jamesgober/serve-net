@@ -1,11 +1,12 @@
 //! Request admission: "can this worker take this request now?".
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::config::ProfileTable;
 use crate::envelope::Envelope;
 use crate::net::WorkerId;
+use crate::sync::{AtomicU32, AtomicU64};
 
 /// Request admission, after `head` and before any body byte.
 ///
@@ -47,7 +48,7 @@ pub struct Shed {
 
 /// One worker's counters, alone on its cache line.
 #[repr(align(64))]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct WorkerShard {
     in_flight: AtomicU32,
     /// Per-profile counts for profiles with per-worker shares.

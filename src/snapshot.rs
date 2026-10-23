@@ -1,7 +1,9 @@
 //! Tables that can be swapped live.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, PoisonError};
+
+use crate::sync::{AtomicU64, Mutex};
 
 /// A value that can be replaced while readers use it: a reader sees a whole
 /// old value or a whole new one, never a mix.

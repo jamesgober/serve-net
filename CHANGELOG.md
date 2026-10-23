@@ -20,7 +20,10 @@
   engine over http-net 0.6, the HTTP request and reply types, deferred
   replies, admission (`InFlightCap`), checkpoints, observation, snapshots,
   the connection state machine, and `testing` helpers that run a service
-  without sockets.
+  without sockets (`respond`, `TestRequest`, `TestConnection`).
+- Counting-allocator tests (zero allocations per request in steady state),
+  property tests, four fuzz targets with a CI smoke job, loom models with a
+  CI job, and criterion benchmarks.
 
 ---
 

@@ -419,6 +419,23 @@ impl Family for HttpFamily {
         };
         match proxy.kind {
             ProxyKind::Headers(source) => {
+                if let Some(client) = cx.resolved {
+                    // Built again for the call: the walk already ran at the head.
+                    let host = if proxy.trust_host {
+                        forwarded::trusted_host(source, &raw)
+                    } else {
+                        None
+                    };
+                    let authority = host.or_else(|| raw.host());
+                    return Ok((
+                        HttpHead {
+                            raw,
+                            client,
+                            authority,
+                        },
+                        client,
+                    ));
+                }
                 let peer = base.peer().ok_or(ingress_error)?;
                 let rules = forwarded::Rules {
                     source,

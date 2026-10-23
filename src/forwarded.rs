@@ -122,9 +122,6 @@ pub(crate) struct Resolved<'h> {
     pub(crate) forwarded: bool,
 }
 
-/// The most entries ever kept while scanning one line from the left.
-const RING: usize = 65;
-
 /// Resolves the client of one request.
 pub(crate) fn resolve<'h, T: Trust, F: FieldLines<'h>>(
     peer: IpAddr,
@@ -173,8 +170,8 @@ pub(crate) fn resolve<'h, T: Trust, F: FieldLines<'h>>(
     }
     let mut out = match rules.source {
         ForwardedSource::SingleAddress(_) => single(&lines)?,
-        ForwardedSource::XForwardedFor => walk(rules, lines.as_slice(), parse_xff_entry)?,
-        ForwardedSource::Forwarded => walk(rules, lines.as_slice(), parse_forwarded_element)?,
+        ForwardedSource::XForwardedFor => walk(rules, lines.as_slice(), parse_xff_entry, false)?,
+        ForwardedSource::Forwarded => walk(rules, lines.as_slice(), parse_forwarded_element, true)?,
     };
     if out.client.is_none() && rules.unknown == UnknownClient::Refuse {
         return Err(WalkError::UnknownRefused);
@@ -184,6 +181,39 @@ pub(crate) fn resolve<'h, T: Trust, F: FieldLines<'h>>(
         _ => proto_host_x(rules, head, &mut lines, &mut out)?,
     }
     Ok(out)
+}
+
+/// The trusted proxy's host for a head that was already resolved once:
+/// `X-Forwarded-Host` (or `Forwarded` `host=`) of the nearest hop, when valid.
+pub(crate) fn trusted_host<'h, F: FieldLines<'h>>(
+    source: ForwardedSource,
+    head: &F,
+) -> Option<&'h str> {
+    let mut lines = Lines::new();
+    let value = match source {
+        ForwardedSource::Forwarded => {
+            head.field_lines("forwarded", &mut lines).ok()?;
+            let element = last_element(lines.as_slice(), true).ok()??;
+            let mut host = None;
+            for_each_pair(element, |name, value| {
+                if name.eq_ignore_ascii_case(b"host") {
+                    host = Some(value);
+                }
+                Ok(())
+            })
+            .ok()?;
+            host?
+        }
+        _ => {
+            head.field_lines("x-forwarded-host", &mut lines).ok()?;
+            last_element(lines.as_slice(), false).ok()??
+        }
+    };
+    if valid_authority(value) {
+        core::str::from_utf8(value).ok()
+    } else {
+        None
+    }
 }
 
 /// One parsed entry: an address with an optional port, or an unknown node.
@@ -224,25 +254,19 @@ fn walk<'h, T: Trust>(
     rules: &Rules<'_, T>,
     lines: &[&'h [u8]],
     parse: fn(&[u8]) -> Result<Node, WalkError>,
+    quotes: bool,
 ) -> Result<Resolved<'h>, WalkError> {
     let max = usize::from(rules.max_hops.max(1));
     let mut walked = 0usize;
     let mut leftmost: Option<Node> = None;
-    let mut spans = [(0u32, 0u32); RING];
     for line in lines.iter().rev() {
-        let count = elements(line, &mut spans);
-        // The ring keeps the last RING elements; only the last `max + 1` can be walked.
-        let kept = count.min(RING);
-        for i in 0..kept {
-            let idx = (count - 1 - i) % RING;
-            let (start, end) = spans[idx];
-            let element = &line[start as usize..end as usize];
+        for element in RevElements::new(line, quotes) {
+            let element = element?;
             walked += 1;
             if walked > max {
                 return Err(WalkError::TooManyHops);
             }
-            let node = parse(element)?;
-            match node {
+            match parse(element)? {
                 Node::Addr(ip, port) => {
                     let ip = normalize(ip);
                     if rules.trusted.trusts(ip) {
@@ -270,10 +294,6 @@ fn walk<'h, T: Trust>(
                 }
             }
         }
-        if count > kept {
-            // More elements on this line than the ring holds: the walk would pass the limit.
-            return Err(WalkError::TooManyHops);
-        }
     }
     match leftmost {
         Some(Node::Addr(ip, port)) => Ok(Resolved {
@@ -292,43 +312,70 @@ fn hops(walked: usize) -> u8 {
     u8::try_from(walked).unwrap_or(u8::MAX)
 }
 
-/// Splits `line` into list elements (commas outside quoted strings), trims
-/// OWS, skips empty elements, and keeps the last [`RING`] spans. Returns how
-/// many elements the line has.
-fn elements(line: &[u8], spans: &mut [(u32, u32); RING]) -> usize {
-    let mut count = 0usize;
-    let mut start = 0usize;
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut push = |s: usize, e: usize, count: &mut usize| {
-        let (s, e) = trim_span(line, s, e);
-        if s < e {
-            spans[*count % RING] = (s as u32, e as u32);
-            *count += 1;
-        }
-    };
-    for (i, &b) in line.iter().enumerate() {
-        if quoted {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                quoted = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => quoted = true,
-            b',' => {
-                push(start, i, &mut count);
-                start = i + 1;
-            }
-            _ => {}
+/// The elements of one list line, from the right: commas split (outside
+/// quoted strings when `quotes` is set), OWS is trimmed, empty elements are
+/// skipped. One backward scan, no storage: a walk that stops after `max_hops`
+/// never reads the rest of the line.
+///
+/// Quoted strings are tracked by toggling on every `"`. That is exact
+/// because no field serve-net reads may carry a backslash escape inside a
+/// quoted string; a line with a backslash in quoted mode is refused.
+struct RevElements<'h> {
+    line: &'h [u8],
+    end: usize,
+    quotes: bool,
+    failed: bool,
+}
+
+impl<'h> RevElements<'h> {
+    fn new(line: &'h [u8], quotes: bool) -> Self {
+        let failed = quotes && line.contains(&b'\\');
+        RevElements {
+            line,
+            end: line.len(),
+            quotes,
+            failed,
         }
     }
-    push(start, line.len(), &mut count);
-    count
+}
+
+impl<'h> Iterator for RevElements<'h> {
+    type Item = Result<&'h [u8], WalkError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            self.failed = false;
+            self.end = 0;
+            return Some(Err(WalkError::Malformed));
+        }
+        while self.end > 0 {
+            let mut i = self.end;
+            let mut quoted = false;
+            while i > 0 {
+                let b = self.line[i - 1];
+                if self.quotes && b == b'"' {
+                    quoted = !quoted;
+                } else if b == b',' && !quoted {
+                    break;
+                }
+                i -= 1;
+            }
+            if quoted {
+                self.end = 0;
+                return Some(Err(WalkError::Malformed));
+            }
+            let (s, e) = trim_span(self.line, i, self.end);
+            // Past the comma (or at the start of the line).
+            self.end = i.saturating_sub(1);
+            if i == 0 {
+                self.end = 0;
+            }
+            if s < e {
+                return Some(Ok(&self.line[s..e]));
+            }
+        }
+        None
+    }
 }
 
 fn trim_span(line: &[u8], mut s: usize, mut e: usize) -> (usize, usize) {
@@ -487,16 +534,9 @@ fn proto_host_forwarded<'h, T: Trust>(
     if !rules.trust_scheme && !rules.trust_host {
         return Ok(());
     }
-    let Some(line) = lines.iter().rev().find(|l| !trim_ows(l).is_empty()) else {
+    let Some(element) = last_element(lines, true)? else {
         return Ok(());
     };
-    let mut spans = [(0u32, 0u32); RING];
-    let count = elements(line, &mut spans);
-    if count == 0 {
-        return Ok(());
-    }
-    let (s, e) = spans[(count - 1) % RING];
-    let element: &'h [u8] = &line[s as usize..e as usize];
     let mut proto: Option<&'h [u8]> = None;
     let mut host: Option<&'h [u8]> = None;
     for_each_pair(element, |name, value| {
@@ -522,25 +562,24 @@ fn proto_host_x<'h, T: Trust, F: FieldLines<'h>>(
     if rules.trust_scheme {
         lines.clear();
         head.field_lines("x-forwarded-proto", lines)?;
-        proto = last_element(lines.as_slice());
+        proto = last_element(lines.as_slice(), false)?;
     }
     if rules.trust_host {
         lines.clear();
         head.field_lines("x-forwarded-host", lines)?;
-        host = last_element(lines.as_slice());
+        host = last_element(lines.as_slice(), false)?;
     }
     apply_proto_host(rules, proto, host, out)
 }
 
-fn last_element<'h>(lines: &[&'h [u8]]) -> Option<&'h [u8]> {
-    let line = lines.iter().rev().find(|l| !trim_ows(l).is_empty())?;
-    let mut spans = [(0u32, 0u32); RING];
-    let count = elements(line, &mut spans);
-    if count == 0 {
-        return None;
+/// The rightmost element of the last non-empty line.
+fn last_element<'h>(lines: &[&'h [u8]], quotes: bool) -> Result<Option<&'h [u8]>, WalkError> {
+    for line in lines.iter().rev() {
+        if let Some(element) = RevElements::new(line, quotes).next() {
+            return element.map(Some);
+        }
     }
-    let (s, e) = spans[(count - 1) % RING];
-    Some(&line[s as usize..e as usize])
+    Ok(None)
 }
 
 fn apply_proto_host<'h, T: Trust>(
@@ -1020,5 +1059,127 @@ pub(crate) mod tests {
             assert!(!valid_authority(bad), "{bad:?}");
         }
         assert!(!valid_authority(&[b'a'; 256]));
+    }
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Pieces a forwarding field is built from: addresses in canonical
+        /// text, trusted and untrusted, and hostile fragments.
+        fn piece() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("10.0.0.1".to_string()),
+                Just("10.9.9.9".to_string()),
+                Just("203.0.113.7".to_string()),
+                Just("198.51.100.1".to_string()),
+                Just("2001:db8::1".to_string()),
+                Just("[2001:db8::2]".to_string()),
+                Just("::ffff:10.0.0.3".to_string()),
+                Just("::ffff:203.0.113.4".to_string()),
+                Just("fe80::1%eth0".to_string()),
+                Just("unknown".to_string()),
+                Just("_hidden".to_string()),
+                Just(" ".to_string()),
+                Just(",".to_string()),
+                Just("\"".to_string()),
+                Just(";".to_string()),
+                Just("for=".to_string()),
+                Just("1.2.3.4:80".to_string()),
+                "[ -~]{0,8}",
+            ]
+        }
+
+        fn line() -> impl Strategy<Value = String> {
+            proptest::collection::vec(piece(), 0..12).prop_map(|v| v.join(","))
+        }
+
+        fn forms_of(ip: IpAddr) -> Vec<String> {
+            let mut forms = vec![ip.to_string()];
+            if let IpAddr::V4(v4) = ip {
+                forms.push(format!("::ffff:{v4}"));
+            }
+            forms
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// The walk never panics, stays within its bounds, and returns
+            /// only the peer or an address that appears in the input.
+            #[test]
+            fn test_walk_never_panics_and_client_comes_from_input(
+                lines in proptest::collection::vec(line(), 0..4),
+                forwarded in any::<bool>(),
+                peer_trusted in any::<bool>(),
+                max_hops in 1u8..=64,
+            ) {
+                let trusted = TrustedProxies::parse("10.0.0.0/8").unwrap();
+                let peer: IpAddr = if peer_trusted { "10.0.0.2".parse().unwrap() } else { "192.0.2.1".parse().unwrap() };
+                let name = if forwarded { "forwarded" } else { "x-forwarded-for" };
+                let owned: Vec<(String, Vec<u8>)> = lines
+                    .iter()
+                    .map(|l| {
+                        let value = if forwarded {
+                            l.split(',').map(|p| format!("for={p}")).collect::<Vec<_>>().join(",")
+                        } else {
+                            l.clone()
+                        };
+                        (name.to_string(), value.into_bytes())
+                    })
+                    .collect();
+                let fields: Vec<(&str, &[u8])> = owned.iter().map(|(n, v)| (n.as_str(), v.as_slice())).collect();
+                let source = if forwarded { ForwardedSource::Forwarded } else { ForwardedSource::XForwardedFor };
+                let mut r = rules(source, &trusted);
+                r.max_hops = max_hops;
+                match resolve(peer, 1, &r, &Fields(&fields)) {
+                    Err(_) => prop_assert!(peer_trusted, "an untrusted peer is never refused"),
+                    Ok(found) => {
+                        prop_assert!(usize::from(found.hops) <= usize::from(max_hops));
+                        if let Some(client) = found.client {
+                            let text: String = owned
+                                .iter()
+                                .map(|(_, v)| String::from_utf8_lossy(v).to_ascii_lowercase())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let from_input = forms_of(client).iter().any(|f| text.contains(&f.to_ascii_lowercase()));
+                            prop_assert!(client == peer || from_input, "{} is neither the peer nor in the input", client);
+                            if !peer_trusted {
+                                prop_assert_eq!(client, peer);
+                            }
+                        }
+                    }
+                }
+            }
+
+            /// Arbitrary bytes in every forwarding field never panic, and an
+            /// accepted host is always a valid authority.
+            #[test]
+            fn test_walk_arbitrary_bytes_never_panic(
+                xff in proptest::collection::vec(any::<u8>(), 0..300),
+                fwd in proptest::collection::vec(any::<u8>(), 0..300),
+                proto in proptest::collection::vec(any::<u8>(), 0..40),
+                host in proptest::collection::vec(any::<u8>(), 0..300),
+            ) {
+                let trusted = TrustedProxies::loopback();
+                for source in [ForwardedSource::XForwardedFor, ForwardedSource::Forwarded, ForwardedSource::SingleAddress("x-real-ip")] {
+                    let mut r = rules(source, &trusted);
+                    r.trust_scheme = true;
+                    r.trust_host = true;
+                    let fields: Vec<(&str, &[u8])> = vec![
+                        ("x-forwarded-for", &xff),
+                        ("forwarded", &fwd),
+                        ("x-real-ip", &xff),
+                        ("x-forwarded-proto", &proto),
+                        ("x-forwarded-host", &host),
+                    ];
+                    if let Ok(found) = resolve("127.0.0.1".parse().unwrap(), 1, &r, &Fields(&fields)) {
+                        if let Some(h) = found.host {
+                            prop_assert!(valid_authority(h.as_bytes()));
+                        }
+                    }
+                }
+            }
+        }
     }
 }

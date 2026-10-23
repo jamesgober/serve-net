@@ -2446,7 +2446,10 @@ pub trait Family: Send + Sync + 'static {
 }
 
 pub struct HeadContext<'c> { /* the connection's client and the listener's ingress rules */ }
-impl HeadContext<'_> { pub fn client(&self) -> &ClientInfo; }
+impl HeadContext<'_> {
+    pub fn client(&self) -> &ClientInfo;
+    pub fn resolved(&self) -> Option<&ClientInfo>;   // set when the view is built again for the call (D-040)
+}
 
 pub struct Reply<F: Family> { /* F::Parts and the link to its connection */ }
 impl<F: Family> Reply<F> {
@@ -2580,6 +2583,16 @@ pub mod testing {
         pub fn scheme(self, scheme: Scheme) -> Self;
         pub fn profile(self, profile: Profile) -> Self;
         pub fn send<S: HttpService>(self, service: &S) -> TestReply;
+    }
+
+    pub struct TestConnection<S: HttpService> { /* one simulated keep-alive connection */ }
+    impl<S: HttpService> TestConnection<S> {
+        pub fn new(service: S) -> Self;
+        pub fn with_profile(service: S, profile: Profile) -> Self;
+        pub fn behind(service: S, source: ProxySource, profile: Profile) -> Self;   // from a proxy at 127.0.0.1
+        pub fn send(&mut self, bytes: &[u8]) -> Vec<TestReply>;
+        pub fn send_into(&mut self, bytes: &[u8], out: &mut Vec<u8>);              // no allocation once warm
+        pub fn is_open(&self) -> bool;
     }
 
     #[non_exhaustive]

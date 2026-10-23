@@ -281,6 +281,9 @@ pub struct HeadContext<'c> {
     pub(crate) client: &'c ClientInfo,
     pub(crate) proxy: Option<&'c ProxySource>,
     pub(crate) declared_scheme: crate::client::Scheme,
+    /// The request's client as resolved at its head, when the view is built
+    /// again for the service call: the walk is not repeated.
+    pub(crate) resolved: Option<ClientInfo>,
 }
 
 impl HeadContext<'_> {
@@ -288,6 +291,12 @@ impl HeadContext<'_> {
     #[must_use]
     pub fn client(&self) -> &ClientInfo {
         self.client
+    }
+
+    /// The request's client, when the head was already resolved once.
+    #[must_use]
+    pub fn resolved(&self) -> Option<&ClientInfo> {
+        self.resolved.as_ref()
     }
 }
 

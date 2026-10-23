@@ -15,6 +15,9 @@ license = "Apache-2.0 OR MIT"
 # Readme
 readme = "README.md"
 
+# The fuzz crate is its own workspace and is not part of the package.
+exclude = ["fuzz/"]
+
 # Description
 description = "The network service engine for Rust: listeners over net-io, ingress from direct clients, reverse proxies (PROXY protocol or trusted forwarded headers), Unix sockets, and FastCGI, a per-connection engine with a slot for any sans-IO protocol engine, admission, drain, and restarts without dropped connections."
 
@@ -61,6 +64,26 @@ http-net = { version = "0.6", default-features = false, optional = true }
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# The loom models run with RUSTFLAGS="--cfg loom" (see dev/DIRECTIVES.md).
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+
+# LINTS
+# #################################
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+
+# BENCHMARKS
+# #################################
+[[bench]]
+name = "core"
+harness = false
+required-features = ["http1"]
 
 
 # RELEASE PROFILE

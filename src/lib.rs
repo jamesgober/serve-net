@@ -32,11 +32,14 @@ mod forwarded;
 mod hooks;
 #[cfg(feature = "http1")]
 mod http;
+#[cfg(all(loom, test, feature = "http1"))]
+mod loom_tests;
 mod net;
 mod reply;
 mod server;
 mod service;
 mod snapshot;
+mod sync;
 #[cfg(feature = "http1")]
 pub mod testing;
 

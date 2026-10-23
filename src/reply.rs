@@ -6,7 +6,9 @@
 //! later deferral) and wakes the worker that owns the connection.
 
 use core::fmt;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, PoisonError};
+
+use crate::sync::Mutex;
 
 use crate::engine::Family;
 use crate::net::ConnectionId;
@@ -56,7 +58,7 @@ impl<P> DeferSlot<P> {
         }
     }
 
-    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, SlotState<P>> {
+    pub(crate) fn lock(&self) -> crate::sync::MutexGuard<'_, SlotState<P>> {
         // A panic while the lock is held cannot leave a half-written state:
         // every write replaces the whole value.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
