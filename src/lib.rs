@@ -14,11 +14,16 @@
 //! [repository](https://github.com/jamesgober/serve-net)).
 //!
 //! ```no_run
+//! # #[cfg(feature = "http1")]
+//! # fn main() -> Result<(), serve_net::ServeError> {
 //! let server = serve_net::http("127.0.0.1:8080", |req, reply| {
 //!     reply.text(200, &format!("hello from {}", req.path()));
 //! })?;
 //! server.wait();
-//! # Ok::<(), serve_net::ServeError>(())
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "http1"))]
+//! # fn main() {}
 //! ```
 
 #![doc(html_root_url = "https://docs.rs/serve-net")]

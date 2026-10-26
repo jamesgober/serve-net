@@ -86,7 +86,9 @@ jobs:
         run: |
           for t in forwarded_xff forwarded_rfc7239 conn_sim config; do
             mkdir -p "$RUNNER_TEMP/corpus/$t"
-            cargo fuzz run "$t" "$RUNNER_TEMP/corpus/$t" -- -max_total_time=30 -rss_limit_mb=2048
+            # The prebuilt cargo-fuzz is a musl build and would default to its
+            # own target, which the address sanitizer does not support.
+            cargo fuzz run --target x86_64-unknown-linux-gnu "$t" "$RUNNER_TEMP/corpus/$t" -- -max_total_time=30 -rss_limit_mb=2048
           done
 
   loom:
