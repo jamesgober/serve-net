@@ -1,7 +1,7 @@
 # serve-net - API Reference
 
 > Reference for every public item in `serve-net`, with signatures, behaviour, errors, costs, and examples.
-> **Current release: `0.2.0` (design lock; no functional code yet).** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
+> **Current release: `0.3.0` (the first working server).** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -548,7 +548,7 @@ impl Bound {
 
 `bind` takes the service and builds net-io's server: every listener is bound, adopted, inherited, or received in declaration order, net-io's PROXY expectation and trusted list are set per listener, and the workers start with the **door closed**: nothing is accepted (the kernel backlog may queue connections). This is the moment to drop privileges, after binding a privileged port and before any untrusted byte is read. `bind_family` does the same for a [custom family](#family-httpfamily) on listeners whose profile engine is `EngineChoice::Custom`.
 
-If any listener fails, everything bound so far is closed (inherited and handed-off sockets are released, not closed, so the owner can retry or pass them on) and the error names the failing listener.
+If any listener fails, everything bound so far is closed and the error names the failing listener. Inherited and handed-off sockets are to be released to the owner instead of closed; net-io 0.4's `build` consumes them, so until net-io can return them on a failed build they are closed too (tracked in `dev/ROADMAP.md`, v0.9.x register). Inherited sockets are matched by name first, then unnamed sockets by position; a socket no listener takes is closed.
 
 | Item | Grade | Tier | Version |
 |---|---|---|---|
@@ -957,7 +957,7 @@ Where the real client comes from behind a front end, and whom to believe.
 
 With `trust_scheme`, the scheme comes from `X-Forwarded-Proto` (or `Forwarded` `proto=`) and must be `http` or `https` (ASCII case-insensitive). With `trust_host`, the authority comes from `X-Forwarded-Host` (or `host=`) and must be a valid RFC 3986 authority of at most 255 bytes. Only the value the nearest trusted hop wrote (the rightmost) is used; anything invalid is a 400 refusal.
 
-**PROXY protocol** (`proxy_protocol`, `0.4.0`). net-io requires a complete, valid header before any byte reaches the engine, from trusted peers only, and closes every other connection before reading (fail closed; the PROXY specification requires both). A v2 `LOCAL` command (the proxy's own health check) keeps the socket peer and sets `ClientInfo::is_proxy_local()`. With `trust_scheme`, `PP2_TYPE_SSL` marks the connection `https`; with `trust_host`, `PP2_TYPE_AUTHORITY` gives the authority. net-io keeps one trusted list per server, so serve-net gives it the union of every PROXY listener's list and checks each connection against its own listener's list when it opens, before any byte reaches the engine.
+**PROXY protocol** (`proxy_protocol`, `0.4.0`). net-io requires a complete, valid header before any byte reaches the engine, from trusted peers only, and closes every other connection before reading (fail closed; the PROXY specification requires both). A v2 `LOCAL` command (the proxy's own health check) keeps the socket peer and sets `ClientInfo::is_proxy_local()`. With `trust_scheme`, `PP2_TYPE_SSL` marks the connection `https`; with `trust_host`, `PP2_TYPE_AUTHORITY` gives the authority. Each PROXY listener gives net-io its own trusted list (net-io 0.4 keeps one per listener), and net-io moves the connection's per-source slot to the real client, so the per-source cap applies to clients, not to the proxy.
 
 | Item | Grade | Tier | Version | Cost |
 |---|---|---|---|---|
@@ -1018,7 +1018,7 @@ pub enum UnknownClient { #[default] Allow, Refuse }
 pub enum UnixPeerTrust { SameUser, Users(Vec<u32>), Groups(Vec<u32>), AnyLocalPeer }
 ```
 
-Who may connect to a Unix listener, checked against net-io's peer credentials when the connection opens; a peer that fails is closed before any byte is read. On a platform without peer credentials only `AnyLocalPeer` validates (`RuleId::PeerCredentialsUnavailable`). P1, Tier 2, `0.4.0`.
+Who may connect to a Unix listener, checked against net-io's peer credentials when the connection opens; a peer that fails is closed before any byte is read. `SameUser` is the owner of the socket file this process created (read after bind, so no system call beyond `stat`); until it is known no peer passes. On a platform without peer credentials only `AnyLocalPeer` validates (`RuleId::PeerCredentialsUnavailable`). P1, Tier 2, `0.4.0`.
 
 ### `FastCgiIngress`
 
@@ -2287,6 +2287,7 @@ impl RuleId { pub const fn as_str(self) -> &'static str; }   // stable snake_cas
 | `TrustParse` | a trust entry in text (Tier 1) that is not an address or CIDR, or has host bits set | none |
 | `WorldWritableSocket` | a Unix socket mode writable by others | `allow_world_writable(reason)` |
 | `PeerCredentialsUnavailable` | a uid or gid allowlist where the platform has no peer credentials | `UnixPeerTrust::AnyLocalPeer` |
+| `IngressSource` | `Ingress::Unix` on a TCP listener, or `Direct` or `Proxy` on a Unix socket listener (`0.4.0`) | none |
 | `DuplicateName`, `BadName` | two listeners with one name; a name outside 1 to 64 bytes of `[a-z0-9._-]` | none |
 | `ProfileIdReserved`, `ProfileGap`, `UnknownProfile` | `ProfileId(255)`; ids not dense from 0 or repeated; a listener naming a missing profile | none |
 | `DeadlineOrder`, `DeadlineRange` | `request_timeout` below `head_timeout`; keep-alive idle 0 with keep-alive on; a value outside its range | none |
@@ -2436,7 +2437,7 @@ pub trait Family: Send + Sync + 'static {
     type Parts: Default + Send + 'static;   // the reply data a service fills
 
     fn engine(&self, profile: &Profile, limits: &Limits) -> Self::Engine;
-    fn head<'a>(&self, raw: <Self::Engine as Engine>::Head<'a>, cx: &HeadContext<'_>)
+    fn head<'a>(&self, raw: <Self::Engine as Engine>::Head<'a>, cx: &HeadContext<'a>)
         -> Result<(Self::Head<'a>, ClientInfo), EngineError>;           // the view and the request's client
     fn request<'a>(&self, head: Self::Head<'a>, body: &'a [u8]) -> Self::Request<'a>;
     fn new_parts(&self) -> Self::Parts;

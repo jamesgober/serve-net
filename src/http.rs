@@ -397,11 +397,8 @@ impl Family for HttpFamily {
     fn head<'a>(
         &self,
         raw: RequestHead<'a>,
-        cx: &HeadContext<'_>,
-    ) -> Result<(HttpHead<'a>, ClientInfo), EngineError>
-    where
-        Self: 'a,
-    {
+        cx: &HeadContext<'a>,
+    ) -> Result<(HttpHead<'a>, ClientInfo), EngineError> {
         let base = *cx.client;
         let ingress_error = EngineError {
             kind: RefusalKind::Ingress,
@@ -436,7 +433,14 @@ impl Family for HttpFamily {
                         client,
                     ));
                 }
-                let peer = base.peer().ok_or(ingress_error)?;
+                // A Unix socket peer has no address; it passed its credential
+                // check, so the walk starts from a trusted hop.
+                let unix = base.ingress() == IngressKind::Unix;
+                let peer = match base.peer() {
+                    Some(p) => Some(p),
+                    None if unix => None,
+                    None => return Err(ingress_error),
+                };
                 let rules = forwarded::Rules {
                     source,
                     trusted: &proxy.trusted,
@@ -446,8 +450,13 @@ impl Family for HttpFamily {
                     trust_scheme: proxy.trust_scheme,
                     trust_host: proxy.trust_host,
                 };
-                let found = forwarded::resolve(peer.ip(), peer.port(), &rules, &raw)
-                    .map_err(|_| ingress_error)?;
+                let found = forwarded::resolve_from(
+                    peer.map(|p| p.ip()),
+                    peer.map_or(0, |p| p.port()),
+                    &rules,
+                    &raw,
+                )
+                .map_err(|_| ingress_error)?;
                 let client = if found.forwarded {
                     base.behind_proxy(found.client, found.port, found.hops, IngressKind::Forwarded)
                         .with_scheme(found.scheme.unwrap_or(cx.declared_scheme))
@@ -465,12 +474,20 @@ impl Family for HttpFamily {
                 ))
             }
             ProxyKind::ProxyProtocol(_) => {
-                let client = base.with_scheme(cx.declared_scheme);
+                // The session built the client from net-io's PROXY facts.
+                let client = base;
+                let tlv = if proxy.trust_host {
+                    cx.proxy_facts
+                        .and_then(|f| f.authority())
+                        .filter(|a| forwarded::valid_authority(a.as_bytes()))
+                } else {
+                    None
+                };
                 Ok((
                     HttpHead {
                         raw,
                         client,
-                        authority: raw.host(),
+                        authority: tlv.or_else(|| raw.host()),
                     },
                     client,
                 ))

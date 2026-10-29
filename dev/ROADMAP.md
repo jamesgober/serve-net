@@ -119,11 +119,44 @@ Exit: zero open findings; the 24 h soak clean (NFR-18); `docs/SECURITY.md` writt
 Exit: a production site served for two weeks without a serve-net defect; `docs/ARCHITECTURE.md` draft; no API change needed by the first real wrapper that is not already made.
 - A real application wrapper built on serve-net's hooks; a custom-family prototype for a database wire protocol.
 
-## v0.9.0 - Beta and release candidates
-Exit: no API change across two release candidates; every document complete.
-- API freeze candidate; one non-HTTP service end to end; the Windows service status adapter (outside serve-net) exercised; `-rc` tags.
+## v0.9.0 - Beta
+Exit: no API change across two beta releases; every document complete.
+- API freeze candidate; one non-HTTP service end to end; the Windows service status adapter (outside serve-net) exercised.
+
+## v0.9.x - Pre-1.0 polish (before any 1.0 release candidate)
+James's standing rule (2026-10-29): "make sure to go back and fix any issues / perf tune / etc before we get close to release." Nothing accepted during the 0.x series becomes final silently: each item below is fixed, measured, or written into the 1.0 readiness note for James with the reason it stays.
+
+Exit: every item in the register below is closed or carried into `docs/STABILITY-1.0.md` (the 1.0 readiness note) with a reason and a cost; the performance pass and the security and edge-case review are recorded; no `-rc` tag before this exit.
+
+**1. Revisit every accepted gap, deferred item, known issue, and missed target.** The register (kept current as versions land; add to it instead of accepting a gap quietly):
+
+| Item | From | What to decide or do |
+|---|---|---|
+| The forwarded walk measured about 165 ns for three entries against a 100 ns target [est.] | 0.3 progress, D-040 | meet the target or record why not, with numbers |
+| Every [est.] cost in `dev/PLAN.md` | PLAN section 9 and the threat table | each replaced by a benchmark (due at 0.6), or listed as unmeasured with the reason |
+| The engine keeps its buffer between keep-alive requests; idle memory returns only through the reactor's per-worker pools | D-041 | confirm the reactor pools bound idle memory (NFR-1), or shrink after an idle period |
+| With no soft cap configured, the blocking pool's soft cap is the pool minus its headroom (224 of 256) | D-044 | confirm the default with a measured overload run (NFR-6), or change it |
+| The per-source connection cap behind a front end | D-046, D-053 | applied per listener since 0.4 (net-io 0.4); confirm a mixed direct and proxied server keeps the cap on its direct listeners (a test exists from 0.4) |
+| The machine reads the live control line because net-io's `draining()` is fixed for one callback | D-047, hello-serve feedback 6 | if net-io makes `draining()` live, drop the extra load or keep it with a measured reason |
+| The timeout-to-close-reason table is copied from net-io (`CloseReason::for_timeout` is crate-private) | hello-serve feedback 7 | use net-io's when public, or keep a test that the tables agree |
+| `health`: stall = inside a service call without progress since the previous call; overload = more than 20% busy refusals since the previous call | D-049 | check against a real supervisor and a stalled-worker test under load; tune or document |
+| `DrainReport::deadline_hit` is derived from `killed > 0` | 0.3 | report net-io's own deadline state if it exposes one |
+| Gate denials: a status outside 400 to 599 becomes 403 | D-050 | confirm with bouncer-io's codes |
+| The crate-level `allow(dead_code)` without the `http1` feature | 0.3 | gate the forwarded walk and the HTTP head context on the feature instead |
+| `Running` keeps its server in an `Option` and reaches it through `unreachable!()` after `drain` or `wait` took it | 0.3 | a shape with no unreachable path |
+| Two `impl InFlightCap` blocks (the index-based internals for tests) | 0.3 | fold into one |
+| serve-net handles no signals; every first program writes a stop channel | OD-8, hello-serve API friction | decide with the examples and a real deployment, as OD-8 planned for 0.9 |
+| Showing transport counters by close reason needed hand-built `CloseReason` values | hello-serve API friction | net-io 0.4 added `Stats::closes` and `Stats::refusals`; check serve-net's `Stats` reads as easily |
+| http-net is pinned at 0.6 while later versions exist | 0.3 | take the current http-net, with the allocation and benchmark tests as the check |
+| A failed `bind` closes inherited and handed-off sockets instead of releasing them to the owner | 0.4, D-059 | needs net-io to hand adopted sockets back when `build` fails (asked in the shared notes); then release them |
+| Anything else listed as "not yet" or "deferred" in this file, `dev/PLAN.md`, or `CHANGELOG.md` | all versions | sweep the documents for open wording before the exit |
+
+**2. A fresh performance tuning pass.** Profile the request path, admission, the forwarded walk, the drain, and connection setup on the reactor and the blocking driver; compare against the 0.6 baselines and the NFR-5 competitor numbers; fix regressions, take the wins that cost no security, and record every change with its security impact (NFR, `docs/PERFORMANCE.md`).
+
+**3. Re-run the security and edge-case review.** Every threat T-1 to T-40 re-tested against the release candidate's code, every validation rule V-1 to V-26, the fuzz targets with a long run on an out-of-repository corpus, the loom models, the leak test at 100k connections (NFR-19), and an adversarial review of every hook seam; findings fixed test first.
 
 ## v1.0.0 - Stable
+- Release candidates (`1.0.0-rc.N`) only after the v0.9.x polish exit, with no API change across two of them.
 - API frozen until 2.0; the full audit (API, docs, tests, benchmarks, security) recorded in `docs/STABILITY-1.0.md`; `dev/DIRECTIVES.md` definition of done item 10 satisfied. James decides the release.
 
 ## After 1.0

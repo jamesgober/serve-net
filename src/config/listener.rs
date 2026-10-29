@@ -1,9 +1,10 @@
 //! Listener specifications.
 
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 
 use crate::client::Scheme;
-use crate::config::{Ingress, ProfileId};
+use crate::config::{Ingress, ProfileId, UnixPeerTrust};
 
 /// Where a listener's socket comes from.
 #[non_exhaustive]
@@ -11,6 +12,19 @@ use crate::config::{Ingress, ProfileId};
 pub enum ListenerSource {
     /// Bind this TCP address.
     Tcp(SocketAddr),
+    /// Bind a Unix socket at this path.
+    Unix(PathBuf),
+    /// The socket systemd passed under this name (or by position when it
+    /// passed no names); `fallback` is bound when the process was not
+    /// socket-activated.
+    Inherited {
+        /// The `LISTEN_FDNAMES` entry to take.
+        name: String,
+        /// The address to bind without socket activation.
+        fallback: Option<SocketAddr>,
+    },
+    /// A listening socket received from a supervisor (`handed_off`).
+    HandedOff,
     /// The address resolved to nothing; `build` reports it (rule `AddressResolve`).
     Unresolved,
 }
@@ -40,6 +54,45 @@ pub struct ListenerSpec {
     pub(crate) max_connections: Option<u32>,
     pub(crate) public_bind: Option<&'static str>,
     pub(crate) broad_trust: Option<&'static str>,
+    pub(crate) unix_mode: UnixMode,
+    pub(crate) world_writable: Option<&'static str>,
+    pub(crate) handle: Option<net_io::ListenerHandle>,
+}
+
+/// A Unix socket file's permissions.
+///
+/// ```
+/// use serve_net::UnixMode;
+/// let mode = UnixMode { group: Some(33), ..UnixMode::new(0o660) };
+/// assert_eq!(mode.mode, 0o660);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnixMode {
+    /// The permission bits (only the low 9 bits are used).
+    pub mode: u32,
+    /// The file's owner; `None` leaves it as created.
+    pub owner: Option<u32>,
+    /// The file's group; `None` leaves it as created.
+    pub group: Option<u32>,
+}
+
+impl UnixMode {
+    /// These permission bits, owner and group unchanged.
+    #[must_use]
+    pub const fn new(mode: u32) -> Self {
+        UnixMode {
+            mode,
+            owner: None,
+            group: None,
+        }
+    }
+}
+
+impl Default for UnixMode {
+    /// `0o660`: the owner and the file's group may connect.
+    fn default() -> Self {
+        UnixMode::new(0o660)
+    }
 }
 
 impl ListenerSpec {
@@ -59,7 +112,80 @@ impl ListenerSpec {
             max_connections: None,
             public_bind: None,
             broad_trust: None,
+            unix_mode: UnixMode::default(),
+            world_writable: None,
+            handle: None,
         }
+    }
+
+    /// The socket systemd passed under `name` (`LISTEN_FDNAMES`), or by
+    /// position when the manager passed no names. With
+    /// [`fallback_bind`](Self::fallback_bind) an address is bound when the
+    /// process was not socket-activated. Inherited sockets no listener names
+    /// are closed. A Unix socket needs `Ingress::Unix`.
+    ///
+    /// ```
+    /// use serve_net::ListenerSpec;
+    /// let web = ListenerSpec::inherited("web").fallback_bind("127.0.0.1:8080".parse().unwrap());
+    /// assert_eq!(web.name(), "web");
+    /// ```
+    pub fn inherited(name: &str) -> Self {
+        let mut spec = ListenerSpec::tcp(name, &[][..] as &[SocketAddr]);
+        spec.source = ListenerSource::Inherited {
+            name: name.to_owned(),
+            fallback: None,
+        };
+        spec
+    }
+
+    /// The address an inherited listener binds when the process was not
+    /// socket-activated (development, tests).
+    pub fn fallback_bind(mut self, addr: SocketAddr) -> Self {
+        if let ListenerSource::Inherited { fallback, .. } = &mut self.source {
+            *fallback = Some(addr);
+        }
+        self
+    }
+
+    /// A listening socket received from a supervisor through net-io's
+    /// hand-off functions (`recv_listeners`) or released by another server.
+    /// A Unix socket needs `Ingress::Unix`.
+    pub fn handed_off(name: &str, listener: net_io::ListenerHandle) -> Self {
+        let mut spec = ListenerSpec::tcp(name, &[][..] as &[SocketAddr]);
+        spec.source = ListenerSource::HandedOff;
+        spec.handle = Some(listener);
+        spec
+    }
+
+    /// A Unix socket listener at `path`. net-io binds it atomically, gives the
+    /// file its mode before it listens, and removes a stale socket file only
+    /// when nothing listens on it. The ingress defaults to
+    /// `Ingress::Unix(UnixPeerTrust::SameUser, None)`.
+    ///
+    /// ```
+    /// use serve_net::{Ingress, ListenerSpec, UnixPeerTrust};
+    /// let api = ListenerSpec::unix("api", "/run/myapp/api.sock")
+    ///     .ingress(Ingress::Unix(UnixPeerTrust::Users(vec![33]), None));
+    /// assert_eq!(api.name(), "api");
+    /// ```
+    pub fn unix(name: &str, path: impl Into<PathBuf>) -> Self {
+        let mut spec = ListenerSpec::tcp(name, &[][..] as &[SocketAddr]);
+        spec.source = ListenerSource::Unix(path.into());
+        spec.ingress = Ingress::Unix(UnixPeerTrust::SameUser, None);
+        spec
+    }
+
+    /// The socket file's permissions (default `0o660`, Unix listeners only).
+    pub fn unix_mode(mut self, mode: UnixMode) -> Self {
+        self.unix_mode = mode;
+        self
+    }
+
+    /// Permits a socket mode writable by others. The reason is kept and
+    /// reported.
+    pub fn allow_world_writable(mut self, reason: &'static str) -> Self {
+        self.world_writable = Some(reason);
+        self
     }
 
     /// How clients reach this listener.

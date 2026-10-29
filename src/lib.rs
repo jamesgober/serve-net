@@ -61,8 +61,8 @@ pub mod testing;
 pub use client::{ClientInfo, IngressKind, Scheme};
 pub use config::{
     Budget, EngineChoice, ForwardedSource, Ingress, KeepAlive, Limits, ListenerSource,
-    ListenerSpec, MissingHeader, Profile, ProfileId, ProfileTable, ProxySource, UnknownClient,
-    Workers,
+    ListenerSpec, MissingHeader, Profile, ProfileId, ProfileTable, ProxySource, UnixMode,
+    UnixPeerTrust, UnknownClient, Workers,
 };
 pub use envelope::{Envelope, RequestSeq};
 pub use error::{ConfigError, ConfigErrors, ConfigWarning, EndReason, RuleId, ServeError, Subject};

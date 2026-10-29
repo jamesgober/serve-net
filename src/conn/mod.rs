@@ -106,6 +106,36 @@ pub(crate) struct ListenerRuntime {
     pub(crate) profile: ProfileId,
     pub(crate) proxy: Option<ProxySource>,
     pub(crate) declared_scheme: Scheme,
+    /// On a Unix socket: who may connect.
+    pub(crate) unix: Option<UnixRuntime>,
+}
+
+/// A Unix listener's peer rule.
+#[derive(Debug, Clone)]
+pub(crate) struct UnixRuntime {
+    pub(crate) trust: crate::config::UnixPeerTrust,
+    /// The uid this process runs as (`SameUser`), read from the bound socket
+    /// file; unset means no peer passes (fail closed).
+    pub(crate) same_user: Arc<std::sync::OnceLock<u32>>,
+}
+
+impl UnixRuntime {
+    /// Whether a peer with these credentials may connect.
+    pub(crate) fn admits(&self, credentials: Option<net_io::PeerCredentials>) -> bool {
+        use crate::config::UnixPeerTrust;
+        match &self.trust {
+            UnixPeerTrust::AnyLocalPeer => true,
+            UnixPeerTrust::SameUser => credentials
+                .and_then(|c| c.uid)
+                .is_some_and(|uid| self.same_user.get() == Some(&uid)),
+            UnixPeerTrust::Users(uids) => credentials
+                .and_then(|c| c.uid)
+                .is_some_and(|uid| uids.contains(&uid)),
+            UnixPeerTrust::Groups(gids) => credentials
+                .and_then(|c| c.gid)
+                .is_some_and(|gid| gids.contains(&gid)),
+        }
+    }
 }
 
 /// What every connection of one server shares.
@@ -193,6 +223,8 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     wipe: bool,
     /// A drain was seen on this connection (for the drain report's counts).
     draining_seen: bool,
+    /// The connection's PROXY header facts, on a PROXY listener.
+    proxy_facts: Option<Arc<net_io::ProxyFacts>>,
 }
 
 impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
@@ -278,7 +310,13 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             first_byte: None,
             wipe,
             draining_seen: false,
+            proxy_facts: None,
         }
+    }
+
+    /// The facts net-io read from the connection's PROXY header.
+    pub(crate) fn set_proxy_facts(&mut self, facts: Option<Arc<net_io::ProxyFacts>>) {
+        self.proxy_facts = facts;
     }
 
     fn compiled(&self) -> Option<&Compiled> {
@@ -788,6 +826,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 proxy: listener.and_then(|l| l.proxy.as_ref()),
                 declared_scheme: listener.map_or(Scheme::Http, |l| l.declared_scheme),
                 resolved: None,
+                proxy_facts: self.proxy_facts.as_deref(),
             };
             match self.engine.head() {
                 None => None,
@@ -989,6 +1028,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 proxy: listener.and_then(|l| l.proxy.as_ref()),
                 declared_scheme: listener.map_or(Scheme::Http, |l| l.declared_scheme),
                 resolved: Some(self.env.client),
+                proxy_facts: self.proxy_facts.as_deref(),
             };
             let discard = self
                 .request

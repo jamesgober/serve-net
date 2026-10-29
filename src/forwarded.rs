@@ -123,16 +123,28 @@ pub(crate) struct Resolved<'h> {
 }
 
 /// Resolves the client of one request.
+#[cfg(test)]
 pub(crate) fn resolve<'h, T: Trust, F: FieldLines<'h>>(
     peer: IpAddr,
     peer_port: u16,
     rules: &Rules<'_, T>,
     head: &F,
 ) -> Result<Resolved<'h>, WalkError> {
-    let peer = normalize(peer);
-    if !rules.trusted.trusts(peer) {
+    resolve_from(Some(peer), peer_port, rules, head)
+}
+
+/// As [`resolve`]; `None` is a peer trusted without an address (a Unix
+/// socket peer that passed its credential check).
+pub(crate) fn resolve_from<'h, T: Trust, F: FieldLines<'h>>(
+    peer: Option<IpAddr>,
+    peer_port: u16,
+    rules: &Rules<'_, T>,
+    head: &F,
+) -> Result<Resolved<'h>, WalkError> {
+    let peer = peer.map(normalize);
+    if let Some(ip) = peer.filter(|ip| !rules.trusted.trusts(*ip)) {
         return Ok(Resolved {
-            client: Some(peer),
+            client: Some(ip),
             port: peer_port,
             hops: 0,
             scheme: None,
@@ -156,7 +168,7 @@ pub(crate) fn resolve<'h, T: Trust, F: FieldLines<'h>>(
             MissingHeader::Refuse => Err(WalkError::Missing),
             MissingHeader::UsePeer => {
                 let mut out = Resolved {
-                    client: Some(peer),
+                    client: peer,
                     port: peer_port,
                     hops: 0,
                     scheme: None,

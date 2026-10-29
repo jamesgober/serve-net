@@ -19,15 +19,46 @@ pub enum Ingress {
     Direct,
     /// Behind a reverse proxy or a load balancer.
     Proxy(ProxySource),
+    /// Over a Unix socket: peers must pass `UnixPeerTrust`; with `None` the
+    /// local peer is the client, with a source the proxy on the other end of
+    /// the socket names the client (its peer is trusted by credentials, so the
+    /// source's trust list covers only further hops).
+    Unix(UnixPeerTrust, Option<ProxySource>),
 }
 
 impl Ingress {
     pub(crate) fn proxy(&self) -> Option<&ProxySource> {
         match self {
-            Ingress::Proxy(p) => Some(p),
-            Ingress::Direct => None,
+            Ingress::Proxy(p) | Ingress::Unix(_, Some(p)) => Some(p),
+            Ingress::Direct | Ingress::Unix(_, None) => None,
         }
     }
+
+    pub(crate) fn is_unix(&self) -> bool {
+        matches!(self, Ingress::Unix(..))
+    }
+}
+
+/// Who may connect to a Unix listener, checked against the peer's
+/// credentials when the connection opens; a peer that fails is closed before
+/// any byte is read.
+///
+/// ```
+/// use serve_net::UnixPeerTrust;
+/// let web_server = UnixPeerTrust::Users(vec![33]); // www-data
+/// # let _ = web_server;
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnixPeerTrust {
+    /// Only the user this process runs as.
+    SameUser,
+    /// Only these user ids.
+    Users(Vec<u32>),
+    /// Only peers whose primary group is one of these.
+    Groups(Vec<u32>),
+    /// Anyone who can open the socket file (its mode decides).
+    AnyLocalPeer,
 }
 
 /// Where the real client comes from behind a front end, and whom to believe.
@@ -59,7 +90,6 @@ pub struct ProxySource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProxyKind {
     Headers(ForwardedSource),
-    #[allow(dead_code)] // the PROXY protocol ingress ships in 0.4
     ProxyProtocol(ProxyVersions),
 }
 
@@ -67,6 +97,26 @@ impl ProxySource {
     /// `X-Forwarded-For` (with `X-Forwarded-Proto` and `X-Forwarded-Host` when trusted).
     pub fn forwarded_for(trusted: TrustedProxies) -> Self {
         Self::headers(ForwardedSource::XForwardedFor, trusted)
+    }
+
+    /// The PROXY protocol: net-io reads a complete header of one of
+    /// `versions` from a trusted peer before any byte reaches the engine, and
+    /// closes every connection from any other peer before reading. A v2
+    /// `LOCAL` header (the proxy's own health check) keeps the socket peer
+    /// and sets [`ClientInfo::is_proxy_local`](crate::ClientInfo::is_proxy_local).
+    /// With `trust_scheme` an SSL TLV marks the connection `https`; with
+    /// `trust_host` the authority TLV gives the authority.
+    ///
+    /// ```
+    /// use serve_net::{ProxySource, ProxyVersions, TrustedProxies};
+    /// let haproxy = ProxySource::proxy_protocol(ProxyVersions::V2, TrustedProxies::loopback());
+    /// # let _ = haproxy;
+    /// ```
+    pub fn proxy_protocol(versions: ProxyVersions, trusted: TrustedProxies) -> Self {
+        ProxySource {
+            kind: ProxyKind::ProxyProtocol(versions),
+            ..Self::headers(ForwardedSource::XForwardedFor, trusted)
+        }
     }
 
     /// Forwarded headers of the given kind.

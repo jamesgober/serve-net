@@ -158,6 +158,48 @@ fn test_loopback_behind_proxy_many_connections_from_one_peer() {
 }
 
 #[test]
+fn test_loopback_mixed_server_keeps_per_source_cap_on_direct_listener() {
+    use serve_net::{Ingress, ListenerSpec, ProxySource, Server, TrustedProxies};
+    let server = Server::builder()
+        .listener(
+            ListenerSpec::tcp("site", "127.0.0.1:0").ingress(Ingress::Proxy(
+                ProxySource::forwarded_for(TrustedProxies::loopback()),
+            )),
+        )
+        .listener(ListenerSpec::tcp("direct", "127.0.0.1:0"))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "ok");
+        }))
+        .unwrap();
+    let listeners = server.listeners();
+    let proxied = listeners[0].local.socket_addr().unwrap();
+    let direct = listeners[1].local.socket_addr().unwrap();
+    // The proxy listener takes more than the per-source default from one peer.
+    let mut through: Vec<TcpStream> = (0..20).map(|_| connect(proxied)).collect();
+    for (i, c) in through.iter_mut().enumerate() {
+        let a = exchange(
+            c,
+            b"GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 192.0.2.1\r\n\r\n",
+        );
+        assert!(a.starts_with("HTTP/1.1 200"), "proxied {i}: {a}");
+    }
+    // The direct listener still caps one address at net-io's default (16 on
+    // the blocking driver): the 17th connection is not served.
+    let mut held: Vec<TcpStream> = (0..16).map(|_| connect(direct)).collect();
+    for (i, c) in held.iter_mut().enumerate() {
+        let a = exchange(c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(a.starts_with("HTTP/1.1 200"), "direct {i}: {a}");
+    }
+    let mut extra = connect(direct);
+    let _ = extra.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut buf = [0u8; 64];
+    let served = matches!(extra.read(&mut buf), Ok(n) if n > 0);
+    assert!(!served, "a 17th connection from one address was served");
+    drop((through, held, extra));
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+#[test]
 fn test_loopback_bind_conflict_names_listener() {
     let first = start();
     let addr = first.local_addr().unwrap();
@@ -446,4 +488,183 @@ fn test_loopback_rounds_at_the_soft_cap_leak_nothing() {
     assert_eq!(stats.shed, 5, "{stats:?}");
     let report = server.drain(Duration::from_secs(2));
     assert_eq!(report.killed, 0);
+}
+
+/// A server behind the PROXY protocol that answers with what it learned.
+fn proxied(
+    versions: serve_net::ProxyVersions,
+    trusted: serve_net::TrustedProxies,
+) -> serve_net::Running {
+    use serve_net::{Ingress, ListenerSpec, ProxySource, Server};
+    Server::builder()
+        .listener(
+            ListenerSpec::tcp("edge", "127.0.0.1:0").ingress(Ingress::Proxy(
+                ProxySource::proxy_protocol(versions, trusted),
+            )),
+        )
+        .serve(serve_net::handler(|req, reply| {
+            let c = req.client();
+            let text = format!(
+                "{} {} {:?} local={}",
+                c.addr().map(|a| a.to_string()).unwrap_or_default(),
+                c.port(),
+                c.ingress(),
+                c.is_proxy_local()
+            );
+            reply.text(200, &text);
+        }))
+        .unwrap()
+}
+
+#[test]
+fn test_loopback_proxy_v1_gives_the_real_client() {
+    let server = proxied(
+        serve_net::ProxyVersions::Both,
+        serve_net::TrustedProxies::loopback(),
+    );
+    let addr = server.local_addr().unwrap();
+    let mut c = connect(addr);
+    c.write_all(b"PROXY TCP4 203.0.113.7 127.0.0.1 51000 80\r\n")
+        .unwrap();
+    let a = exchange(&mut c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(a.starts_with("HTTP/1.1 200"), "{a}");
+    assert!(
+        a.ends_with("203.0.113.7 51000 ProxyProtocol local=false"),
+        "{a}"
+    );
+    // Keep-alive: the second request on the connection keeps the client.
+    let b = exchange(&mut c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(
+        b.ends_with("203.0.113.7 51000 ProxyProtocol local=false"),
+        "{b}"
+    );
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+#[test]
+fn test_loopback_proxy_v2_and_local() {
+    let server = proxied(
+        serve_net::ProxyVersions::V2,
+        serve_net::TrustedProxies::loopback(),
+    );
+    let addr = server.local_addr().unwrap();
+    const SIG: &[u8] = b"\r\n\r\n\0\r\nQUIT\n";
+    // PROXY TCP4 198.51.100.9:443 -> 127.0.0.1:80
+    let mut v2 = SIG.to_vec();
+    v2.extend_from_slice(&[
+        0x21, 0x11, 0, 12, 198, 51, 100, 9, 127, 0, 0, 1, 0x01, 0xBB, 0, 80,
+    ]);
+    let mut c = connect(addr);
+    c.write_all(&v2).unwrap();
+    let a = exchange(&mut c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(
+        a.ends_with("198.51.100.9 443 ProxyProtocol local=false"),
+        "{a}"
+    );
+    // LOCAL: the proxy's own health check keeps the socket peer.
+    let mut local = SIG.to_vec();
+    local.extend_from_slice(&[0x20, 0x00, 0, 0]);
+    let mut h = connect(addr);
+    h.write_all(&local).unwrap();
+    let b = exchange(&mut h, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(b.contains("127.0.0.1"), "{b}");
+    assert!(b.ends_with("local=true"), "{b}");
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+#[test]
+fn test_loopback_proxy_from_untrusted_peer_is_closed_unread() {
+    let server = proxied(
+        serve_net::ProxyVersions::Both,
+        serve_net::TrustedProxies::parse("10.0.0.0/8").unwrap(),
+    );
+    let addr = server.local_addr().unwrap();
+    let mut c = connect(addr);
+    let _ = c.write_all(
+        b"PROXY TCP4 203.0.113.7 127.0.0.1 51000 80\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n",
+    );
+    let mut buf = [0u8; 64];
+    let served = matches!(c.read(&mut buf), Ok(n) if n > 0);
+    assert!(!served, "a connection from an untrusted proxy was served");
+    let stats = server.stats();
+    assert_eq!(stats.requests, 0, "{stats:?}");
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+/// A listening socket released by another server, as a supervisor would
+/// hand it over.
+fn released() -> (net_io::Server, SocketAddr, net_io::ListenerHandle) {
+    let old = net_io::ServerBuilder::new()
+        .listener(net_io::ListenerSpec::tcp("127.0.0.1:0"))
+        .handler(|_c: &mut net_io::TcpConnection| Ok(()))
+        .gate(net_io::AllowAll)
+        .build()
+        .unwrap();
+    let addr = old.listeners()[0].local.socket_addr().unwrap();
+    let handle = old.release_listeners().unwrap().pop().unwrap();
+    (old, addr, handle)
+}
+
+#[test]
+fn test_loopback_handed_off_socket_is_served_on_its_port() {
+    use serve_net::{ListenerSpec, Server};
+    let (old, addr, handle) = released();
+    // The old server stops; the socket lives on in the new one.
+    let _ = old.shutdown(std::time::Instant::now());
+    let server = Server::builder()
+        .listener(ListenerSpec::handed_off("web", handle))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "new process");
+        }))
+        .unwrap();
+    assert_eq!(server.local_addr(), Some(addr));
+    let mut c = connect(addr);
+    let a = exchange(&mut c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(a.ends_with("new process"), "{a}");
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+#[test]
+fn test_loopback_handed_off_socket_of_the_wrong_kind_is_refused() {
+    use serve_net::{Ingress, ListenerSpec, Server, UnixPeerTrust};
+    let (_old, _addr, handle) = released();
+    let err = Server::builder()
+        .listener(
+            ListenerSpec::handed_off("web", handle)
+                .ingress(Ingress::Unix(UnixPeerTrust::AnyLocalPeer, None)),
+        )
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "x");
+        }))
+        .unwrap_err();
+    assert!(
+        matches!(&err, serve_net::ServeError::HandOff { listener, .. } if listener == "web"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_loopback_inherited_without_systemd_uses_the_fallback() {
+    use serve_net::{ListenerSpec, Server};
+    // Not socket-activated: without a fallback the listener has no socket.
+    let err = Server::builder()
+        .listener(ListenerSpec::inherited("web"))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "x");
+        }))
+        .unwrap_err();
+    assert!(
+        matches!(&err, serve_net::ServeError::Inherited { listener, .. } if listener == "web"),
+        "{err}"
+    );
+    let server = Server::builder()
+        .listener(ListenerSpec::inherited("web").fallback_bind("127.0.0.1:0".parse().unwrap()))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "fallback");
+        }))
+        .unwrap();
+    let mut c = connect(server.local_addr().unwrap());
+    let a = exchange(&mut c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(a.ends_with("fallback"), "{a}");
+    let _ = server.drain(Duration::from_secs(2));
 }
