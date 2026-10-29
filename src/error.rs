@@ -34,6 +34,9 @@ pub enum RuleId {
     WorldWritableSocket,
     /// A uid or gid allowlist where the platform has no peer credentials.
     PeerCredentialsUnavailable,
+    /// An ingress that does not fit the listener's socket: `Unix` ingress on
+    /// a TCP listener, or a TCP ingress on a Unix socket.
+    IngressSource,
     /// Two listeners with one name.
     DuplicateName,
     /// A listener name outside 1 to 64 bytes of `[a-z0-9._-]`.
@@ -107,6 +110,7 @@ impl RuleId {
             RuleId::TrustParse => "trust_parse",
             RuleId::WorldWritableSocket => "world_writable_socket",
             RuleId::PeerCredentialsUnavailable => "peer_credentials_unavailable",
+            RuleId::IngressSource => "ingress_source",
             RuleId::DuplicateName => "duplicate_name",
             RuleId::BadName => "bad_name",
             RuleId::ProfileIdReserved => "profile_id_reserved",

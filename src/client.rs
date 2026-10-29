@@ -95,9 +95,21 @@ pub struct ClientInfo {
     scheme: Scheme,
     hops: u8,
     ingress: IngressKind,
-    peer: Option<SocketAddr>,
+    peer: Peer,
     proxy_local: bool,
 }
+
+/// The socket peer: an IP address, or a local peer's credentials. One slot,
+/// so a client stays small (`Copy`, at most 64 bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Peer {
+    Ip(SocketAddr),
+    /// User, group, and process ids; `u32::MAX` where the platform reports none.
+    Local([u32; 3]),
+    Unknown,
+}
+
+const NO_ID: u32 = u32::MAX;
 
 impl ClientInfo {
     /// A client that connected directly from `peer`; `tls` says whether the
@@ -115,8 +127,43 @@ impl ClientInfo {
             } else {
                 IngressKind::Direct
             },
-            peer: Some(peer),
+            peer: Peer::Ip(peer),
             proxy_local: false,
+        }
+    }
+
+    /// A client over a Unix socket: no address, the peer's credentials.
+    pub(crate) fn unix(credentials: Option<net_io::PeerCredentials>) -> ClientInfo {
+        ClientInfo {
+            addr: None,
+            port: 0,
+            scheme: Scheme::Http,
+            hops: 0,
+            ingress: IngressKind::Unix,
+            peer: match credentials {
+                Some(c) => Peer::Local([
+                    c.uid.unwrap_or(NO_ID),
+                    c.gid.unwrap_or(NO_ID),
+                    c.pid.unwrap_or(NO_ID),
+                ]),
+                None => Peer::Unknown,
+            },
+            proxy_local: false,
+        }
+    }
+
+    /// The Unix socket peer's credentials (None for TCP clients, or where the
+    /// platform reports none).
+    #[must_use]
+    pub fn peer_credentials(&self) -> Option<net_io::PeerCredentials> {
+        let id = |v: u32| (v != NO_ID).then_some(v);
+        match self.peer {
+            Peer::Local([uid, gid, pid]) => Some(net_io::PeerCredentials {
+                pid: id(pid),
+                uid: id(uid),
+                gid: id(gid),
+            }),
+            Peer::Ip(_) | Peer::Unknown => None,
         }
     }
 
@@ -160,7 +207,10 @@ impl ClientInfo {
     /// The socket peer, always kept (`None` on a Unix socket).
     #[must_use]
     pub fn peer(&self) -> Option<SocketAddr> {
-        self.peer
+        match self.peer {
+            Peer::Ip(a) => Some(a),
+            Peer::Local(_) | Peer::Unknown => None,
+        }
     }
 
     /// Whether a PROXY v2 `LOCAL` command named the proxy itself.

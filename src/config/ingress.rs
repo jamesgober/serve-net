@@ -19,15 +19,46 @@ pub enum Ingress {
     Direct,
     /// Behind a reverse proxy or a load balancer.
     Proxy(ProxySource),
+    /// Over a Unix socket: peers must pass `UnixPeerTrust`; with `None` the
+    /// local peer is the client, with a source the proxy on the other end of
+    /// the socket names the client (its peer is trusted by credentials, so the
+    /// source's trust list covers only further hops).
+    Unix(UnixPeerTrust, Option<ProxySource>),
 }
 
 impl Ingress {
     pub(crate) fn proxy(&self) -> Option<&ProxySource> {
         match self {
-            Ingress::Proxy(p) => Some(p),
-            Ingress::Direct => None,
+            Ingress::Proxy(p) | Ingress::Unix(_, Some(p)) => Some(p),
+            Ingress::Direct | Ingress::Unix(_, None) => None,
         }
     }
+
+    pub(crate) fn is_unix(&self) -> bool {
+        matches!(self, Ingress::Unix(..))
+    }
+}
+
+/// Who may connect to a Unix listener, checked against the peer's
+/// credentials when the connection opens; a peer that fails is closed before
+/// any byte is read.
+///
+/// ```
+/// use serve_net::UnixPeerTrust;
+/// let web_server = UnixPeerTrust::Users(vec![33]); // www-data
+/// # let _ = web_server;
+/// ```
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnixPeerTrust {
+    /// Only the user this process runs as.
+    SameUser,
+    /// Only these user ids.
+    Users(Vec<u32>),
+    /// Only peers whose primary group is one of these.
+    Groups(Vec<u32>),
+    /// Anyone who can open the socket file (its mode decides).
+    AnyLocalPeer,
 }
 
 /// Where the real client comes from behind a front end, and whom to believe.

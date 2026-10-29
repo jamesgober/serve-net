@@ -303,10 +303,19 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::SessionFactory for Fa
         let Some(runtime) = self.shared.listeners.get(listener) else {
             return Err(RefusalCause::Session);
         };
-        let Some(peer) = info.client_addr() else {
-            return Err(RefusalCause::Session);
+        let mut client = match &runtime.unix {
+            Some(unix) => {
+                // Checked before any byte is read; a peer that fails is closed.
+                if !unix.admits(info.peer_credentials) {
+                    return Err(RefusalCause::Credentials);
+                }
+                ClientInfo::unix(info.peer_credentials)
+            }
+            None => match info.client_addr() {
+                Some(peer) => ClientInfo::direct(peer, info.tls.is_some()),
+                None => return Err(RefusalCause::Session),
+            },
         };
-        let mut client = ClientInfo::direct(peer, info.tls.is_some());
         let proxy_protocol = runtime
             .proxy
             .as_ref()

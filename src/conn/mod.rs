@@ -106,6 +106,36 @@ pub(crate) struct ListenerRuntime {
     pub(crate) profile: ProfileId,
     pub(crate) proxy: Option<ProxySource>,
     pub(crate) declared_scheme: Scheme,
+    /// On a Unix socket: who may connect.
+    pub(crate) unix: Option<UnixRuntime>,
+}
+
+/// A Unix listener's peer rule.
+#[derive(Debug, Clone)]
+pub(crate) struct UnixRuntime {
+    pub(crate) trust: crate::config::UnixPeerTrust,
+    /// The uid this process runs as (`SameUser`), read from the bound socket
+    /// file; unset means no peer passes (fail closed).
+    pub(crate) same_user: Arc<std::sync::OnceLock<u32>>,
+}
+
+impl UnixRuntime {
+    /// Whether a peer with these credentials may connect.
+    pub(crate) fn admits(&self, credentials: Option<net_io::PeerCredentials>) -> bool {
+        use crate::config::UnixPeerTrust;
+        match &self.trust {
+            UnixPeerTrust::AnyLocalPeer => true,
+            UnixPeerTrust::SameUser => credentials
+                .and_then(|c| c.uid)
+                .is_some_and(|uid| self.same_user.get() == Some(&uid)),
+            UnixPeerTrust::Users(uids) => credentials
+                .and_then(|c| c.uid)
+                .is_some_and(|uid| uids.contains(&uid)),
+            UnixPeerTrust::Groups(gids) => credentials
+                .and_then(|c| c.gid)
+                .is_some_and(|gid| gids.contains(&gid)),
+        }
+    }
 }
 
 /// What every connection of one server shares.

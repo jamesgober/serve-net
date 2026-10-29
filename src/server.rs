@@ -11,7 +11,7 @@ use crate::config::{
     Workers,
 };
 use crate::conn::session::{Factory, Runtime};
-use crate::conn::{ListenerRuntime, Shared};
+use crate::conn::{ListenerRuntime, Shared, UnixRuntime};
 use crate::engine::{Family, Service};
 use crate::error::{ConfigErrors, ConfigWarning, ServeError};
 use crate::health::{HealthState, Tap};
@@ -494,7 +494,19 @@ where
                 profile: l.profile,
                 proxy: l.ingress.proxy().cloned(),
                 declared_scheme: l.scheme,
+                unix: match &l.ingress {
+                    crate::config::Ingress::Unix(trust, _) => Some(UnixRuntime {
+                        trust: trust.clone(),
+                        same_user: Arc::default(),
+                    }),
+                    _ => None,
+                },
             })
+            .collect::<Vec<_>>();
+        // Filled after bind, once the socket files exist.
+        let same_users: Vec<_> = runtime_listeners
+            .iter()
+            .map(|l| l.unix.as_ref().map(|u| Arc::clone(&u.same_user)))
             .collect();
         let listener_caps: Vec<Option<u32>> = listeners.iter().map(|l| l.max_connections).collect();
         let profile_caps: Vec<Option<u32>> =
@@ -518,11 +530,25 @@ where
             .limits(global)
             .control(Arc::clone(&merged));
         for spec in &listeners {
-            let ListenerSource::Tcp(addr) = spec.source else {
-                return Err(ServeError::Bind {
-                    listener: spec.name.clone(),
-                    source: net_io::NetError::NoAddresses,
-                });
+            let net_spec = match &spec.source {
+                ListenerSource::Tcp(addr) => net_io::ListenerSpec::tcp(*addr),
+                ListenerSource::Unix(path) => {
+                    let m = spec.unix_mode;
+                    let mut options = net_io::LocalOptions::new().mode(m.mode);
+                    if let Some(uid) = m.owner {
+                        options = options.owner(uid);
+                    }
+                    if let Some(gid) = m.group {
+                        options = options.group(gid);
+                    }
+                    net_io::ListenerSpec::unix(path.clone(), options)
+                }
+                ListenerSource::Unresolved => {
+                    return Err(ServeError::Bind {
+                        listener: spec.name.clone(),
+                        source: net_io::NetError::NoAddresses,
+                    });
+                }
             };
             let compiled = profiles.compiled(spec.profile);
             let behind = spec.ingress.proxy().is_some();
@@ -554,18 +580,21 @@ where
                 own = own.max_per_source(listener_hard, net_io::PrefixPolicy::DEFAULT);
             }
             let own = own.build().map_err(ServeError::Start)?;
-            let mut net_spec = net_io::ListenerSpec::tcp(addr).name(&spec.name).limits(own);
+            let mut net_spec = net_spec.name(&spec.name).limits(own);
             if let Some(ProxySource {
                 kind: ProxyKind::ProxyProtocol(versions),
                 trusted,
                 ..
             }) = proxy
             {
-                net_spec = net_spec
-                    .proxy(net_io::ProxyMode::Required {
-                        versions: *versions,
-                    })
-                    .trusted_proxies(trusted.clone());
+                net_spec = net_spec.proxy(net_io::ProxyMode::Required {
+                    versions: *versions,
+                });
+                // Over a Unix socket every peer that passed its credential
+                // check is trusted; net-io ignores the list there.
+                if !spec.ingress.is_unix() {
+                    net_spec = net_spec.trusted_proxies(trusted.clone());
+                }
             }
             net = net.listener(net_spec);
         }
@@ -596,10 +625,20 @@ where
             .events(events)
             .build()
             .map_err(|e| bind_error(&listeners, e))?;
+        // SameUser: the uid this process runs as is the owner of the socket
+        // file it just created.
+        for (spec, cell) in listeners.iter().zip(&same_users) {
+            if let (ListenerSource::Unix(path), Some(cell)) = (&spec.source, cell) {
+                if let Some(uid) = file_owner(path) {
+                    let _ = cell.set(uid);
+                }
+            }
+        }
         let listeners = listeners
             .into_iter()
             .map(|l| ListenerMeta {
                 ingress: match l.ingress.proxy().map(|p| p.kind) {
+                    None if l.ingress.is_unix() => IngressKind::Unix,
                     None => IngressKind::Direct,
                     Some(ProxyKind::Headers(_)) => IngressKind::Forwarded,
                     Some(ProxyKind::ProxyProtocol(_)) => IngressKind::ProxyProtocol,
@@ -618,6 +657,18 @@ where
             health,
         }))
     }
+}
+
+/// The owner of a file, where the platform has one.
+#[cfg(unix)]
+fn file_owner(path: &std::path::Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.uid())
+}
+
+#[cfg(not(unix))]
+fn file_owner(_path: &std::path::Path) -> Option<u32> {
+    None
 }
 
 /// Names the listener a net-io bind error is about.

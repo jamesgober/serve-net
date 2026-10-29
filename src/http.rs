@@ -433,7 +433,14 @@ impl Family for HttpFamily {
                         client,
                     ));
                 }
-                let peer = base.peer().ok_or(ingress_error)?;
+                // A Unix socket peer has no address; it passed its credential
+                // check, so the walk starts from a trusted hop.
+                let unix = base.ingress() == IngressKind::Unix;
+                let peer = match base.peer() {
+                    Some(p) => Some(p),
+                    None if unix => None,
+                    None => return Err(ingress_error),
+                };
                 let rules = forwarded::Rules {
                     source,
                     trusted: &proxy.trusted,
@@ -443,8 +450,13 @@ impl Family for HttpFamily {
                     trust_scheme: proxy.trust_scheme,
                     trust_host: proxy.trust_host,
                 };
-                let found = forwarded::resolve(peer.ip(), peer.port(), &rules, &raw)
-                    .map_err(|_| ingress_error)?;
+                let found = forwarded::resolve_from(
+                    peer.map(|p| p.ip()),
+                    peer.map_or(0, |p| p.port()),
+                    &rules,
+                    &raw,
+                )
+                .map_err(|_| ingress_error)?;
                 let client = if found.forwarded {
                     base.behind_proxy(found.client, found.port, found.hops, IngressKind::Forwarded)
                         .with_scheme(found.scheme.unwrap_or(cx.declared_scheme))

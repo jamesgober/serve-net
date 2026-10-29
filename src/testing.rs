@@ -446,6 +446,7 @@ where
         profile: ProfileId(0),
         proxy,
         declared_scheme: scheme,
+        unix: None,
     };
     let shared = Shared {
         family: HttpFamily,

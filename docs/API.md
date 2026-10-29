@@ -1018,7 +1018,7 @@ pub enum UnknownClient { #[default] Allow, Refuse }
 pub enum UnixPeerTrust { SameUser, Users(Vec<u32>), Groups(Vec<u32>), AnyLocalPeer }
 ```
 
-Who may connect to a Unix listener, checked against net-io's peer credentials when the connection opens; a peer that fails is closed before any byte is read. On a platform without peer credentials only `AnyLocalPeer` validates (`RuleId::PeerCredentialsUnavailable`). P1, Tier 2, `0.4.0`.
+Who may connect to a Unix listener, checked against net-io's peer credentials when the connection opens; a peer that fails is closed before any byte is read. `SameUser` is the owner of the socket file this process created (read after bind, so no system call beyond `stat`); until it is known no peer passes. On a platform without peer credentials only `AnyLocalPeer` validates (`RuleId::PeerCredentialsUnavailable`). P1, Tier 2, `0.4.0`.
 
 ### `FastCgiIngress`
 
@@ -2287,6 +2287,7 @@ impl RuleId { pub const fn as_str(self) -> &'static str; }   // stable snake_cas
 | `TrustParse` | a trust entry in text (Tier 1) that is not an address or CIDR, or has host bits set | none |
 | `WorldWritableSocket` | a Unix socket mode writable by others | `allow_world_writable(reason)` |
 | `PeerCredentialsUnavailable` | a uid or gid allowlist where the platform has no peer credentials | `UnixPeerTrust::AnyLocalPeer` |
+| `IngressSource` | `Ingress::Unix` on a TCP listener, or `Direct` or `Proxy` on a Unix socket listener (`0.4.0`) | none |
 | `DuplicateName`, `BadName` | two listeners with one name; a name outside 1 to 64 bytes of `[a-z0-9._-]` | none |
 | `ProfileIdReserved`, `ProfileGap`, `UnknownProfile` | `ProfileId(255)`; ids not dense from 0 or repeated; a listener naming a missing profile | none |
 | `DeadlineOrder`, `DeadlineRange` | `request_timeout` below `head_timeout`; keep-alive idle 0 with keep-alive on; a value outside its range | none |
