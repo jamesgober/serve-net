@@ -953,12 +953,12 @@ At least one new defence idea per version, written as hypothesis, method, and ex
 
 ## 14. Open decisions
 
-All technical decisions are taken (section 16). Left for James:
+All technical decisions are taken (section 16). None is open for James.
 
-| Id | Question | Recommendation |
+| Id | Question | Answer |
 |---|---|---|
-| O-4 | Approve `docs/API.md` as the 0.2 design lock | approve; the reconciliations with net-io's lock are D-007 to D-030 |
-| O-5 | Publish 0.2.0 to crates.io to claim the name (it was never published) | yes, after approval, as net-io and the other stack crates did |
+| O-4 | Approve `docs/API.md` as the 0.2 design lock | approved by James on 2026-10-29: "I approve ... serve-net's design lock PR #1 including publishing serve-net 0.2.0" |
+| O-5 | Publish 0.2.0 to crates.io to claim the name (it was never published) | approved by James on 2026-10-29 in the same words; published with the 0.2.0 release |
 
 The earlier O-1 (name), O-2 (core contract with the system kernel), and O-3 (publish 0.1.0) are closed: O-1 by use, O-2 by D-006 (serve-net has no core of its own; its owner calls the boot and shutdown steps of 3.4), O-3 by O-5.
 
