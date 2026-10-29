@@ -1,0 +1,44 @@
+[package]
+name = "serve-net-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serve-net = { path = ".." }
+
+# Its own workspace, so the library's builds never include it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "forwarded_xff"
+path = "fuzz_targets/forwarded_xff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "forwarded_rfc7239"
+path = "fuzz_targets/forwarded_rfc7239.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "conn_sim"
+path = "fuzz_targets/conn_sim.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false

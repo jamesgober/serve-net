@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "serve-net"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -14,6 +14,9 @@ license = "Apache-2.0 OR MIT"
 
 # Readme
 readme = "README.md"
+
+# The fuzz crate is its own workspace and is not part of the package.
+exclude = ["fuzz/"]
 
 # Description
 description = "The network service engine for Rust: listeners over net-io, ingress from direct clients, reverse proxies (PROXY protocol or trusted forwarded headers), Unix sockets, and FastCGI, a per-connection engine with a slot for any sans-IO protocol engine, admission, drain, and restarts without dropped connections."
@@ -44,19 +47,53 @@ path = "src/lib.rs"
 # FEATURE FLAGS
 # #################################
 [features]
-default = []
+default = ["http1"]
+# The HTTP family over http-net: HttpService, HttpRequest, HttpReply,
+# engine::Http1, the Tier 1 functions, and the testing helpers.
+http1 = ["dep:http-net"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-# None in 0.2.0 (design lock). From 0.3.0: net-io (required) and http-net
-# (feature http1), each at a published version; see dev/PLAN.md section 3.2.
+# First-party crates at published versions only (dev/PLAN.md section 3.2).
+# net-io: the transport (required).
+net-io = "0.3"
+http-net = { version = "0.6", default-features = false, optional = true }
 
 
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# The loom models run with RUSTFLAGS="--cfg serve_net_loom" (a name of our
+# own: `--cfg loom` reaches every crate in the build, net-io included).
+[target.'cfg(serve_net_loom)'.dev-dependencies]
+loom = "0.7"
+
+
+# LINTS
+# #################################
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(serve_net_loom)"] }
+
+
+# BENCHMARKS
+# #################################
+[[example]]
+name = "hello"
+required-features = ["http1"]
+
+[[example]]
+name = "behind_proxy"
+required-features = ["http1"]
+
+[[bench]]
+name = "core"
+harness = false
+required-features = ["http1"]
 
 
 # RELEASE PROFILE

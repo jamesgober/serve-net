@@ -13,6 +13,50 @@
 
 ---
 
+## [0.3.0] - 2026-10-29
+
+The first working server: HTTP/1.1 over net-io 0.3's blocking driver, with
+every default limit and defence on, behind a reverse proxy or facing clients
+directly.
+
+### Added
+
+- Tier 1: `serve_net::http(addr, handler)` and
+  `serve_net::http_behind_proxy(addr, trusted, handler)`.
+- Building and running: `Server::builder()` with listeners, profiles,
+  limits, keep-alive, workers, and every hook (`admit`, `dispatch`,
+  `checkpoint`, `observer`, `gate`, `events`, `control`); `build`, `Built`,
+  `bind`, `bind_family`, `Bound`, `open`, `serve`; `Running` with
+  `local_addr`, `listeners`, `close_door`, `drain`, `drain_handle`, `wait`,
+  `stats`, `health`, `server_handle`; `DrainHandle`, `DrainReport`,
+  `ListenerInfo`, `ListenerState`, `Health`, `HealthIssue`, `Stats`.
+- Ingress: direct clients and trusted forwarded headers (`X-Forwarded-For`,
+  RFC 7239 `Forwarded`, a single address header) with the right-to-left
+  walk, client normalization (`ClientInfo`, `Scheme`, `IngressKind`).
+- The HTTP family over http-net 0.6 (`HttpService`, `HttpHead`,
+  `HttpRequest`, `HttpReply`, `handler`), deferred replies (`ReplyToken`),
+  admission (`InFlightCap`), checkpoints, observation, `Snapshot`, and the
+  engine and family traits for custom protocols.
+- Two-tier connection caps: soft caps answered with 503 and a jittered
+  `Retry-After`, net-io's hard caps above them; keep-alive shortened under
+  pressure; gate denials answered with the engine's refusal.
+- `testing`: `respond`, `TestRequest`, `TestReply`, `TestConnection`.
+- Examples `hello` and `behind_proxy`.
+- Tests: the simulated-connection suite, loopback socket tests on three
+  operating systems (keep-alive, pipelining, drain with a request in flight,
+  gate denial, proxies, the leak test), counting-allocator tests (zero
+  allocations per request in steady state), property tests, fuzz targets,
+  loom models, and criterion benchmarks.
+
+### Changed
+
+- The net-io items serve-net names (`ConnectionId`, `WorkerId`, `Lane`,
+  `Cidr`, `TrustedProxies`, `ControlLine`, `ControlState`, `Gate`,
+  `EventSink`, `CloseReason`, and the rest) are re-exported from net-io, and
+  the `net_io` and `http_net` crates themselves.
+
+---
+
 ## [0.2.0] - 2026-10-29
 
 The design lock: the public API is written down in full and the design
@@ -71,6 +115,7 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/serve-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/serve-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/serve-net/releases/tag/v0.1.0
