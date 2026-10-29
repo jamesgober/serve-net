@@ -11,8 +11,7 @@
 //! Design lock (`0.2.0`). The public API is written and locked in
 //! `docs/API.md`, and the design behind it in `dev/PLAN.md` (both in the
 //! [repository](https://github.com/jamesgober/serve-net)). `0.3.0` is the
-//! first working server; it waits for net-io `0.3.0`. This release holds only
-//! [`VERSION`].
+//! first working server. This release holds only [`VERSION`].
 
 #![doc(html_root_url = "https://docs.rs/serve-net")]
 #![cfg_attr(docsrs, feature(doc_cfg))]

@@ -13,12 +13,11 @@
 
 ---
 
-## [0.2.0] - 2026-10-23
+## [0.2.0] - 2026-10-29
 
 The design lock: the public API is written down in full and the design
 behind it recorded, reconciled with net-io's own 0.2 design lock. Still no
-functional code; `0.3.0` is the first working server and waits for net-io
-`0.3.0`.
+functional code; `0.3.0` is the first working server.
 
 ### Added
 

@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: design lock (<code>0.2.0</code>).</strong> No functional code yet. The public API is written and locked in <a href="./docs/API.md"><code>docs/API.md</code></a>; the design and every decision behind it are in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. <code>0.3.0</code> is the first working server; it waits for net-io <code>0.3.0</code>.
+        <strong>Status: design lock (<code>0.2.0</code>).</strong> No functional code yet. The public API is written and locked in <a href="./docs/API.md"><code>docs/API.md</code></a>; the design and every decision behind it are in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. <code>0.3.0</code> is the first working server.
     </blockquote>
 </div>
 
