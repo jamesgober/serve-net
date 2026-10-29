@@ -14,6 +14,17 @@ pub enum ListenerSource {
     Tcp(SocketAddr),
     /// Bind a Unix socket at this path.
     Unix(PathBuf),
+    /// The socket systemd passed under this name (or by position when it
+    /// passed no names); `fallback` is bound when the process was not
+    /// socket-activated.
+    Inherited {
+        /// The `LISTEN_FDNAMES` entry to take.
+        name: String,
+        /// The address to bind without socket activation.
+        fallback: Option<SocketAddr>,
+    },
+    /// A listening socket received from a supervisor (`handed_off`).
+    HandedOff,
     /// The address resolved to nothing; `build` reports it (rule `AddressResolve`).
     Unresolved,
 }
@@ -45,6 +56,7 @@ pub struct ListenerSpec {
     pub(crate) broad_trust: Option<&'static str>,
     pub(crate) unix_mode: UnixMode,
     pub(crate) world_writable: Option<&'static str>,
+    pub(crate) handle: Option<net_io::ListenerHandle>,
 }
 
 /// A Unix socket file's permissions.
@@ -102,7 +114,47 @@ impl ListenerSpec {
             broad_trust: None,
             unix_mode: UnixMode::default(),
             world_writable: None,
+            handle: None,
         }
+    }
+
+    /// The socket systemd passed under `name` (`LISTEN_FDNAMES`), or by
+    /// position when the manager passed no names. With
+    /// [`fallback_bind`](Self::fallback_bind) an address is bound when the
+    /// process was not socket-activated. Inherited sockets no listener names
+    /// are closed. A Unix socket needs `Ingress::Unix`.
+    ///
+    /// ```
+    /// use serve_net::ListenerSpec;
+    /// let web = ListenerSpec::inherited("web").fallback_bind("127.0.0.1:8080".parse().unwrap());
+    /// assert_eq!(web.name(), "web");
+    /// ```
+    pub fn inherited(name: &str) -> Self {
+        let mut spec = ListenerSpec::tcp(name, &[][..] as &[SocketAddr]);
+        spec.source = ListenerSource::Inherited {
+            name: name.to_owned(),
+            fallback: None,
+        };
+        spec
+    }
+
+    /// The address an inherited listener binds when the process was not
+    /// socket-activated (development, tests).
+    pub fn fallback_bind(mut self, addr: SocketAddr) -> Self {
+        if let ListenerSource::Inherited { fallback, .. } = &mut self.source {
+            *fallback = Some(addr);
+        }
+        self
+    }
+
+    /// A listening socket received from a supervisor through net-io's
+    /// hand-off functions (`recv_listeners`) or released by another server.
+    /// A Unix socket needs `Ingress::Unix`.
+    pub fn handed_off(name: &str, listener: net_io::ListenerHandle) -> Self {
+        let mut spec = ListenerSpec::tcp(name, &[][..] as &[SocketAddr]);
+        spec.source = ListenerSource::HandedOff;
+        spec.handle = Some(listener);
+        spec
     }
 
     /// A Unix socket listener at `path`. net-io binds it atomically, gives the

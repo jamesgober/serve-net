@@ -124,3 +124,33 @@ fn test_unix_proxy_on_the_socket_names_the_client() {
     assert!(b.starts_with("HTTP/1.1 400"), "{b}");
     let _ = server.drain(Duration::from_secs(2));
 }
+
+#[test]
+fn test_unix_handed_off_socket_keeps_its_file_and_peer_check() {
+    let path = socket_path("handoff");
+    let old = net_io::ServerBuilder::new()
+        .listener(net_io::ListenerSpec::unix(
+            &path,
+            net_io::LocalOptions::new(),
+        ))
+        .handler(|_c: &mut net_io::TcpConnection| Ok(()))
+        .gate(net_io::AllowAll)
+        .build()
+        .unwrap();
+    let handle = old.release_listeners().unwrap().pop().unwrap();
+    let _ = old.shutdown(std::time::Instant::now());
+    let server = Server::builder()
+        .listener(
+            ListenerSpec::handed_off("api", handle)
+                .ingress(Ingress::Unix(UnixPeerTrust::SameUser, None)),
+        )
+        .serve(serve_net::handler(|req, reply| {
+            let uid = req.client().peer_credentials().and_then(|p| p.uid);
+            reply.text(200, &format!("uid={uid:?}"));
+        }))
+        .unwrap();
+    let uid = own_uid(&path);
+    let a = ask(&path, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("served");
+    assert!(a.ends_with(&format!("uid=Some({uid})")), "{a}");
+    let _ = server.drain(Duration::from_secs(2));
+}

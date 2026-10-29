@@ -148,6 +148,7 @@ Exit: every item in the register below is closed or carried into `docs/STABILITY
 | serve-net handles no signals; every first program writes a stop channel | OD-8, hello-serve API friction | decide with the examples and a real deployment, as OD-8 planned for 0.9 |
 | Showing transport counters by close reason needed hand-built `CloseReason` values | hello-serve API friction | net-io 0.4 added `Stats::closes` and `Stats::refusals`; check serve-net's `Stats` reads as easily |
 | http-net is pinned at 0.6 while later versions exist | 0.3 | take the current http-net, with the allocation and benchmark tests as the check |
+| A failed `bind` closes inherited and handed-off sockets instead of releasing them to the owner | 0.4, D-059 | needs net-io to hand adopted sockets back when `build` fails (asked in the shared notes); then release them |
 | Anything else listed as "not yet" or "deferred" in this file, `dev/PLAN.md`, or `CHANGELOG.md` | all versions | sweep the documents for open wording before the exit |
 
 **2. A fresh performance tuning pass.** Profile the request path, admission, the forwarded walk, the drain, and connection setup on the reactor and the blocking driver; compare against the 0.6 baselines and the NFR-5 competitor numbers; fix regressions, take the wins that cost no security, and record every change with its security impact (NFR, `docs/PERFORMANCE.md`).

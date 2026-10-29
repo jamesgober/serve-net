@@ -590,3 +590,81 @@ fn test_loopback_proxy_from_untrusted_peer_is_closed_unread() {
     assert_eq!(stats.requests, 0, "{stats:?}");
     let _ = server.drain(Duration::from_secs(2));
 }
+
+/// A listening socket released by another server, as a supervisor would
+/// hand it over.
+fn released() -> (net_io::Server, SocketAddr, net_io::ListenerHandle) {
+    let old = net_io::ServerBuilder::new()
+        .listener(net_io::ListenerSpec::tcp("127.0.0.1:0"))
+        .handler(|_c: &mut net_io::TcpConnection| Ok(()))
+        .gate(net_io::AllowAll)
+        .build()
+        .unwrap();
+    let addr = old.listeners()[0].local.socket_addr().unwrap();
+    let handle = old.release_listeners().unwrap().pop().unwrap();
+    (old, addr, handle)
+}
+
+#[test]
+fn test_loopback_handed_off_socket_is_served_on_its_port() {
+    use serve_net::{ListenerSpec, Server};
+    let (old, addr, handle) = released();
+    // The old server stops; the socket lives on in the new one.
+    let _ = old.shutdown(std::time::Instant::now());
+    let server = Server::builder()
+        .listener(ListenerSpec::handed_off("web", handle))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "new process");
+        }))
+        .unwrap();
+    assert_eq!(server.local_addr(), Some(addr));
+    let mut c = connect(addr);
+    let a = exchange(&mut c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(a.ends_with("new process"), "{a}");
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+#[test]
+fn test_loopback_handed_off_socket_of_the_wrong_kind_is_refused() {
+    use serve_net::{Ingress, ListenerSpec, Server, UnixPeerTrust};
+    let (_old, _addr, handle) = released();
+    let err = Server::builder()
+        .listener(
+            ListenerSpec::handed_off("web", handle)
+                .ingress(Ingress::Unix(UnixPeerTrust::AnyLocalPeer, None)),
+        )
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "x");
+        }))
+        .unwrap_err();
+    assert!(
+        matches!(&err, serve_net::ServeError::HandOff { listener, .. } if listener == "web"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_loopback_inherited_without_systemd_uses_the_fallback() {
+    use serve_net::{ListenerSpec, Server};
+    // Not socket-activated: without a fallback the listener has no socket.
+    let err = Server::builder()
+        .listener(ListenerSpec::inherited("web"))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "x");
+        }))
+        .unwrap_err();
+    assert!(
+        matches!(&err, serve_net::ServeError::Inherited { listener, .. } if listener == "web"),
+        "{err}"
+    );
+    let server = Server::builder()
+        .listener(ListenerSpec::inherited("web").fallback_bind("127.0.0.1:0".parse().unwrap()))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "fallback");
+        }))
+        .unwrap();
+    let mut c = connect(server.local_addr().unwrap());
+    let a = exchange(&mut c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(a.ends_with("fallback"), "{a}");
+    let _ = server.drain(Duration::from_secs(2));
+}

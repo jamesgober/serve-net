@@ -1,7 +1,7 @@
 # serve-net - API Reference
 
 > Reference for every public item in `serve-net`, with signatures, behaviour, errors, costs, and examples.
-> **Current release: `0.2.0` (design lock; no functional code yet).** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
+> **Current release: `0.3.0` (the first working server).** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -548,7 +548,7 @@ impl Bound {
 
 `bind` takes the service and builds net-io's server: every listener is bound, adopted, inherited, or received in declaration order, net-io's PROXY expectation and trusted list are set per listener, and the workers start with the **door closed**: nothing is accepted (the kernel backlog may queue connections). This is the moment to drop privileges, after binding a privileged port and before any untrusted byte is read. `bind_family` does the same for a [custom family](#family-httpfamily) on listeners whose profile engine is `EngineChoice::Custom`.
 
-If any listener fails, everything bound so far is closed (inherited and handed-off sockets are released, not closed, so the owner can retry or pass them on) and the error names the failing listener.
+If any listener fails, everything bound so far is closed and the error names the failing listener. Inherited and handed-off sockets are to be released to the owner instead of closed; net-io 0.4's `build` consumes them, so until net-io can return them on a failed build they are closed too (tracked in `dev/ROADMAP.md`, v0.9.x register). Inherited sockets are matched by name first, then unnamed sockets by position; a socket no listener takes is closed.
 
 | Item | Grade | Tier | Version |
 |---|---|---|---|

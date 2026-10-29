@@ -463,7 +463,7 @@ where
         service: S,
     ) -> Result<Bound, ServeError> {
         let Built {
-            listeners,
+            mut listeners,
             profiles,
             limits,
             workers,
@@ -529,10 +529,73 @@ where
             .workers(threads)
             .limits(global)
             .control(Arc::clone(&merged));
-        for spec in &listeners {
-            let net_spec = match &spec.source {
-                ListenerSource::Tcp(addr) => net_io::ListenerSpec::tcp(*addr),
-                ListenerSource::Unix(path) => {
+        // systemd's sockets, matched to inherited listeners by name or position.
+        let mut inherited = if listeners
+            .iter()
+            .any(|l| matches!(l.source, ListenerSource::Inherited { .. }))
+        {
+            let passed = net_io::systemd().map_err(|_| ServeError::Inherited {
+                listener: first_inherited(&listeners),
+                reason: "the systemd environment (LISTEN_FDS, LISTEN_FDNAMES) is malformed, or a passed descriptor is not a listening socket",
+            })?;
+            match_inherited(&listeners, passed)
+        } else {
+            Vec::new()
+        };
+        for (index, spec) in listeners.iter_mut().enumerate() {
+            let adopted = match &spec.source {
+                ListenerSource::Inherited { fallback, .. } => {
+                    match inherited.get_mut(index).and_then(Option::take) {
+                        Some(handle) => Some(handle),
+                        None if fallback.is_some() => None,
+                        None => {
+                            return Err(ServeError::Inherited {
+                                listener: spec.name.clone(),
+                                reason: "no socket was passed for this listener and no fallback_bind is set; check the unit's FileDescriptorName=",
+                            });
+                        }
+                    }
+                }
+                ListenerSource::HandedOff => spec.handle.take(),
+                _ => None,
+            };
+            if let Some(handle) = &adopted {
+                let unix = handle.kind() == net_io::Transport::Unix;
+                if unix != spec.ingress.is_unix() {
+                    let reason = if unix {
+                        "the socket is a Unix socket; use Ingress::Unix"
+                    } else {
+                        "the socket is a TCP socket; Ingress::Unix needs a Unix socket"
+                    };
+                    return Err(match spec.source {
+                        ListenerSource::HandedOff => ServeError::HandOff {
+                            listener: spec.name.clone(),
+                            reason,
+                        },
+                        _ => ServeError::Inherited {
+                            listener: spec.name.clone(),
+                            reason,
+                        },
+                    });
+                }
+            }
+            let net_spec = match (&spec.source, adopted) {
+                (_, Some(handle)) => net_io::ListenerSpec::adopt(handle),
+                (
+                    ListenerSource::Inherited {
+                        fallback: Some(addr),
+                        ..
+                    },
+                    None,
+                ) => net_io::ListenerSpec::tcp(*addr),
+                (ListenerSource::HandedOff | ListenerSource::Inherited { .. }, None) => {
+                    return Err(ServeError::HandOff {
+                        listener: spec.name.clone(),
+                        reason: "the listener has no socket",
+                    });
+                }
+                (ListenerSource::Tcp(addr), None) => net_io::ListenerSpec::tcp(*addr),
+                (ListenerSource::Unix(path), None) => {
                     let m = spec.unix_mode;
                     let mut options = net_io::LocalOptions::new().mode(m.mode);
                     if let Some(uid) = m.owner {
@@ -543,7 +606,7 @@ where
                     }
                     net_io::ListenerSpec::unix(path.clone(), options)
                 }
-                ListenerSource::Unresolved => {
+                (ListenerSource::Unresolved, None) => {
                     return Err(ServeError::Bind {
                         listener: spec.name.clone(),
                         source: net_io::NetError::NoAddresses,
@@ -626,9 +689,12 @@ where
             .build()
             .map_err(|e| bind_error(&listeners, e))?;
         // SameUser: the uid this process runs as is the owner of the socket
-        // file it just created.
-        for (spec, cell) in listeners.iter().zip(&same_users) {
-            if let (ListenerSource::Unix(path), Some(cell)) = (&spec.source, cell) {
+        // file it created (or was given; an inherited file is the service's).
+        for info in server.listeners() {
+            let cell = same_users
+                .get(usize::from(info.id.get()))
+                .and_then(Option::as_ref);
+            if let (net_io::Endpoint::Unix(path), Some(cell)) = (&info.local, cell) {
                 if let Some(uid) = file_owner(path) {
                     let _ = cell.set(uid);
                 }
@@ -659,15 +725,58 @@ where
     }
 }
 
+/// The first inherited listener's name, for an error about the environment.
+fn first_inherited(listeners: &[ListenerSpec]) -> String {
+    listeners
+        .iter()
+        .find(|l| matches!(l.source, ListenerSource::Inherited { .. }))
+        .map_or_else(String::new, |l| l.name.clone())
+}
+
+/// Gives each inherited listener its socket: by name first, then the
+/// unnamed sockets in order to the listeners left. Sockets no listener takes
+/// are dropped (closed).
+fn match_inherited(
+    listeners: &[ListenerSpec],
+    passed: Vec<net_io::InheritedListener>,
+) -> Vec<Option<net_io::ListenerHandle>> {
+    let mut pool: Vec<Option<net_io::InheritedListener>> = passed.into_iter().map(Some).collect();
+    let mut out: Vec<Option<net_io::ListenerHandle>> = (0..listeners.len()).map(|_| None).collect();
+    for (i, l) in listeners.iter().enumerate() {
+        let ListenerSource::Inherited { name, .. } = &l.source else {
+            continue;
+        };
+        let found = pool.iter_mut().find(|p| {
+            p.as_ref()
+                .is_some_and(|p| p.name.as_deref() == Some(name.as_str()))
+        });
+        if let Some(slot) = found {
+            out[i] = slot.take().map(|p| p.handle);
+        }
+    }
+    for (i, l) in listeners.iter().enumerate() {
+        if !matches!(l.source, ListenerSource::Inherited { .. }) || out[i].is_some() {
+            continue;
+        }
+        let unnamed = pool
+            .iter_mut()
+            .find(|p| p.as_ref().is_some_and(|p| p.name.is_none()));
+        if let Some(slot) = unnamed {
+            out[i] = slot.take().map(|p| p.handle);
+        }
+    }
+    out
+}
+
 /// The owner of a file, where the platform has one.
 #[cfg(unix)]
-fn file_owner(path: &std::path::Path) -> Option<u32> {
+fn file_owner(path: &net_io::UnixPath) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).ok().map(|m| m.uid())
+    std::fs::metadata(path.as_path()).ok().map(|m| m.uid())
 }
 
 #[cfg(not(unix))]
-fn file_owner(_path: &std::path::Path) -> Option<u32> {
+fn file_owner(_path: &net_io::UnixPath) -> Option<u32> {
     None
 }
 
@@ -704,6 +813,53 @@ impl<H: Hooks> core::fmt::Debug for Built<H> {
 mod tests {
     use super::*;
     use crate::{Ingress, ProxySource, RuleId, TrustedProxies};
+
+    /// Listening sockets, released by a throwaway net-io server.
+    fn handles(n: usize) -> Vec<net_io::ListenerHandle> {
+        let mut b = net_io::ServerBuilder::new();
+        for _ in 0..n {
+            b = b.listener(net_io::ListenerSpec::tcp("127.0.0.1:0"));
+        }
+        let s = b
+            .handler(|_c: &mut net_io::TcpConnection| Ok(()))
+            .gate(net_io::AllowAll)
+            .build()
+            .unwrap();
+        s.release_listeners().unwrap()
+    }
+
+    #[test]
+    fn test_match_inherited_by_name_then_by_position() {
+        let mut h = handles(3);
+        let passed = vec![
+            net_io::InheritedListener {
+                name: None,
+                handle: h.pop().unwrap(),
+            },
+            net_io::InheritedListener {
+                name: Some("api".into()),
+                handle: h.pop().unwrap(),
+            },
+            net_io::InheritedListener {
+                name: Some("unused".into()),
+                handle: h.pop().unwrap(),
+            },
+        ];
+        let api_addr = passed[1].handle.local().clone();
+        let listeners = vec![
+            ListenerSpec::inherited("web"),
+            ListenerSpec::tcp("plain", "127.0.0.1:0"),
+            ListenerSpec::inherited("api"),
+            ListenerSpec::inherited("extra"),
+        ];
+        let got = match_inherited(&listeners, passed);
+        // "api" by name; "web" takes the unnamed socket; "extra" gets none,
+        // and the socket named "unused" is dropped.
+        assert_eq!(got[2].as_ref().map(|h| h.local().clone()), Some(api_addr));
+        assert!(got[0].is_some());
+        assert!(got[1].is_none());
+        assert!(got[3].is_none());
+    }
 
     #[test]
     fn test_build_reports_every_error_at_once() {

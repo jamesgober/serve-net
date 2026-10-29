@@ -327,6 +327,20 @@ pub enum ServeError {
     },
     /// net-io could not start its workers or open the door.
     Start(net_io::NetError),
+    /// An inherited socket is missing or of the wrong kind.
+    Inherited {
+        /// The listener's name.
+        listener: String,
+        /// What is wrong.
+        reason: &'static str,
+    },
+    /// A handed-off socket is not of the kind the listener's ingress expects.
+    HandOff {
+        /// The listener's name.
+        listener: String,
+        /// What is wrong.
+        reason: &'static str,
+    },
     /// The operation needs a server that is not draining.
     Draining,
 }
@@ -339,6 +353,12 @@ impl fmt::Display for ServeError {
                 write!(f, "listener `{listener}` could not be bound: {source}")
             }
             ServeError::Start(source) => write!(f, "the server could not start: {source}"),
+            ServeError::Inherited { listener, reason } => {
+                write!(f, "listener `{listener}`: {reason}")
+            }
+            ServeError::HandOff { listener, reason } => {
+                write!(f, "listener `{listener}`: {reason}")
+            }
             ServeError::Draining => {
                 f.write_str("the server is draining; start a new server instead")
             }
@@ -351,7 +371,9 @@ impl std::error::Error for ServeError {
         match self {
             ServeError::Config(errors) => Some(errors),
             ServeError::Bind { source, .. } | ServeError::Start(source) => Some(source),
-            ServeError::Draining => None,
+            ServeError::Inherited { .. } | ServeError::HandOff { .. } | ServeError::Draining => {
+                None
+            }
         }
     }
 }

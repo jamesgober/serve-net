@@ -167,6 +167,7 @@ fn binds(d: &Draft<'_>, f: &mut Findings) {
                     );
                 }
             }
+            ListenerSource::Inherited { .. } | ListenerSource::HandedOff => {}
             ListenerSource::Tcp(addr) => {
                 // Port 0 picks a free port each time, so two port-0 listeners never collide.
                 if addr.port() != 0 && !seen.insert(addr) {
@@ -271,7 +272,8 @@ fn public_bind(l: &ListenerSpec, f: &mut Findings) {
 fn unix(l: &ListenerSpec, f: &mut Findings) {
     let subject = || Subject::Listener(l.name.clone());
     let on_unix = matches!(l.source, ListenerSource::Unix(_));
-    if on_unix != l.ingress.is_unix() && !matches!(l.source, ListenerSource::Unresolved) {
+    let kind_known = matches!(l.source, ListenerSource::Tcp(_) | ListenerSource::Unix(_));
+    if on_unix != l.ingress.is_unix() && kind_known {
         f.error(
             RuleId::IngressSource,
             subject(),
