@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "serve-net"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "The network service engine for Rust: listeners through net-io, a per-connection engine with a slot for any protocol engine, the connection gate wired in, every ingress mode (direct, reverse proxy, Unix socket, FastCGI, CGI), drain, and a core for lifecycle."
+description = "The network service engine for Rust: listeners over net-io, ingress from direct clients, reverse proxies (PROXY protocol or trusted forwarded headers), Unix sockets, and FastCGI, a per-connection engine with a slot for any sans-IO protocol engine, admission, drain, and restarts without dropped connections."
 
 # Keywords (5 max)
 keywords = ["server", "network", "service", "http", "engine"]
@@ -50,8 +50,8 @@ default = []
 # DEPENDENCIES
 # #################################
 [dependencies]
-# None yet. Planned dependencies and the reason for each are listed in
-# dev/PLAN.md; each is added with the first code that needs it.
+# None in 0.2.0 (design lock). From 0.3.0: net-io (required) and http-net
+# (feature http1), each at a published version; see dev/PLAN.md section 3.2.
 
 
 # DEV DEPENDENCIES
