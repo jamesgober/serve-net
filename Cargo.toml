@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "serve-net"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -82,6 +82,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(serve_net_loom)"] }
 
 # BENCHMARKS
 # #################################
+[[example]]
+name = "hello"
+required-features = ["http1"]
+
+[[example]]
+name = "behind_proxy"
+required-features = ["http1"]
+
 [[bench]]
 name = "core"
 harness = false

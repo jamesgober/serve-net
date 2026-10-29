@@ -14,7 +14,7 @@ use crate::Finished;
 use crate::engine::{Family, Service};
 use crate::envelope::Envelope;
 use crate::error::EndReason;
-use crate::net::{ConnectionId, ControlLine, NoControl};
+use crate::net::{AllowAll, ConnectionId, ControlLine, EventSink, Gate, NoControl, NoopSink};
 use crate::reply::Reply;
 use crate::service::Outcome;
 
@@ -137,31 +137,60 @@ pub trait Hooks: Send + Sync + 'static {
     type Checkpoint: Checkpoint;
     /// Request events.
     type Observer: Observer;
+    /// The connection gate net-io consults.
+    type Gate: Gate;
+    /// The sink for net-io's transport events.
+    type Events: EventSink;
     /// The control line.
     type Control: ControlLine;
+    /// The TLS acceptor (set from 0.4).
+    type Tls: net_io::TlsAcceptor;
 }
 
 /// The hook values; programs never name this type.
-pub struct HookSet<A, D, K, O, C> {
+pub struct HookSet<A, D, K, O, G, E, C, T> {
     pub(crate) admit: A,
     pub(crate) dispatch: D,
     pub(crate) checkpoint: K,
     pub(crate) observer: O,
+    pub(crate) gate: G,
+    pub(crate) events: E,
     pub(crate) control: std::sync::Arc<C>,
+    pub(crate) tls: T,
 }
 
-impl<A: Admit, D: Dispatch, K: Checkpoint, O: Observer, C: ControlLine> Hooks
-    for HookSet<A, D, K, O, C>
+impl<A, D, K, O, G, E, C, T> Hooks for HookSet<A, D, K, O, G, E, C, T>
+where
+    A: Admit,
+    D: Dispatch,
+    K: Checkpoint,
+    O: Observer,
+    G: Gate,
+    E: EventSink,
+    C: ControlLine,
+    T: net_io::TlsAcceptor,
 {
     type Admit = A;
     type Dispatch = D;
     type Checkpoint = K;
     type Observer = O;
+    type Gate = G;
+    type Events = E;
     type Control = C;
+    type Tls = T;
 }
 
 /// The default hooks.
-pub type DefaultHooks = HookSet<InFlightCap, Inline, NoCheckpoint, NoObserver, NoControl>;
+pub type DefaultHooks = HookSet<
+    InFlightCap,
+    Inline,
+    NoCheckpoint,
+    NoObserver,
+    AllowAll,
+    NoopSink,
+    NoControl,
+    net_io::NoTls,
+>;
 
 impl Default for DefaultHooks {
     fn default() -> Self {
@@ -170,12 +199,15 @@ impl Default for DefaultHooks {
             dispatch: Inline,
             checkpoint: NoCheckpoint,
             observer: NoObserver,
+            gate: AllowAll,
+            events: NoopSink,
             control: std::sync::Arc::new(NoControl),
+            tls: net_io::NoTls,
         }
     }
 }
 
-impl<A, D, K, O, C> core::fmt::Debug for HookSet<A, D, K, O, C> {
+impl<A, D, K, O, G, E, C, T> core::fmt::Debug for HookSet<A, D, K, O, G, E, C, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("HookSet")
     }

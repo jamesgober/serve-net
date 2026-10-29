@@ -631,18 +631,92 @@ where
     A: std::net::ToSocketAddrs,
     F: Fn(&HttpRequest<'_>, &mut HttpReply) + Send + Sync + 'static,
 {
+    tier1(addr, None, handler)
+}
+
+/// As [`http`], behind a reverse proxy on the same host: the real client
+/// comes from `X-Forwarded-For`, walked right to left and believed only when
+/// the socket peer is in `trusted` (addresses and CIDR blocks separated by
+/// commas or whitespace, `"127.0.0.1, ::1"`). A trusted peer that sends no
+/// `X-Forwarded-For` is refused with 400; scheme and host are not taken from
+/// the proxy (Tier 2 has `trust_scheme` and `trust_host`).
+///
+/// ```
+/// // Refused at start-up: a trusting listener on every interface.
+/// let err = serve_net::http_behind_proxy("0.0.0.0:8080", "127.0.0.1", |_req, reply| {
+///     reply.text(200, "x");
+/// })
+/// .unwrap_err();
+/// assert!(err.to_string().contains("public"));
+/// ```
+///
+/// # Errors
+///
+/// As [`http`], plus [`ServeError::Config`](crate::ServeError::Config) with
+/// `RuleId::PublicBind`, `TrustParse`, `TrustEmpty`, `TrustTooBroad`, or
+/// `TrustWildcard`.
+pub fn http_behind_proxy<A, F>(
+    addr: A,
+    trusted: &str,
+    handler: F,
+) -> Result<crate::Running, crate::ServeError>
+where
+    A: std::net::ToSocketAddrs,
+    F: Fn(&HttpRequest<'_>, &mut HttpReply) + Send + Sync + 'static,
+{
+    use crate::error::{ConfigError, ConfigErrors, RuleId, Subject};
+    let trusted = crate::TrustedProxies::parse(trusted).map_err(|e| {
+        let error = match e {
+            crate::AddrError::Empty => ConfigError::new(
+                RuleId::TrustEmpty,
+                Subject::Listener("http-0".to_owned()),
+                "the trusted proxy list is empty",
+                "list the proxies' addresses, for example \"127.0.0.1, ::1\"",
+            ),
+            _ => ConfigError::new(
+                RuleId::TrustParse,
+                Subject::Listener("http-0".to_owned()),
+                "the trusted proxy list does not parse",
+                "use addresses or CIDR blocks separated by commas, for example \"10.0.0.0/8\"",
+            ),
+        };
+        crate::ServeError::Config(
+            ConfigErrors::from_vec(vec![error]).unwrap_or_else(|| unreachable!()),
+        )
+    })?;
+    tier1(addr, Some(trusted), handler)
+}
+
+/// The listeners of Tier 1: one per resolved address, `http-0`, `http-1`, ...
+fn tier1<A, F>(
+    addr: A,
+    trusted: Option<crate::TrustedProxies>,
+    handler: F,
+) -> Result<crate::Running, crate::ServeError>
+where
+    A: std::net::ToSocketAddrs,
+    F: Fn(&HttpRequest<'_>, &mut HttpReply) + Send + Sync + 'static,
+{
     let addrs: Vec<std::net::SocketAddr> = addr
         .to_socket_addrs()
         .map(Iterator::collect)
         .unwrap_or_default();
+    let spec = |name: &str, a: &[std::net::SocketAddr]| {
+        let l = crate::ListenerSpec::tcp(name, a);
+        match &trusted {
+            None => l,
+            Some(t) => l.ingress(crate::Ingress::Proxy(crate::ProxySource::forwarded_for(
+                t.clone(),
+            ))),
+        }
+    };
     let mut builder = crate::Server::builder();
     if addrs.is_empty() {
         // Resolves to nothing: validation names the rule.
-        let none: &[std::net::SocketAddr] = &[];
-        builder = builder.listener(crate::ListenerSpec::tcp("http-0", none));
+        builder = builder.listener(spec("http-0", &[]));
     }
     for (i, a) in addrs.iter().enumerate() {
-        builder = builder.listener(crate::ListenerSpec::tcp(&format!("http-{i}"), *a));
+        builder = builder.listener(spec(&format!("http-{i}"), core::slice::from_ref(a)));
     }
     builder.serve(Handler { f: handler })
 }

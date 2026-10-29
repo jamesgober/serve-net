@@ -39,7 +39,7 @@ No hard task moved later.
 ## v0.1.0 - Scaffold (DONE, 2026-10-13)
 - [x] Manifest, README, CHANGELOG, REPS, dual license, CI, deny, clippy, rustfmt, DIRECTIVES, ROADMAP, PLAN.
 
-## v0.2.0 - Design lock (CURRENT)
+## v0.2.0 - Design lock (DONE, 2026-10-29)
 Exit: James approves `docs/API.md`; every open decision answered or carried with a reason; CI green.
 - [x] `docs/API.md`: every public item with signature, behaviour, errors, cost, grade, tier, version, examples.
 - [x] `dev/PLAN.md` rewritten: role (D-006), the division of work with net-io (8.2), requirements FR-1 to FR-69 and NFR-1 to NFR-24, threats T-1 to T-40, validation rules, enterprise and distributed (section 6), decisions D-006 to D-035.
@@ -50,10 +50,10 @@ Exit: James approves `docs/API.md`; every open decision answered or carried with
 - [ ] James approves `docs/API.md` (PLAN O-4).
 - [ ] Release routine: 0.2.0 tagged, released, published to claim the name (PLAN O-5).
 
-## v0.3.0 - Core
+## v0.3.0 - Core (DONE, 2026-10-29)
 Exit: a browser and curl get a page from `serve_net::http("127.0.0.1:8080", ...)` on Windows and WSL Ubuntu; malformed requests are refused; a drain with a slow request in flight works; every state of the connection state machine is covered by the simulated-connection suite; CI green on three OSes.
 
-**Unblocked: net-io 0.3.0 is on crates.io (2026-10-26).** The parts that did not need net-io's code were built first on branch `feature/0.3-core`; the wire-up followed on `feature/0.3-net-io`, written against net-io's 0.3 code before it was published and now built against the published crate. Release order: 0.2.0 (PR #1, waiting for approval), then 0.3.0.
+**Released 2026-10-29.** net-io 0.3.0 reached crates.io on 2026-10-26. The parts that did not need net-io's code were built first on branch `feature/0.3-core`; the wire-up followed on `feature/0.3-net-io` (PR #2), written against net-io's 0.3 code before it was published and then built against the published crate. 0.2.0 was released first (PR #1), the same day.
 
 | Area | Items (`docs/API.md`) | Needs net-io code |
 |---|---|---|
@@ -89,10 +89,13 @@ net-io answered every request (2026-10-23, net-io D-081): `TrustedProxies` and `
 - [x] Tier 1 `http`.
 - [x] Loopback tests (`tests/loopback.rs`): routes and keep-alive, pipelining, sequential connections, drain through `DrainHandle` closing an idle keep-alive connection, a bind conflict naming the listener, 24 connections from one peer behind a proxy.
 - [x] A browser-style check: a local demo (not in the repository) served a page, `/health`, and a 404 on 127.0.0.1 with keep-alive, about 17,000 requests per second on one connection and 190,000 on 15 (p99 0.37 ms), and stopped cleanly on Ctrl+C.
-- [ ] `on_denied` (the gate's refusal bytes) and `Output::begin_response`/`end_response` markers, so a gate can deny a reply; `ListenerInfo`, `health`, `stats` (request counters, D-033); `DrainReport::requests_finished` and `refused_while_draining` (0 until counted); gate and event-sink passthrough; `EndReason::Transport(CloseReason)`.
-- [ ] Tier 1 `http_behind_proxy`; the `hello` and `behind_proxy` examples; loopback tests on Linux and macOS in CI; the leak test; `InFlightCap` benchmarks.
+- [x] Gate denials: every reply is marked as a response start, and a denial before its first byte is answered with the engine's refusal for the gate's code (D-050); gate and event-sink hooks (`gate`, `events`) passed to net-io, the event sink behind serve-net's health tap; `EndReason::Transport(CloseReason)`.
+- [x] `Running::stats` and `Stats` (per-worker request counters plus net-io's, D-048), `health` (D-049), `listeners` and `Bound::listeners` (`ListenerInfo`, `ListenerState`); `DrainReport::requests_finished` and `refused_while_draining`; replies in flight during a drain carry the close signal (D-047).
+- [x] Tier 1 `http_behind_proxy`; the `hello` and `behind_proxy` examples.
+- [x] Loopback tests on Windows, Linux, and macOS in CI: Tier 1 behind a proxy, stats, health and listener state, a malformed request refused and counted, a gate denial on the second reply of a keep-alive connection, net-io's events and end reasons, a drain with a slow request in flight, and the leak test (rounds at the soft cap: every round fully served, the one over the cap answered 503, no connection left open).
+- [x] `InFlightCap` benchmarks through the request path: per-worker shares about 4 ns over no cap, the shared counter about 14 ns (keep-alive GET about 330 ns on a shared machine; numbers for comparing builds only).
 
-## v0.4.0 - Extended
+## v0.4.0 - Extended (CURRENT)
 Exit: the ingress equivalence matrix (PLAN section 11) passes for direct, PROXY v1 and v2, forwarded headers, Unix socket, and FastCGI (`mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0); a WebSocket upgrade to ws-net works end to end; the restart test passes with a test supervisor (zero refused or reset); a systemd `Type=notify-reload` unit reloads under load with zero dropped connections in a container; the interop CI job (Apache, nginx, HAProxy containers) is green.
 - API: `http_behind_proxy` with the PROXY option, `fastcgi`, `FastCgiListen`, `ServerConfig`, `ServerBuilder::config`, `reload`, `ReloadSummary`, `ListenerSpec::{unix, inherited, fastcgi_descriptor_zero, handed_off}`, `fallback_bind`, `unix_mode`, `UnixMode`, `Ingress::{DirectTls, Unix, FastCgi}`, `ProxySource::proxy_protocol`, `UnixPeerTrust`, `FastCgiIngress`, `ServerBuilder::tls`, `EngineChoice::{FastCgi, Http1OrH2ByAlpn}`, `UpgradeTarget`, `UpgradedConn`, `HttpService::upgraded`, `engine::FastCgi`, `engine::WebSocket`, `Notify`, `NoNotify`, `SystemdNotify`, `ServerBuilder::notify`, `Finished::head_reads`, `ClientInfo::peer_credentials`, `ServeError::{Inherited, HandOff, Reload, ReloadBind}`.
 - Threat tests T-10, T-18 to T-21, T-30, T-31, T-38, T-39; fuzz target `fastcgi_mapping`.

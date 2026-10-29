@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::client::IngressKind;
+use crate::config::ProxyKind;
 use crate::config::validate::{self, Draft};
 use crate::config::{
     KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId, ProfileTable, Workers,
@@ -11,11 +13,13 @@ use crate::conn::session::{Factory, Runtime};
 use crate::conn::{ListenerRuntime, Shared};
 use crate::engine::{Family, Service};
 use crate::error::{ConfigErrors, ConfigWarning, ServeError};
+use crate::health::{HealthState, Tap};
 use crate::hooks::{Admit, Checkpoint, DefaultHooks, Dispatch, HookSet, Hooks, Observer};
-use crate::net::ControlLine;
+use crate::net::{ControlLine, EventSink, Gate};
 #[cfg(feature = "http1")]
 use crate::running::Running;
-use crate::running::{Bound, DrainSwitch, Merged};
+use crate::running::{Bound, DrainSwitch, ListenerMeta, Merged, Parts};
+use crate::stats::Counters;
 
 /// The entry point for Tier 2.
 ///
@@ -112,14 +116,20 @@ impl<H> ServerBuilder<H> {
     }
 }
 
-impl<A, D, K, O, C> ServerBuilder<HookSet<A, D, K, O, C>> {
+// Each setter changes one slot of the hook set, so every hook is a static
+// call that inlines (docs/API.md, "ServerBuilder: hooks").
+#[allow(clippy::type_complexity)]
+impl<A, D, K, O, G, E, C, T> ServerBuilder<HookSet<A, D, K, O, G, E, C, T>> {
     /// Replaces admission.
-    pub fn admit<A2: Admit>(self, admit: A2) -> ServerBuilder<HookSet<A2, D, K, O, C>> {
+    pub fn admit<A2: Admit>(self, admit: A2) -> ServerBuilder<HookSet<A2, D, K, O, G, E, C, T>> {
         let HookSet {
             dispatch,
             checkpoint,
             observer,
+            gate,
+            events,
             control,
+            tls,
             ..
         } = self.hooks;
         ServerBuilder {
@@ -129,18 +139,27 @@ impl<A, D, K, O, C> ServerBuilder<HookSet<A, D, K, O, C>> {
                 dispatch,
                 checkpoint,
                 observer,
+                gate,
+                events,
                 control,
+                tls,
             },
         }
     }
 
     /// Replaces dispatch.
-    pub fn dispatch<D2: Dispatch>(self, dispatch: D2) -> ServerBuilder<HookSet<A, D2, K, O, C>> {
+    pub fn dispatch<D2: Dispatch>(
+        self,
+        dispatch: D2,
+    ) -> ServerBuilder<HookSet<A, D2, K, O, G, E, C, T>> {
         let HookSet {
             admit,
             checkpoint,
             observer,
+            gate,
+            events,
             control,
+            tls,
             ..
         } = self.hooks;
         ServerBuilder {
@@ -150,7 +169,10 @@ impl<A, D, K, O, C> ServerBuilder<HookSet<A, D, K, O, C>> {
                 dispatch,
                 checkpoint,
                 observer,
+                gate,
+                events,
                 control,
+                tls,
             },
         }
     }
@@ -159,12 +181,15 @@ impl<A, D, K, O, C> ServerBuilder<HookSet<A, D, K, O, C>> {
     pub fn checkpoint<K2: Checkpoint>(
         self,
         checkpoint: K2,
-    ) -> ServerBuilder<HookSet<A, D, K2, O, C>> {
+    ) -> ServerBuilder<HookSet<A, D, K2, O, G, E, C, T>> {
         let HookSet {
             admit,
             dispatch,
             observer,
+            gate,
+            events,
             control,
+            tls,
             ..
         } = self.hooks;
         ServerBuilder {
@@ -174,18 +199,27 @@ impl<A, D, K, O, C> ServerBuilder<HookSet<A, D, K, O, C>> {
                 dispatch,
                 checkpoint,
                 observer,
+                gate,
+                events,
                 control,
+                tls,
             },
         }
     }
 
     /// Replaces the observer.
-    pub fn observer<O2: Observer>(self, observer: O2) -> ServerBuilder<HookSet<A, D, K, O2, C>> {
+    pub fn observer<O2: Observer>(
+        self,
+        observer: O2,
+    ) -> ServerBuilder<HookSet<A, D, K, O2, G, E, C, T>> {
         let HookSet {
             admit,
             dispatch,
             checkpoint,
+            gate,
+            events,
             control,
+            tls,
             ..
         } = self.hooks;
         ServerBuilder {
@@ -195,7 +229,69 @@ impl<A, D, K, O, C> ServerBuilder<HookSet<A, D, K, O, C>> {
                 dispatch,
                 checkpoint,
                 observer,
+                gate,
+                events,
                 control,
+                tls,
+            },
+        }
+    }
+
+    /// The connection gate net-io consults at accept, before every
+    /// write, and at close (default `AllowAll`).
+    pub fn gate<G2: Gate>(self, gate: G2) -> ServerBuilder<HookSet<A, D, K, O, G2, E, C, T>> {
+        let HookSet {
+            admit,
+            dispatch,
+            checkpoint,
+            observer,
+            events,
+            control,
+            tls,
+            ..
+        } = self.hooks;
+        ServerBuilder {
+            config: self.config,
+            hooks: HookSet {
+                admit,
+                dispatch,
+                checkpoint,
+                observer,
+                gate,
+                events,
+                control,
+                tls,
+            },
+        }
+    }
+
+    /// The sink for net-io's transport events (default `NoopSink`);
+    /// serve-net also reads them for `health`.
+    pub fn events<E2: EventSink>(
+        self,
+        events: E2,
+    ) -> ServerBuilder<HookSet<A, D, K, O, G, E2, C, T>> {
+        let HookSet {
+            admit,
+            dispatch,
+            checkpoint,
+            observer,
+            gate,
+            control,
+            tls,
+            ..
+        } = self.hooks;
+        ServerBuilder {
+            config: self.config,
+            hooks: HookSet {
+                admit,
+                dispatch,
+                checkpoint,
+                observer,
+                gate,
+                events,
+                control,
+                tls,
             },
         }
     }
@@ -204,13 +300,16 @@ impl<A, D, K, O, C> ServerBuilder<HookSet<A, D, K, O, C>> {
     pub fn control<C2: ControlLine>(
         mut self,
         line: Arc<C2>,
-    ) -> ServerBuilder<HookSet<A, D, K, O, C2>> {
+    ) -> ServerBuilder<HookSet<A, D, K, O, G, E, C2, T>> {
         self.config.has_control = true;
         let HookSet {
             admit,
             dispatch,
             checkpoint,
             observer,
+            gate,
+            events,
+            tls,
             ..
         } = self.hooks;
         ServerBuilder {
@@ -220,7 +319,10 @@ impl<A, D, K, O, C> ServerBuilder<HookSet<A, D, K, O, C>> {
                 dispatch,
                 checkpoint,
                 observer,
+                gate,
+                events,
                 control: line,
+                tls,
             },
         }
     }
@@ -266,8 +368,16 @@ impl<H: Hooks> ServerBuilder<H> {
     }
 }
 
-impl<A: Admit, D: Dispatch, K: Checkpoint, O: Observer, C: ControlLine>
-    ServerBuilder<HookSet<A, D, K, O, C>>
+impl<A, D, K, O, G, E, C, T> ServerBuilder<HookSet<A, D, K, O, G, E, C, T>>
+where
+    A: Admit,
+    D: Dispatch,
+    K: Checkpoint,
+    O: Observer,
+    G: Gate,
+    E: EventSink,
+    C: ControlLine,
+    T: net_io::TlsAcceptor,
 {
     /// `build`, `bind`, and `open` in one call.
     ///
@@ -292,7 +402,7 @@ impl<H> core::fmt::Debug for ServerBuilder<H> {
 
 /// A validated configuration: nothing bound, no thread started.
 #[must_use]
-#[allow(dead_code)] // `keep_alive` and `accept_failure_window` are read by reload and health (0.4)
+#[allow(dead_code)] // `keep_alive` is read by reload (0.4)
 pub struct Built<H: Hooks = DefaultHooks> {
     pub(crate) listeners: Vec<ListenerSpec>,
     pub(crate) profiles: ProfileTable,
@@ -319,8 +429,16 @@ impl<H: Hooks> Built<H> {
     }
 }
 
-impl<A: Admit, D: Dispatch, K: Checkpoint, O: Observer, C: ControlLine>
-    Built<HookSet<A, D, K, O, C>>
+impl<A, D, K, O, G, E, C, T> Built<HookSet<A, D, K, O, G, E, C, T>>
+where
+    A: Admit,
+    D: Dispatch,
+    K: Checkpoint,
+    O: Observer,
+    G: Gate,
+    E: EventSink,
+    C: ControlLine,
+    T: net_io::TlsAcceptor,
 {
     /// Builds net-io's server for `service`: every listener is bound and the
     /// workers start with the door closed.
@@ -349,6 +467,7 @@ impl<A: Admit, D: Dispatch, K: Checkpoint, O: Observer, C: ControlLine>
             limits,
             workers,
             drain_deadline,
+            accept_failure_window,
             hooks,
             ..
         } = self;
@@ -366,6 +485,7 @@ impl<A: Admit, D: Dispatch, K: Checkpoint, O: Observer, C: ControlLine>
 
         let mut admit = hooks.admit;
         admit.prepare(threads, &profiles);
+        let counters = Arc::new(Counters::new(threads));
         let runtime_listeners = listeners
             .iter()
             .map(|l| ListenerRuntime {
@@ -431,33 +551,54 @@ impl<A: Admit, D: Dispatch, K: Checkpoint, O: Observer, C: ControlLine>
             let own = own.build().map_err(ServeError::Start)?;
             net = net.listener(net_io::ListenerSpec::tcp(addr).name(&spec.name).limits(own));
         }
-        let shared = Arc::new(Shared::<F, S, HookSet<A, D, K, O, C>> {
+        let shared = Arc::new(Shared::<F, S, HookSet<A, D, K, O, G, E, C, T>> {
             family,
             service,
             admit,
             dispatch: hooks.dispatch,
             checkpoint: hooks.checkpoint,
             observer: hooks.observer,
-            control: hooks.control,
+            control: Arc::clone(&merged),
             profiles,
             listeners: runtime_listeners,
+            counters: Arc::clone(&counters),
         });
         let factory = Factory {
             shared,
             rt: Arc::clone(&rt),
         };
+        let health = Arc::new(HealthState::new(listeners.len(), accept_failure_window));
+        let events = Tap {
+            inner: hooks.events,
+            state: Arc::clone(&health),
+        };
         let server = net
             .sessions(factory)
-            .gate(net_io::AllowAll)
+            .gate(hooks.gate)
+            .events(events)
             .build()
             .map_err(|e| bind_error(&listeners, e))?;
-        let names = listeners.into_iter().map(|l| l.name).collect();
-        Ok(Bound::new(
+        let listeners = listeners
+            .into_iter()
+            .map(|l| ListenerMeta {
+                ingress: match l.ingress.proxy().map(|p| p.kind) {
+                    None => IngressKind::Direct,
+                    Some(ProxyKind::Headers(_)) => IngressKind::Forwarded,
+                    Some(ProxyKind::ProxyProtocol(_)) => IngressKind::ProxyProtocol,
+                },
+                profile: l.profile,
+                public_bind: l.public_bind,
+                name: l.name,
+            })
+            .collect();
+        Ok(Bound::new(Parts {
             server,
-            names,
-            merged as Arc<dyn DrainSwitch>,
+            listeners,
+            switch: merged as Arc<dyn DrainSwitch>,
             rt,
-        ))
+            counters,
+            health,
+        }))
     }
 }
 

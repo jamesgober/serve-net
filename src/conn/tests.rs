@@ -39,7 +39,7 @@ impl HttpService for Counting {
     }
 }
 
-type C<S> = Conn<HttpFamily, S, HookSet<InFlightCap, Inline, NoCheckpoint, NoObserver, NoControl>>;
+type C<S> = Conn<HttpFamily, S, crate::hooks::DefaultHooks>;
 
 fn conn<S: HttpService>(service: S, profile: Profile) -> (C<S>, SimIo) {
     let (shared, _) = shared(service, profile, None, Scheme::Http);
@@ -127,7 +127,7 @@ fn test_done_exactly_once_on_every_path() {
     let (mut c, mut io) = conn(Shared(svc.clone()), Profile::new(ProfileId(0)));
     c.on_open(&mut io, false);
     let _ = c.on_data(&mut io, GET);
-    c.on_close(true);
+    c.on_close(crate::net::CloseReason::PeerClosed);
     // 2. body timeout
     let (mut c, mut io) = conn(Shared(svc.clone()), Profile::new(ProfileId(0)));
     c.on_open(&mut io, false);
@@ -136,7 +136,7 @@ fn test_done_exactly_once_on_every_path() {
         b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nab",
     );
     assert_eq!(c.on_timeout(&mut io, Timeout::Exchange), Step::Close);
-    c.on_close(false);
+    c.on_close(crate::net::CloseReason::Shutdown);
     // 3. peer gone mid-body
     let (mut c, mut io) = conn(Shared(svc.clone()), Profile::new(ProfileId(0)));
     c.on_open(&mut io, false);
@@ -144,7 +144,7 @@ fn test_done_exactly_once_on_every_path() {
         &mut io,
         b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nab",
     );
-    c.on_close(true);
+    c.on_close(crate::net::CloseReason::PeerClosed);
     assert_eq!(svc.heads.load(Ordering::Relaxed), 3);
     assert_eq!(svc.dones.load(Ordering::Relaxed), 3);
     let ends = svc.ends.lock().unwrap().clone();
@@ -312,6 +312,9 @@ fn test_admission_shed_503_with_retry_after_no_call() {
         checkpoint: NoCheckpoint,
         observer: NoObserver,
         control: Arc::new(NoControl),
+        gate: crate::net::AllowAll,
+        events: crate::net::NoopSink,
+        tls: net_io::NoTls,
     };
     let (shared, _) = shared_with(svc, Profile::new(ProfileId(0)), None, Scheme::Http, hooks);
     let mut io = SimIo::new(Instant::now());
@@ -386,6 +389,9 @@ fn test_checkpoint_deny_before_reply_no_bytes_of_reply() {
         checkpoint: DenyReply,
         observer: NoObserver,
         control: Arc::new(NoControl),
+        gate: crate::net::AllowAll,
+        events: crate::net::NoopSink,
+        tls: net_io::NoTls,
     };
     let (shared, _) = shared_with(
         crate::handler(|_r, o| {
@@ -426,6 +432,9 @@ fn test_checkpoint_kill_aborts_with_nothing_written() {
         checkpoint: Kill,
         observer: NoObserver,
         control: Arc::new(NoControl),
+        gate: crate::net::AllowAll,
+        events: crate::net::NoopSink,
+        tls: net_io::NoTls,
     };
     let (shared, _) = shared_with(
         Counting::default(),
@@ -657,6 +666,9 @@ fn test_control_shed_refuses_lane_and_lockdown_refuses_non_critical() {
         checkpoint: NoCheckpoint,
         observer: NoObserver,
         control: control.clone(),
+        gate: crate::net::AllowAll,
+        events: crate::net::NoopSink,
+        tls: net_io::NoTls,
     };
     let (shared, _) = shared_with(
         Counting::default(),
@@ -873,7 +885,7 @@ mod props {
                 };
             }
             prop_assert!(guard < 10_000, "the machine did not finish");
-            c.on_close(true);
+            c.on_close(crate::net::CloseReason::PeerClosed);
             let heads = svc.heads.load(Ordering::Relaxed);
             let calls = svc.calls.load(Ordering::Relaxed);
             let dones = svc.dones.load(Ordering::Relaxed);

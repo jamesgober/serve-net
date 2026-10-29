@@ -1,6 +1,6 @@
 //! Hot-path benchmarks (dev/PLAN.md section 10): the keep-alive request path
-//! with and without the forwarded walk, the snapshot reader, and the control
-//! check. Run with `cargo bench`; a regression over 5% against the stored
+//! with and without the forwarded walk, with `InFlightCap` profile caps, the
+//! snapshot reader, and the control check. Run with `cargo bench`; a regression over 5% against the stored
 //! baseline blocks a change.
 
 use std::hint::black_box;
@@ -8,7 +8,7 @@ use std::hint::black_box;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use serve_net::testing::TestConnection;
 use serve_net::{
-    ControlLine, KeepAlive, Profile, ProfileId, ProxySource, SimpleControl, Snapshot,
+    Budget, ControlLine, KeepAlive, Profile, ProfileId, ProxySource, SimpleControl, Snapshot,
     TrustedProxies,
 };
 
@@ -45,7 +45,7 @@ fn request_path(c: &mut Criterion) {
         });
     });
     let proxy = ProxySource::forwarded_for(TrustedProxies::loopback());
-    let mut behind = TestConnection::behind(site(), proxy, forever);
+    let mut behind = TestConnection::behind(site(), proxy, forever.clone());
     group.bench_function("keep_alive_get_xff_3_entries", |b| {
         b.iter(|| {
             out.clear();
@@ -54,6 +54,28 @@ fn request_path(c: &mut Criterion) {
     });
     assert!(
         conn.is_open() && behind.is_open(),
+        "a benchmark connection closed"
+    );
+    // InFlightCap: a profile cap of at least 4 per worker is split into exact
+    // per-worker shares (single writer); a smaller one is one shared counter
+    // (a compare-and-swap per admission).
+    let capped = |n| forever.clone().budget(Budget::new().max_in_flight(n));
+    let mut shares = TestConnection::with_profile(site(), capped(64));
+    group.bench_function("keep_alive_get_in_flight_shares", |b| {
+        b.iter(|| {
+            out.clear();
+            shares.send_into(black_box(GET), &mut out);
+        });
+    });
+    let mut shared = TestConnection::with_profile(site(), capped(2));
+    group.bench_function("keep_alive_get_in_flight_shared_counter", |b| {
+        b.iter(|| {
+            out.clear();
+            shared.send_into(black_box(GET), &mut out);
+        });
+    });
+    assert!(
+        shares.is_open() && shared.is_open(),
         "a benchmark connection closed"
     );
     group.finish();

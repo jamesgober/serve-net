@@ -6,9 +6,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::client::IngressKind;
+use crate::config::ProfileId;
 use crate::conn::session::Runtime;
 use crate::error::ServeError;
+use crate::health::{Health, HealthState, ListenerInfo, ListenerState};
 use crate::net::{ControlLine, ControlState};
+use crate::stats::{Counters, Stats};
 
 /// The control line net-io reads: the owner's line merged with serve-net's
 /// own drain request (D-032). A drain asked for through a [`DrainHandle`]
@@ -97,9 +101,9 @@ pub struct DrainReport {
     pub graceful: u32,
     /// Connections closed at the deadline.
     pub killed: u32,
-    /// Requests that completed during the drain (not counted yet: 0).
+    /// Requests that completed during the drain.
     pub requests_finished: u64,
-    /// Requests refused because the server was draining (not counted yet: 0).
+    /// Requests refused while the server was draining.
     pub refused_while_draining: u64,
     /// How long the drain took.
     pub elapsed: Duration,
@@ -108,12 +112,13 @@ pub struct DrainReport {
 }
 
 impl DrainReport {
-    fn from_net(r: net_io::DrainReport) -> Self {
+    fn from_net(r: net_io::DrainReport, counters: &Counters) -> Self {
+        let (requests_finished, refused_while_draining) = counters.draining();
         DrainReport {
             graceful: r.graceful,
             killed: r.killed,
-            requests_finished: 0,
-            refused_while_draining: 0,
+            requests_finished,
+            refused_while_draining,
             elapsed: r.took,
             deadline_hit: r.killed > 0,
         }
@@ -152,16 +157,66 @@ impl fmt::Debug for DrainHandle {
     }
 }
 
+/// One listener's facts for `listeners()`.
+pub(crate) struct ListenerMeta {
+    pub(crate) name: String,
+    pub(crate) ingress: IngressKind,
+    pub(crate) profile: ProfileId,
+    pub(crate) public_bind: Option<&'static str>,
+}
+
+/// Everything `bind` hands to [`Bound`].
+pub(crate) struct Parts {
+    pub(crate) server: net_io::Server,
+    pub(crate) listeners: Vec<ListenerMeta>,
+    pub(crate) switch: Arc<dyn DrainSwitch>,
+    pub(crate) rt: Arc<Runtime>,
+    pub(crate) counters: Arc<Counters>,
+    pub(crate) health: Arc<HealthState>,
+}
+
 /// What a bound and a running server hold.
 struct Inner {
     server: net_io::Server,
+    listeners: Vec<ListenerMeta>,
     names: Vec<String>,
     switch: Arc<dyn DrainSwitch>,
-    /// Kept alive with the server; read by `stats` (not wired yet).
+    /// The soft-cap seats; kept alive with the server.
     _rt: Arc<Runtime>,
+    counters: Arc<Counters>,
+    health: Arc<HealthState>,
 }
 
 impl Inner {
+    fn listener_infos(&self, opened: bool) -> Vec<ListenerInfo> {
+        let door = self.server.door();
+        self.server
+            .listeners()
+            .iter()
+            .filter_map(|l| {
+                let i = usize::from(l.id.get());
+                let meta = self.listeners.get(i)?;
+                let state = if self.health.listener_failing(i) {
+                    ListenerState::Failing
+                } else if !opened {
+                    ListenerState::Bound
+                } else if door == net_io::DoorState::Open {
+                    ListenerState::Accepting
+                } else {
+                    ListenerState::DoorClosed
+                };
+                Some(ListenerInfo {
+                    name: meta.name.clone(),
+                    local: l.local.clone(),
+                    ingress: meta.ingress,
+                    profile: meta.profile,
+                    state,
+                    public_bind_reason: meta.public_bind,
+                })
+            })
+            .collect()
+    }
+
     fn local_addrs(&self) -> impl Iterator<Item = (&str, SocketAddr)> + '_ {
         self.server.listeners().iter().filter_map(|l| {
             let name = self
@@ -180,18 +235,17 @@ pub struct Bound {
 }
 
 impl Bound {
-    pub(crate) fn new(
-        server: net_io::Server,
-        names: Vec<String>,
-        switch: Arc<dyn DrainSwitch>,
-        rt: Arc<Runtime>,
-    ) -> Self {
+    pub(crate) fn new(parts: Parts) -> Self {
+        let names = parts.listeners.iter().map(|l| l.name.clone()).collect();
         Bound {
             inner: Inner {
-                server,
+                server: parts.server,
+                listeners: parts.listeners,
                 names,
-                switch,
-                _rt: rt,
+                switch: parts.switch,
+                _rt: parts.rt,
+                counters: parts.counters,
+                health: parts.health,
             },
         }
     }
@@ -199,6 +253,12 @@ impl Bound {
     /// Each TCP listener's name and bound address.
     pub fn local_addrs(&self) -> impl Iterator<Item = (&str, SocketAddr)> + '_ {
         self.inner.local_addrs()
+    }
+
+    /// Name, address, ingress, profile, and state per listener.
+    #[must_use]
+    pub fn listeners(&self) -> Vec<ListenerInfo> {
+        self.inner.listener_infos(false)
     }
 
     /// Opens the door on every listener.
@@ -240,15 +300,46 @@ impl Running {
         self.inner().local_addrs().next().map(|(_, a)| a)
     }
 
+    /// Name, address, ingress, profile, and state per listener (allocates;
+    /// not a hot path).
+    #[must_use]
+    pub fn listeners(&self) -> Vec<ListenerInfo> {
+        self.inner().listener_infos(true)
+    }
+
     /// Stops accepting on every listener; idempotent.
     pub fn close_door(&self) {
         self.inner().server.close_door();
     }
 
+    /// Request counters summed over the workers, with net-io's transport
+    /// counters.
+    #[must_use]
+    pub fn stats(&self) -> Stats {
+        let inner = self.inner();
+        let mut s = inner.counters.sum();
+        s.transport = inner.server.stats();
+        s
+    }
+
+    /// Health, computed on call: listeners accepting, workers making
+    /// progress, the share of busy refusals since the last call, the drain.
+    #[must_use]
+    pub fn health(&self) -> Health {
+        let inner = self.inner();
+        inner
+            .health
+            .compute(&inner.names, &inner.counters, inner.switch.is_draining())
+    }
+
     /// Drains with `deadline` and shuts the server down.
     pub fn drain(mut self, deadline: Duration) -> DrainReport {
         let inner = self.inner.take().unwrap_or_else(|| unreachable!());
-        DrainReport::from_net(inner.server.shutdown(Instant::now() + deadline))
+        let deadline = Instant::now() + deadline;
+        // Replies in flight read the line live and carry the close signal.
+        inner.switch.request(deadline);
+        let report = inner.server.shutdown(deadline);
+        DrainReport::from_net(report, &inner.counters)
     }
 
     /// A handle that starts a drain from any thread.
@@ -264,7 +355,8 @@ impl Running {
     /// Parks until a drain is asked for, then drains and shuts down.
     pub fn wait(mut self) -> DrainReport {
         let inner = self.inner.take().unwrap_or_else(|| unreachable!());
-        DrainReport::from_net(inner.server.wait_for_stop())
+        let report = inner.server.wait_for_stop();
+        DrainReport::from_net(report, &inner.counters)
     }
 
     /// net-io's handle.

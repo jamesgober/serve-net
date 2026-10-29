@@ -29,9 +29,10 @@ use crate::error::EndReason;
 use crate::hooks::{
     Admit, Admitted, Checkpoint, CheckpointAt, Dispatch, Hooks, Observer, Shed, Verdict,
 };
-use crate::net::{ConnectionId, ControlLine, ControlState, WorkerId};
+use crate::net::{CloseReason, ConnectionId, ControlLine, ControlState, WorkerId};
 use crate::reply::{DeferSlot, Link, Reply, SlotState, WAKE_REPLY, Waker};
 use crate::service::{BodyPolicy, Finished, HeadAction, Outcome, RequestEnd};
+use crate::stats::{Count, Counters};
 
 pub(crate) mod session;
 #[cfg(all(test, feature = "http1"))]
@@ -67,8 +68,8 @@ pub(crate) enum Timeout {
     Exchange,
     /// The park deadline of a deferred reply.
     Park,
-    /// Any transport deadline (idle, read, write).
-    Transport,
+    /// A transport deadline (idle, read, write), with net-io's close reason.
+    Transport(CloseReason),
 }
 
 /// The transport, as the machine sees it.
@@ -82,6 +83,9 @@ pub(crate) trait Io {
     /// This connection's idle timeout from its next idle wait; `None`
     /// restores the listener's (net-io `SessionContext::set_idle_timeout`).
     fn set_idle_timeout(&mut self, timeout: Option<Duration>);
+    /// A reply starts: a gate may still deny it cleanly until its first byte
+    /// leaves (net-io `Output::begin_response`).
+    fn begin_reply(&mut self);
     /// Hands as much of `bytes` as the output budget allows; returns the count.
     fn push(&mut self, bytes: &[u8]) -> usize;
     /// Whether the server is draining.
@@ -112,9 +116,13 @@ pub(crate) struct Shared<F: Family, S: Service<F>, H: Hooks> {
     pub(crate) dispatch: H::Dispatch,
     pub(crate) checkpoint: H::Checkpoint,
     pub(crate) observer: H::Observer,
-    pub(crate) control: Arc<H::Control>,
+    /// The owner's line merged with serve-net's drain request (D-032). Read
+    /// live at each checkpoint: net-io's `draining()` is fixed for the length
+    /// of one callback, and a drain may start while the service runs (D-047).
+    pub(crate) control: Arc<crate::running::Merged<H::Control>>,
     pub(crate) profiles: ProfileTable,
     pub(crate) listeners: Vec<ListenerRuntime>,
+    pub(crate) counters: Arc<Counters>,
 }
 
 /// Where the machine is.
@@ -183,6 +191,8 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     closing_after_write: bool,
     first_byte: Option<Instant>,
     wipe: bool,
+    /// A drain was seen on this connection (for the drain report's counts).
+    draining_seen: bool,
 }
 
 impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
@@ -267,6 +277,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             closing_after_write: false,
             first_byte: None,
             wipe,
+            draining_seen: false,
         }
     }
 
@@ -288,6 +299,22 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         self.clock_base
             .1
             .saturating_add(now.saturating_duration_since(self.clock_base.0).as_secs())
+    }
+
+    #[inline]
+    fn count<I: Io>(&mut self, io: &I, what: Count) {
+        self.shared.counters.count(io.worker().get(), what);
+    }
+
+    /// Whether a drain runs: net-io's flag, or the live control line (net-io's
+    /// flag is fixed for one callback, D-047).
+    fn draining_now<I: Io>(&mut self, io: &I) -> bool {
+        let live = matches!(
+            self.checkpoint(),
+            ControlState::Draining | ControlState::Stopping
+        );
+        self.draining_seen |= live || io.draining();
+        self.draining_seen
     }
 
     /// Reads the control line: one load when nothing changed.
@@ -336,7 +363,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             }
             State::AwaitHead | State::ReadBody => {}
         }
-        self.process(io, input)
+        let (n, step) = self.process(io, input);
+        self.count(io, Count::BytesIn(n as u64));
+        (n, step)
     }
 
     /// The peer closed its sending side; replies still go out.
@@ -345,7 +374,8 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             // Nobody will read the reply: cancel it and close.
             self.cancel_deferred();
             self.finish_request(RequestEnd::PeerGone);
-            self.end.get_or_insert(EndReason::Transport);
+            self.end
+                .get_or_insert(EndReason::Transport(CloseReason::PeerClosed));
             return Step::Close;
         }
         self.engine.feed_eof();
@@ -429,6 +459,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 } else {
                     // Nothing of a head arrived: a quiet close.
                     self.end = Some(EndReason::HeadTimeout);
+                    self.count(io, Count::TimedOut);
                     self.state = State::Closed;
                     Step::Close
                 }
@@ -447,15 +478,61 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 self.state = State::Closed;
                 Step::Abort
             }
+            (Timeout::Transport(reason), _) => {
+                self.end.get_or_insert(EndReason::Transport(reason));
+                Step::Close
+            }
             _ => {
-                self.end.get_or_insert(EndReason::Transport);
+                self.end
+                    .get_or_insert(EndReason::Transport(CloseReason::ExchangeDeadline));
                 Step::Close
             }
         }
     }
 
-    /// The connection closed; runs exactly once.
-    pub(crate) fn on_close(&mut self, transport: bool) {
+    /// The gate denied the reply before its first byte left: the engine's
+    /// refusal for `status` replaces it, and the connection closes (net-io
+    /// closes it with `EgressDenied`).
+    pub(crate) fn on_denied(&mut self, status: u16, worker: WorkerId) -> &[u8] {
+        if matches!(self.state, State::Parked { .. }) {
+            self.cancel_deferred();
+        }
+        self.end = Some(EndReason::Denied);
+        self.out.clear(self.wipe);
+        self.out_sent = 0;
+        let refusal = Refusal {
+            kind: RefusalKind::Denied,
+            status: if (400..=599).contains(&status) {
+                status
+            } else {
+                403
+            },
+            retry_after: None,
+        };
+        self.engine.refuse(&refusal, &mut self.out);
+        self.shared.counters.count(
+            worker.get(),
+            Count::Refused {
+                kind: RefusalKind::Denied,
+                draining: self.draining_seen,
+            },
+        );
+        if let Some(r) = self.request.as_mut() {
+            r.status = Some(refusal.status);
+        }
+        self.finish_request(RequestEnd::Denied);
+        self.state = State::Closed;
+        self.out.as_slice()
+    }
+
+    /// The connection closed with net-io's `reason`; runs exactly once.
+    pub(crate) fn on_close(&mut self, reason: CloseReason) {
+        // A kill, the drain deadline, or shutdown ended it; anything else is
+        // the transport or the machine's own close.
+        let transport = !matches!(
+            reason,
+            CloseReason::Killed(_) | CloseReason::DrainDeadline | CloseReason::Shutdown
+        );
         if matches!(self.state, State::Parked { .. }) {
             self.cancel_deferred();
         }
@@ -469,7 +546,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         }
         let end = match (transport, self.end) {
             (_, Some(e)) => e,
-            (true, None) => EndReason::Transport,
+            (true, None) => EndReason::Transport(reason),
             (false, None) => EndReason::Drained,
         };
         self.state = State::Closed;
@@ -505,6 +582,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 return Step::Write;
             }
             self.out_sent += n;
+            self.count(io, Count::BytesOut(n as u64));
         }
         self.out.clear(self.wipe);
         self.out.shrink(OUT_RETAIN);
@@ -925,12 +1003,15 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                         let body: &[u8] = if discard { &[] } else { &self.body };
                         let request = shared.family.request(head, body);
                         let started = Instant::now();
+                        let worker = self.env.worker.get();
+                        shared.counters.in_call(worker, true);
                         let outcome = shared.dispatch.run(
                             &shared.service,
                             &request,
                             &self.env,
                             &mut self.reply,
                         );
+                        shared.counters.in_call(worker, false);
                         if cfg!(debug_assertions)
                             && <S as Service<F>>::WORK == crate::service::WorkClass::Quick
                         {
@@ -966,6 +1047,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                     .observer
                     .service_error(&self.env, "reply deferred but call did not return Deferred");
             }
+            self.count(io, Count::Deferred);
             let until = io.now() + self.limits().reply_timeout;
             self.state = State::Parked {
                 generation: self.generation,
@@ -1077,6 +1159,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         self.closing_after_write = close;
         self.state = State::Writing;
         io.set_exchange_deadline(None);
+        io.begin_reply();
         self.flush(io)
     }
 
@@ -1104,6 +1187,8 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             retry_after,
         };
         self.engine.refuse(&refusal, &mut self.out);
+        let draining = self.draining_now(io);
+        self.count(io, Count::Refused { kind, draining });
         let n = self.out.len() as u64;
         if let Some(r) = self.request.as_mut() {
             r.bytes_out = n;
@@ -1111,6 +1196,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         self.finish_request(end);
         self.state = State::Closing;
         io.set_exchange_deadline(Some(io.now() + self.limits().write_stall));
+        io.begin_reply();
         self.flush(io)
     }
 
@@ -1130,8 +1216,16 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             retry_after,
         };
         self.engine.refuse(&refusal, &mut self.out);
+        let draining = self.draining_now(io);
+        self.count(io, Count::Refused { kind, draining });
+        match kind {
+            RefusalKind::Busy => self.count(io, Count::Shed),
+            RefusalKind::HeadTimeout => self.count(io, Count::TimedOut),
+            _ => {}
+        }
         self.state = State::Closing;
         io.set_exchange_deadline(Some(io.now() + self.limits().write_stall));
+        io.begin_reply();
         self.flush(io)
     }
 
@@ -1153,6 +1247,25 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     /// Ends the current request: `done`, the observer, and admission release, once.
     fn finish_request(&mut self, end: RequestEnd) {
         let Some(r) = self.request.take() else { return };
+        let worker = self.env.worker.get();
+        let counters = &self.shared.counters;
+        counters.count(worker, Count::Requests);
+        match end {
+            RequestEnd::Replied => counters.count(worker, Count::Replied),
+            RequestEnd::Shed => counters.count(worker, Count::Shed),
+            RequestEnd::Denied => counters.count(worker, Count::Denied),
+            RequestEnd::TimedOut => counters.count(worker, Count::TimedOut),
+            _ => {}
+        }
+        let live = matches!(
+            self.checkpoint(),
+            ControlState::Draining | ControlState::Stopping
+        );
+        self.draining_seen |= live;
+        let counters = &self.shared.counters;
+        if self.draining_seen {
+            counters.count(worker, Count::FinishedDraining);
+        }
         let finished = Finished {
             status: r.status,
             end,

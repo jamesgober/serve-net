@@ -4,6 +4,7 @@
 use core::fmt;
 
 use crate::config::ProfileId;
+use crate::net::CloseReason;
 
 /// Which configuration rule an error or warning comes from.
 ///
@@ -361,8 +362,9 @@ impl From<ConfigErrors> for ServeError {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EndReason {
-    /// The transport closed it (the peer, a transport deadline, a kill).
-    Transport,
+    /// net-io closed it: the peer, idle, a read or write timeout, a slow
+    /// peer, a kill.
+    Transport(CloseReason),
     /// No complete head within `head_timeout`.
     HeadTimeout,
     /// The body did not finish within `request_timeout`.
@@ -407,7 +409,7 @@ impl EndReason {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            EndReason::Transport => "transport",
+            EndReason::Transport(_) => "transport",
             EndReason::HeadTimeout => "head_timeout",
             EndReason::RequestTimeout => "request_timeout",
             EndReason::ReplyTimeout => "reply_timeout",
@@ -431,8 +433,12 @@ impl EndReason {
 
     /// Whether the connection was closed with a reset rather than a graceful close.
     #[must_use]
-    pub const fn is_abortive(self) -> bool {
-        matches!(self, EndReason::CheckpointKill | EndReason::ServicePanic)
+    pub fn is_abortive(self) -> bool {
+        match self {
+            EndReason::CheckpointKill | EndReason::ServicePanic => true,
+            EndReason::Transport(reason) => reason.is_abortive(),
+            _ => false,
+        }
     }
 }
 
@@ -513,7 +519,7 @@ mod tests {
     #[test]
     fn test_end_reason_names_unique() {
         let all = [
-            EndReason::Transport,
+            EndReason::Transport(CloseReason::PeerClosed),
             EndReason::HeadTimeout,
             EndReason::RequestTimeout,
             EndReason::ReplyTimeout,

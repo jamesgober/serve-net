@@ -2,6 +2,7 @@
 //! program that uses both crates sees one type for each.
 
 pub use net_io::{
-    AddrError, Cidr, ConnectionId, ControlLine, ControlState, DriverKind, Lane, NoControl,
-    ProxyVersions, SimpleControl, TrustedProxies, WorkerId, normalize,
+    AddrError, AllowAll, Cidr, CloseReason, ConnectionId, ControlLine, ControlState, DriverKind,
+    EventSink, Gate, Lane, NoControl, NoopSink, ProxyVersions, SimpleControl, TrustedProxies,
+    WorkerId, normalize,
 };

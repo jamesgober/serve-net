@@ -140,7 +140,7 @@ impl<'a> TestRequest<'a> {
                 }
             }
         }
-        conn.on_close(true);
+        conn.on_close(crate::net::CloseReason::PeerClosed);
         TestReply::parse(&io.written, head)
     }
 }
@@ -294,7 +294,7 @@ impl<S: HttpService> TestConnection<S> {
             match step {
                 Step::Close | Step::Abort => {
                     self.open = false;
-                    self.conn.on_close(false);
+                    self.conn.on_close(crate::net::CloseReason::Shutdown);
                 }
                 Step::Write => step = self.conn.on_writable(&mut self.io),
                 Step::Park { .. } => match self.io.take_wake() {
@@ -327,7 +327,7 @@ impl<S: HttpService> Drop for TestConnection<S> {
     fn drop(&mut self) {
         if self.open {
             self.open = false;
-            self.conn.on_close(true);
+            self.conn.on_close(crate::net::CloseReason::PeerClosed);
         }
     }
 }
@@ -407,22 +407,27 @@ pub(crate) fn shared<S: HttpService>(
             checkpoint: NoCheckpoint,
             observer: NoObserver,
             control: Arc::new(NoControl),
+            gate: crate::net::AllowAll,
+            events: crate::net::NoopSink,
+            tls: net_io::NoTls,
         },
     )
 }
 
 /// As [`shared`], with given hooks.
-pub(crate) fn shared_with<S: HttpService, A, D, K, O, C>(
+#[allow(clippy::type_complexity)] // the hook set's eight slots, as in `ServerBuilder`
+pub(crate) fn shared_with<S: HttpService, A, D, K, O, G, E, C, T>(
     service: S,
     profile: Profile,
     proxy: Option<ProxySource>,
     scheme: Scheme,
-    hooks: HookSet<A, D, K, O, C>,
-) -> TestShared<S, HookSet<A, D, K, O, C>>
+    hooks: HookSet<A, D, K, O, G, E, C, T>,
+) -> TestShared<S, HookSet<A, D, K, O, G, E, C, T>>
 where
-    HookSet<A, D, K, O, C>:
+    HookSet<A, D, K, O, G, E, C, T>:
         Hooks<Admit = A, Dispatch = D, Checkpoint = K, Observer = O, Control = C>,
     A: Admit,
+    C: crate::net::ControlLine,
 {
     let profiles = ProfileTable::compile(
         core::slice::from_ref(&profile),
@@ -449,9 +454,10 @@ where
         dispatch: hooks.dispatch,
         checkpoint: hooks.checkpoint,
         observer: hooks.observer,
-        control: hooks.control,
+        control: Arc::new(crate::running::Merged::new(hooks.control)),
         profiles,
         listeners: vec![listener],
+        counters: Arc::new(crate::stats::Counters::new(1)),
     };
     (Arc::new(shared), copy)
 }
@@ -544,6 +550,7 @@ impl Io for SimIo {
     fn set_idle_timeout(&mut self, timeout: Option<Duration>) {
         self.idle_timeout = timeout;
     }
+    fn begin_reply(&mut self) {}
     fn push(&mut self, bytes: &[u8]) -> usize {
         let n = match &mut self.budget {
             None => bytes.len(),

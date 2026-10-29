@@ -41,6 +41,7 @@ pub mod engine;
 mod envelope;
 mod error;
 mod forwarded;
+mod health;
 mod hooks;
 #[cfg(feature = "http1")]
 mod http;
@@ -52,6 +53,7 @@ mod running;
 mod server;
 mod service;
 mod snapshot;
+mod stats;
 mod sync;
 #[cfg(feature = "http1")]
 pub mod testing;
@@ -64,6 +66,7 @@ pub use config::{
 };
 pub use envelope::{Envelope, RequestSeq};
 pub use error::{ConfigError, ConfigErrors, ConfigWarning, EndReason, RuleId, ServeError, Subject};
+pub use health::{Health, HealthIssue, ListenerInfo, ListenerState};
 pub use hooks::{
     Admit, Admitted, Checkpoint, CheckpointAt, DefaultHooks, Dispatch, HookSet, Hooks, InFlightCap,
     Inline, NoCheckpoint, NoObserver, Observer, Shed, Verdict,
@@ -71,19 +74,27 @@ pub use hooks::{
 #[cfg(feature = "http1")]
 pub use http::{
     Fields, Handler, HttpBody, HttpFamily, HttpHead, HttpParts, HttpReply, HttpRequest,
-    HttpService, handler, http,
+    HttpService, handler, http, http_behind_proxy,
 };
 #[cfg(feature = "http1")]
 pub use http_net::{Method, Version};
 pub use net::{
-    AddrError, Cidr, ConnectionId, ControlLine, ControlState, DriverKind, Lane, NoControl,
-    ProxyVersions, SimpleControl, TrustedProxies, WorkerId,
+    AddrError, AllowAll, Cidr, CloseReason, ConnectionId, ControlLine, ControlState, DriverKind,
+    EventSink, Gate, Lane, NoControl, NoopSink, ProxyVersions, SimpleControl, TrustedProxies,
+    WorkerId,
 };
 pub use reply::{CompleteError, Reply, ReplyToken};
 pub use running::{Bound, DrainHandle, DrainReport, Running};
 pub use server::{Built, Server, ServerBuilder};
 pub use service::{BodyPolicy, Finished, HeadAction, Outcome, RequestEnd, WorkClass};
 pub use snapshot::{Snapshot, SnapshotReader};
+pub use stats::Stats;
+
+/// http-net, for its engine limits and types.
+#[cfg(feature = "http1")]
+pub use http_net;
+/// net-io, for everything serve-net does not re-export by name.
+pub use net_io;
 
 /// Crate version string, populated by Cargo at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -29,16 +29,19 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: design lock (<code>0.2.0</code>).</strong> No functional code yet. The public API is written and locked in <a href="./docs/API.md"><code>docs/API.md</code></a>; the design and every decision behind it are in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. <code>0.3.0</code> is the first working server.
+        <strong>Status: <code>0.3.0</code>, the first working server.</strong> HTTP/1.1 over net-io's blocking driver, directly or behind a reverse proxy. The public API is locked in <a href="./docs/API.md"><code>docs/API.md</code></a>; the design and every decision behind it are in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. <code>0.4.0</code> adds PROXY protocol, Unix sockets, FastCGI, TLS, WebSocket upgrades, and restarts without dropped connections.
     </blockquote>
 </div>
 
 <hr>
 <br>
 
-## What it will look like
+## Quick start
 
-The API below is locked for `0.3.0`; it does not exist in `0.2.0`.
+```toml
+[dependencies]
+serve-net = "0.3"
+```
 
 ```rust
 fn main() -> Result<(), serve_net::ServeError> {

@@ -146,6 +146,9 @@ impl Io for NetIo<'_, '_> {
     fn set_idle_timeout(&mut self, timeout: Option<Duration>) {
         self.cx.set_idle_timeout(timeout);
     }
+    fn begin_reply(&mut self) {
+        self.cx.output().begin_response();
+    }
     fn push(&mut self, bytes: &[u8]) -> usize {
         self.cx.output().push_partial(bytes)
     }
@@ -195,6 +198,7 @@ fn handed(s: Step, cx: &mut SessionContext<'_>, resume: &mut Option<Step>) -> ne
 pub(crate) struct ServeSession<F: Family, S: Service<F>, H: Hooks> {
     conn: Conn<F, S, H>,
     rt: Arc<Runtime>,
+    worker: WorkerId,
     over_cap: bool,
     /// The step a flush forced by [`handed`] interrupted.
     resume: Option<Step>,
@@ -249,7 +253,11 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::Session for ServeSess
         let which = match which {
             TimeoutKind::Exchange => Timeout::Exchange,
             TimeoutKind::Park => Timeout::Park,
-            _ => Timeout::Transport,
+            TimeoutKind::Handshake => Timeout::Transport(CloseReason::HandshakeTimeout),
+            TimeoutKind::Idle => Timeout::Transport(CloseReason::Idle),
+            TimeoutKind::Write => Timeout::Transport(CloseReason::WriteTimeout),
+            TimeoutKind::Drain => Timeout::Transport(CloseReason::DrainDeadline),
+            _ => Timeout::Transport(CloseReason::ReadTimeout),
         };
         let mut io = NetIo {
             cx: &mut *cx,
@@ -268,14 +276,15 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::Session for ServeSess
         handed(s, cx, &mut self.resume)
     }
 
+    fn on_denied(&mut self, code: u16, output: &mut net_io::Output) {
+        let refusal = self.conn.on_denied(code, self.worker);
+        // net-io sends this once, bounded by its refusal limit; what does not
+        // fit is dropped, and the connection closes either way.
+        let _ = output.push_partial(refusal);
+    }
+
     fn on_close(&mut self, _info: &ConnectionInfo, reason: CloseReason) {
-        // A kill, the drain deadline, or shutdown ended it; anything else is
-        // the transport or the machine's own close.
-        let transport = !matches!(
-            reason,
-            CloseReason::Killed(_) | CloseReason::DrainDeadline | CloseReason::Shutdown
-        );
-        self.conn.on_close(transport);
+        self.conn.on_close(reason);
     }
 }
 
@@ -309,6 +318,7 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::SessionFactory for Fa
         Ok(ServeSession {
             conn,
             rt: Arc::clone(&self.rt),
+            worker: info.worker,
             over_cap,
             resume: None,
             _seat: seat,
