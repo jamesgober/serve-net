@@ -505,17 +505,11 @@ where
             threads,
         ));
 
-        let mut global = net_io::Limits::builder()
+        let global = net_io::Limits::builder()
             .max_connections(hard)
-            .drain_timeout(drain_deadline);
-        if listeners.iter().any(|l| l.ingress.proxy().is_some()) {
-            // Behind a front end every connection comes from the front end,
-            // so net-io's per-source cap would cap the whole site. net-io 0.3
-            // applies the cap server-wide only, so it is lifted for the
-            // server (D-046).
-            global = global.max_per_source(hard, net_io::PrefixPolicy::DEFAULT);
-        }
-        let global = global.build().map_err(ServeError::Start)?;
+            .drain_timeout(drain_deadline)
+            .build()
+            .map_err(ServeError::Start)?;
         let merged = Arc::new(Merged::new(Arc::clone(&hooks.control)));
         let mut net = net_io::ServerBuilder::new()
             .driver(workers.kind())
@@ -547,6 +541,13 @@ where
                 .map_or(hard, |n| n.saturating_add(limits.headroom_for(n)).min(hard));
             if spec.max_connections.is_some() {
                 own = own.max_per_listener(listener_hard);
+            }
+            if behind {
+                // Every connection comes from the front end, so a per-source
+                // cap would cap the whole listener; per-client limits behind a
+                // proxy belong to a gate that sees the forwarded client
+                // (D-046, per listener since net-io 0.4).
+                own = own.max_per_source(listener_hard, net_io::PrefixPolicy::DEFAULT);
             }
             let own = own.build().map_err(ServeError::Start)?;
             net = net.listener(net_io::ListenerSpec::tcp(addr).name(&spec.name).limits(own));

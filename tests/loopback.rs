@@ -158,6 +158,48 @@ fn test_loopback_behind_proxy_many_connections_from_one_peer() {
 }
 
 #[test]
+fn test_loopback_mixed_server_keeps_per_source_cap_on_direct_listener() {
+    use serve_net::{Ingress, ListenerSpec, ProxySource, Server, TrustedProxies};
+    let server = Server::builder()
+        .listener(
+            ListenerSpec::tcp("site", "127.0.0.1:0").ingress(Ingress::Proxy(
+                ProxySource::forwarded_for(TrustedProxies::loopback()),
+            )),
+        )
+        .listener(ListenerSpec::tcp("direct", "127.0.0.1:0"))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "ok");
+        }))
+        .unwrap();
+    let listeners = server.listeners();
+    let proxied = listeners[0].local.socket_addr().unwrap();
+    let direct = listeners[1].local.socket_addr().unwrap();
+    // The proxy listener takes more than the per-source default from one peer.
+    let mut through: Vec<TcpStream> = (0..20).map(|_| connect(proxied)).collect();
+    for (i, c) in through.iter_mut().enumerate() {
+        let a = exchange(
+            c,
+            b"GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 192.0.2.1\r\n\r\n",
+        );
+        assert!(a.starts_with("HTTP/1.1 200"), "proxied {i}: {a}");
+    }
+    // The direct listener still caps one address at net-io's default (16 on
+    // the blocking driver): the 17th connection is not served.
+    let mut held: Vec<TcpStream> = (0..16).map(|_| connect(direct)).collect();
+    for (i, c) in held.iter_mut().enumerate() {
+        let a = exchange(c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(a.starts_with("HTTP/1.1 200"), "direct {i}: {a}");
+    }
+    let mut extra = connect(direct);
+    let _ = extra.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut buf = [0u8; 64];
+    let served = matches!(extra.read(&mut buf), Ok(n) if n > 0);
+    assert!(!served, "a 17th connection from one address was served");
+    drop((through, held, extra));
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+#[test]
 fn test_loopback_bind_conflict_names_listener() {
     let first = start();
     let addr = first.local_addr().unwrap();

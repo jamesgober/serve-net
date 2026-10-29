@@ -58,7 +58,7 @@ http1 = ["dep:http-net"]
 [dependencies]
 # First-party crates at published versions only (dev/PLAN.md section 3.2).
 # net-io: the transport (required).
-net-io = "0.3"
+net-io = "0.4"
 http-net = { version = "0.6", default-features = false, optional = true }
 
 

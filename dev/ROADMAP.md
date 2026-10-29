@@ -136,7 +136,7 @@ Exit: every item in the register below is closed or carried into `docs/STABILITY
 | Every [est.] cost in `dev/PLAN.md` | PLAN section 9 and the threat table | each replaced by a benchmark (due at 0.6), or listed as unmeasured with the reason |
 | The engine keeps its buffer between keep-alive requests; idle memory returns only through the reactor's per-worker pools | D-041 | confirm the reactor pools bound idle memory (NFR-1), or shrink after an idle period |
 | With no soft cap configured, the blocking pool's soft cap is the pool minus its headroom (224 of 256) | D-044 | confirm the default with a measured overload run (NFR-6), or change it |
-| The per-source connection cap behind a front end | D-046 | net-io 0.4 counts it per listener: apply it per listener and remove the server-wide lift (0.4); confirm here it is gone |
+| The per-source connection cap behind a front end | D-046, D-053 | applied per listener since 0.4 (net-io 0.4); confirm a mixed direct and proxied server keeps the cap on its direct listeners (a test exists from 0.4) |
 | The machine reads the live control line because net-io's `draining()` is fixed for one callback | D-047, hello-serve feedback 6 | if net-io makes `draining()` live, drop the extra load or keep it with a measured reason |
 | The timeout-to-close-reason table is copied from net-io (`CloseReason::for_timeout` is crate-private) | hello-serve feedback 7 | use net-io's when public, or keep a test that the tables agree |
 | `health`: stall = inside a service call without progress since the previous call; overload = more than 20% busy refusals since the previous call | D-049 | check against a real supervisor and a stalled-worker test under load; tune or document |
