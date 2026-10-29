@@ -397,11 +397,8 @@ impl Family for HttpFamily {
     fn head<'a>(
         &self,
         raw: RequestHead<'a>,
-        cx: &HeadContext<'_>,
-    ) -> Result<(HttpHead<'a>, ClientInfo), EngineError>
-    where
-        Self: 'a,
-    {
+        cx: &HeadContext<'a>,
+    ) -> Result<(HttpHead<'a>, ClientInfo), EngineError> {
         let base = *cx.client;
         let ingress_error = EngineError {
             kind: RefusalKind::Ingress,
@@ -465,12 +462,20 @@ impl Family for HttpFamily {
                 ))
             }
             ProxyKind::ProxyProtocol(_) => {
-                let client = base.with_scheme(cx.declared_scheme);
+                // The session built the client from net-io's PROXY facts.
+                let client = base;
+                let tlv = if proxy.trust_host {
+                    cx.proxy_facts
+                        .and_then(|f| f.authority())
+                        .filter(|a| forwarded::valid_authority(a.as_bytes()))
+                } else {
+                    None
+                };
                 Ok((
                     HttpHead {
                         raw,
                         client,
-                        authority: raw.host(),
+                        authority: tlv.or_else(|| raw.host()),
                     },
                     client,
                 ))

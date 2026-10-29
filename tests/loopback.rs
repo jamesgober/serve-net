@@ -489,3 +489,104 @@ fn test_loopback_rounds_at_the_soft_cap_leak_nothing() {
     let report = server.drain(Duration::from_secs(2));
     assert_eq!(report.killed, 0);
 }
+
+/// A server behind the PROXY protocol that answers with what it learned.
+fn proxied(
+    versions: serve_net::ProxyVersions,
+    trusted: serve_net::TrustedProxies,
+) -> serve_net::Running {
+    use serve_net::{Ingress, ListenerSpec, ProxySource, Server};
+    Server::builder()
+        .listener(
+            ListenerSpec::tcp("edge", "127.0.0.1:0").ingress(Ingress::Proxy(
+                ProxySource::proxy_protocol(versions, trusted),
+            )),
+        )
+        .serve(serve_net::handler(|req, reply| {
+            let c = req.client();
+            let text = format!(
+                "{} {} {:?} local={}",
+                c.addr().map(|a| a.to_string()).unwrap_or_default(),
+                c.port(),
+                c.ingress(),
+                c.is_proxy_local()
+            );
+            reply.text(200, &text);
+        }))
+        .unwrap()
+}
+
+#[test]
+fn test_loopback_proxy_v1_gives_the_real_client() {
+    let server = proxied(
+        serve_net::ProxyVersions::Both,
+        serve_net::TrustedProxies::loopback(),
+    );
+    let addr = server.local_addr().unwrap();
+    let mut c = connect(addr);
+    c.write_all(b"PROXY TCP4 203.0.113.7 127.0.0.1 51000 80\r\n")
+        .unwrap();
+    let a = exchange(&mut c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(a.starts_with("HTTP/1.1 200"), "{a}");
+    assert!(
+        a.ends_with("203.0.113.7 51000 ProxyProtocol local=false"),
+        "{a}"
+    );
+    // Keep-alive: the second request on the connection keeps the client.
+    let b = exchange(&mut c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(
+        b.ends_with("203.0.113.7 51000 ProxyProtocol local=false"),
+        "{b}"
+    );
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+#[test]
+fn test_loopback_proxy_v2_and_local() {
+    let server = proxied(
+        serve_net::ProxyVersions::V2,
+        serve_net::TrustedProxies::loopback(),
+    );
+    let addr = server.local_addr().unwrap();
+    const SIG: &[u8] = b"\r\n\r\n\0\r\nQUIT\n";
+    // PROXY TCP4 198.51.100.9:443 -> 127.0.0.1:80
+    let mut v2 = SIG.to_vec();
+    v2.extend_from_slice(&[
+        0x21, 0x11, 0, 12, 198, 51, 100, 9, 127, 0, 0, 1, 0x01, 0xBB, 0, 80,
+    ]);
+    let mut c = connect(addr);
+    c.write_all(&v2).unwrap();
+    let a = exchange(&mut c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(
+        a.ends_with("198.51.100.9 443 ProxyProtocol local=false"),
+        "{a}"
+    );
+    // LOCAL: the proxy's own health check keeps the socket peer.
+    let mut local = SIG.to_vec();
+    local.extend_from_slice(&[0x20, 0x00, 0, 0]);
+    let mut h = connect(addr);
+    h.write_all(&local).unwrap();
+    let b = exchange(&mut h, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(b.contains("127.0.0.1"), "{b}");
+    assert!(b.ends_with("local=true"), "{b}");
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+#[test]
+fn test_loopback_proxy_from_untrusted_peer_is_closed_unread() {
+    let server = proxied(
+        serve_net::ProxyVersions::Both,
+        serve_net::TrustedProxies::parse("10.0.0.0/8").unwrap(),
+    );
+    let addr = server.local_addr().unwrap();
+    let mut c = connect(addr);
+    let _ = c.write_all(
+        b"PROXY TCP4 203.0.113.7 127.0.0.1 51000 80\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n",
+    );
+    let mut buf = [0u8; 64];
+    let served = matches!(c.read(&mut buf), Ok(n) if n > 0);
+    assert!(!served, "a connection from an untrusted proxy was served");
+    let stats = server.stats();
+    assert_eq!(stats.requests, 0, "{stats:?}");
+    let _ = server.drain(Duration::from_secs(2));
+}

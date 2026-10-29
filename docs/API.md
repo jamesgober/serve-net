@@ -957,7 +957,7 @@ Where the real client comes from behind a front end, and whom to believe.
 
 With `trust_scheme`, the scheme comes from `X-Forwarded-Proto` (or `Forwarded` `proto=`) and must be `http` or `https` (ASCII case-insensitive). With `trust_host`, the authority comes from `X-Forwarded-Host` (or `host=`) and must be a valid RFC 3986 authority of at most 255 bytes. Only the value the nearest trusted hop wrote (the rightmost) is used; anything invalid is a 400 refusal.
 
-**PROXY protocol** (`proxy_protocol`, `0.4.0`). net-io requires a complete, valid header before any byte reaches the engine, from trusted peers only, and closes every other connection before reading (fail closed; the PROXY specification requires both). A v2 `LOCAL` command (the proxy's own health check) keeps the socket peer and sets `ClientInfo::is_proxy_local()`. With `trust_scheme`, `PP2_TYPE_SSL` marks the connection `https`; with `trust_host`, `PP2_TYPE_AUTHORITY` gives the authority. net-io keeps one trusted list per server, so serve-net gives it the union of every PROXY listener's list and checks each connection against its own listener's list when it opens, before any byte reaches the engine.
+**PROXY protocol** (`proxy_protocol`, `0.4.0`). net-io requires a complete, valid header before any byte reaches the engine, from trusted peers only, and closes every other connection before reading (fail closed; the PROXY specification requires both). A v2 `LOCAL` command (the proxy's own health check) keeps the socket peer and sets `ClientInfo::is_proxy_local()`. With `trust_scheme`, `PP2_TYPE_SSL` marks the connection `https`; with `trust_host`, `PP2_TYPE_AUTHORITY` gives the authority. Each PROXY listener gives net-io its own trusted list (net-io 0.4 keeps one per listener), and net-io moves the connection's per-source slot to the real client, so the per-source cap applies to clients, not to the proxy.
 
 | Item | Grade | Tier | Version | Cost |
 |---|---|---|---|---|
@@ -2436,7 +2436,7 @@ pub trait Family: Send + Sync + 'static {
     type Parts: Default + Send + 'static;   // the reply data a service fills
 
     fn engine(&self, profile: &Profile, limits: &Limits) -> Self::Engine;
-    fn head<'a>(&self, raw: <Self::Engine as Engine>::Head<'a>, cx: &HeadContext<'_>)
+    fn head<'a>(&self, raw: <Self::Engine as Engine>::Head<'a>, cx: &HeadContext<'a>)
         -> Result<(Self::Head<'a>, ClientInfo), EngineError>;           // the view and the request's client
     fn request<'a>(&self, head: Self::Head<'a>, body: &'a [u8]) -> Self::Request<'a>;
     fn new_parts(&self) -> Self::Parts;

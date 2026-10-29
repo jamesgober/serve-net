@@ -193,6 +193,8 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     wipe: bool,
     /// A drain was seen on this connection (for the drain report's counts).
     draining_seen: bool,
+    /// The connection's PROXY header facts, on a PROXY listener.
+    proxy_facts: Option<Arc<net_io::ProxyFacts>>,
 }
 
 impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
@@ -278,7 +280,13 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             first_byte: None,
             wipe,
             draining_seen: false,
+            proxy_facts: None,
         }
+    }
+
+    /// The facts net-io read from the connection's PROXY header.
+    pub(crate) fn set_proxy_facts(&mut self, facts: Option<Arc<net_io::ProxyFacts>>) {
+        self.proxy_facts = facts;
     }
 
     fn compiled(&self) -> Option<&Compiled> {
@@ -788,6 +796,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 proxy: listener.and_then(|l| l.proxy.as_ref()),
                 declared_scheme: listener.map_or(Scheme::Http, |l| l.declared_scheme),
                 resolved: None,
+                proxy_facts: self.proxy_facts.as_deref(),
             };
             match self.engine.head() {
                 None => None,
@@ -989,6 +998,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 proxy: listener.and_then(|l| l.proxy.as_ref()),
                 declared_scheme: listener.map_or(Scheme::Http, |l| l.declared_scheme),
                 resolved: Some(self.env.client),
+                proxy_facts: self.proxy_facts.as_deref(),
             };
             let discard = self
                 .request

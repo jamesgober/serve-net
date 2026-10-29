@@ -194,7 +194,6 @@ impl ClientInfo {
         self
     }
 
-    #[allow(dead_code)] // used by the PROXY ingress (0.4)
     pub(crate) fn with_proxy_local(mut self, on: bool) -> ClientInfo {
         self.proxy_local = on;
         self

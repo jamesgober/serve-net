@@ -59,7 +59,6 @@ pub struct ProxySource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProxyKind {
     Headers(ForwardedSource),
-    #[allow(dead_code)] // the PROXY protocol ingress ships in 0.4
     ProxyProtocol(ProxyVersions),
 }
 
@@ -67,6 +66,26 @@ impl ProxySource {
     /// `X-Forwarded-For` (with `X-Forwarded-Proto` and `X-Forwarded-Host` when trusted).
     pub fn forwarded_for(trusted: TrustedProxies) -> Self {
         Self::headers(ForwardedSource::XForwardedFor, trusted)
+    }
+
+    /// The PROXY protocol: net-io reads a complete header of one of
+    /// `versions` from a trusted peer before any byte reaches the engine, and
+    /// closes every connection from any other peer before reading. A v2
+    /// `LOCAL` header (the proxy's own health check) keeps the socket peer
+    /// and sets [`ClientInfo::is_proxy_local`](crate::ClientInfo::is_proxy_local).
+    /// With `trust_scheme` an SSL TLV marks the connection `https`; with
+    /// `trust_host` the authority TLV gives the authority.
+    ///
+    /// ```
+    /// use serve_net::{ProxySource, ProxyVersions, TrustedProxies};
+    /// let haproxy = ProxySource::proxy_protocol(ProxyVersions::V2, TrustedProxies::loopback());
+    /// # let _ = haproxy;
+    /// ```
+    pub fn proxy_protocol(versions: ProxyVersions, trusted: TrustedProxies) -> Self {
+        ProxySource {
+            kind: ProxyKind::ProxyProtocol(versions),
+            ..Self::headers(ForwardedSource::XForwardedFor, trusted)
+        }
     }
 
     /// Forwarded headers of the given kind.

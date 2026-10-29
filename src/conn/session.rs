@@ -15,8 +15,9 @@ use net_io::{
 };
 
 use super::{Conn, Io, Phase, Shared, Step, Timeout};
-use crate::client::ClientInfo;
+use crate::client::{ClientInfo, IngressKind, Scheme};
 use crate::config::ProfileId;
+use crate::config::ProxyKind;
 use crate::engine::{Family, Service};
 use crate::hooks::Hooks;
 use crate::net::{ConnectionId, WorkerId};
@@ -305,9 +306,33 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::SessionFactory for Fa
         let Some(peer) = info.client_addr() else {
             return Err(RefusalCause::Session);
         };
-        let client = ClientInfo::direct(peer, info.tls.is_some());
+        let mut client = ClientInfo::direct(peer, info.tls.is_some());
+        let proxy_protocol = runtime
+            .proxy
+            .as_ref()
+            .filter(|p| matches!(p.kind, ProxyKind::ProxyProtocol(_)));
+        if let Some(p) = proxy_protocol {
+            // net-io read the header from a trusted peer before calling this.
+            client = match info.real_peer {
+                Some(real) => {
+                    client.behind_proxy(Some(real.ip()), real.port(), 1, IngressKind::ProxyProtocol)
+                }
+                // LOCAL: the proxy itself, for example its health check.
+                None => client.with_proxy_local(true),
+            };
+            let tls = p.trust_scheme
+                && info
+                    .proxy
+                    .as_ref()
+                    .is_some_and(|f| f.ssl_client().is_some());
+            client = client.with_scheme(if tls {
+                Scheme::Https
+            } else {
+                runtime.declared_scheme
+            });
+        }
         let (seat, over_cap) = Seat::take(&self.rt, listener, runtime.profile);
-        let conn = Conn::new(
+        let mut conn = Conn::new(
             Arc::clone(&self.shared),
             listener,
             info.id,
@@ -315,6 +340,9 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::SessionFactory for Fa
             info.accepted_at,
             info.worker,
         );
+        if proxy_protocol.is_some() {
+            conn.set_proxy_facts(info.proxy.clone());
+        }
         Ok(ServeSession {
             conn,
             rt: Arc::clone(&self.rt),

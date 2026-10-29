@@ -7,7 +7,8 @@ use crate::client::IngressKind;
 use crate::config::ProxyKind;
 use crate::config::validate::{self, Draft};
 use crate::config::{
-    KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId, ProfileTable, Workers,
+    KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId, ProfileTable, ProxySource,
+    Workers,
 };
 use crate::conn::session::{Factory, Runtime};
 use crate::conn::{ListenerRuntime, Shared};
@@ -542,15 +543,31 @@ where
             if spec.max_connections.is_some() {
                 own = own.max_per_listener(listener_hard);
             }
-            if behind {
+            let proxy = spec.ingress.proxy();
+            if proxy.is_some_and(|p| matches!(p.kind, ProxyKind::Headers(_))) {
                 // Every connection comes from the front end, so a per-source
                 // cap would cap the whole listener; per-client limits behind a
                 // proxy belong to a gate that sees the forwarded client
-                // (D-046, per listener since net-io 0.4).
+                // (D-046, per listener since net-io 0.4). Behind the PROXY
+                // protocol net-io moves the slot to the real client, so the
+                // cap stays.
                 own = own.max_per_source(listener_hard, net_io::PrefixPolicy::DEFAULT);
             }
             let own = own.build().map_err(ServeError::Start)?;
-            net = net.listener(net_io::ListenerSpec::tcp(addr).name(&spec.name).limits(own));
+            let mut net_spec = net_io::ListenerSpec::tcp(addr).name(&spec.name).limits(own);
+            if let Some(ProxySource {
+                kind: ProxyKind::ProxyProtocol(versions),
+                trusted,
+                ..
+            }) = proxy
+            {
+                net_spec = net_spec
+                    .proxy(net_io::ProxyMode::Required {
+                        versions: *versions,
+                    })
+                    .trusted_proxies(trusted.clone());
+            }
+            net = net.listener(net_spec);
         }
         let shared = Arc::new(Shared::<F, S, HookSet<A, D, K, O, G, E, C, T>> {
             family,
