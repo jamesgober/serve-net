@@ -827,6 +827,10 @@ fn test_loopback_transport_limits_reach_net_io() {
     }
 }
 
+// A worker blocked in a read learns of a manual clock when woken, which needs
+// net-io's wait before each receive: Windows and macOS. Linux receives block
+// under SO_RCVTIMEO.
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn test_loopback_a_slow_body_is_answered_by_the_request_deadline() {
     use serve_net::{Limits, ListenerSpec, Server};
@@ -887,6 +891,10 @@ fn test_loopback_listen_options_apply() {
     let _ = server.drain(Duration::from_secs(1));
 }
 
+// A worker blocked in a read learns of a manual clock when woken, which needs
+// net-io's wait before each receive: Windows and macOS. Linux receives block
+// under SO_RCVTIMEO.
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn test_loopback_manual_clock_drives_the_head_deadline() {
     use serve_net::{Limits, ListenerSpec, Server};
@@ -909,6 +917,40 @@ fn test_loopback_manual_clock_drives_the_head_deadline() {
     let mut got = String::new();
     let _ = c.read_to_string(&mut got);
     assert!(got.starts_with("HTTP/1.1 408"), "{got}");
+    let _ = server.drain(Duration::from_secs(1));
+}
+
+#[test]
+fn test_loopback_timeouts_answer_on_real_sockets() {
+    use serve_net::{Limits, ListenerSpec, Server};
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .limits(
+            Limits::new()
+                .head_timeout(Duration::from_millis(200))
+                .request_timeout(Duration::from_millis(400))
+                .min_rate(0, Duration::from_secs(10)),
+        )
+        .serve(serve_net::handler(|_r, reply| {
+            reply.text(200, "ok");
+        }))
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    // A head that never finishes.
+    let mut head = connect(addr);
+    head.write_all(b"GET / HT").unwrap();
+    let mut got = String::new();
+    let _ = head.read_to_string(&mut got);
+    assert!(got.starts_with("HTTP/1.1 408"), "head: {got}");
+    // A body that never finishes.
+    let mut body = connect(addr);
+    body.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
+        .unwrap();
+    let mut got = String::new();
+    let _ = body.read_to_string(&mut got);
+    assert!(got.starts_with("HTTP/1.1 408"), "body: {got}");
+    let stats = server.stats();
+    assert_eq!(stats.timed_out, 2, "{stats:?}");
     let _ = server.drain(Duration::from_secs(1));
 }
 

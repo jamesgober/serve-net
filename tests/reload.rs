@@ -5,6 +5,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use serve_net::{
@@ -23,13 +24,19 @@ fn site() -> impl serve_net::HttpService {
     })
 }
 
-/// A free port on loopback, for a listener that keeps its address across a
-/// reload (port 0 would be a different socket each time).
+/// A port on loopback for a listener that keeps its address across a reload
+/// (port 0 would be a different socket each time). Taken from a per-process
+/// run below the ephemeral range, so parallel tests never collide and a
+/// connection's source port never takes one.
 fn free_addr() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let base = 20_000 + (std::process::id() % 10_000) as u16;
+    loop {
+        let port = base + NEXT.fetch_add(1, Ordering::Relaxed);
+        if let Ok(l) = TcpListener::bind(("127.0.0.1", port)) {
+            return l.local_addr().unwrap();
+        }
+    }
 }
 
 fn connect(addr: SocketAddr) -> TcpStream {
