@@ -64,11 +64,19 @@ impl Cap {
     /// Takes a seat only if one is free.
     fn try_take(&self) -> bool {
         let limit = self.limit.load(Ordering::Acquire);
-        self.open
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
-                (open < limit).then_some(open + 1)
-            })
-            .is_ok()
+        let mut open = self.open.load(Ordering::Acquire);
+        while open < limit {
+            match self.open.compare_exchange_weak(
+                open,
+                open + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => open = actual,
+            }
+        }
+        false
     }
 
     fn give_back(&self) {

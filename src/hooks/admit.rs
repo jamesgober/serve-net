@@ -320,7 +320,7 @@ impl InFlightCap {
         if row != NO_ROW {
             let r = usize::from(row);
             if self.take_slot(&rows[r], self.row_slots[r]) {
-                return Some(COUNTED_ROW | u64::from(row) << ROW_SHIFT);
+                return Some(COUNTED_ROW | (u64::from(row) << ROW_SHIFT));
             }
         }
         self.take_slot(pool, self.pool_slots)
