@@ -335,6 +335,21 @@ pub trait Family: Send + Sync + 'static {
         unix_secs: u64,
         out: &mut OutBuf,
     ) -> Result<u16, EngineError>;
+    /// An owned copy of a request, for a service that runs on another thread;
+    /// `None` keeps the service on the worker.
+    fn detach(&self, request: &Self::Request<'_>) -> Option<Box<dyn DetachedRequest<Self>>>
+    where
+        Self: Sized,
+    {
+        let _ = request;
+        None
+    }
+}
+
+/// An owned copy of a family's request.
+pub trait DetachedRequest<F: Family>: Send {
+    /// Shows the service the same view the worker would have.
+    fn with(&self, call: &mut dyn FnMut(&F::Request<'_>));
 }
 
 /// A service over a family's types: the same calls in the same order as

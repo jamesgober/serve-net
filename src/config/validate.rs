@@ -26,6 +26,7 @@ pub(crate) struct Draft<'a> {
     pub(crate) has_control: bool,
     pub(crate) has_tls: bool,
     pub(crate) catch_panics: bool,
+    pub(crate) reserved_percent: u32,
 }
 
 /// Errors and warnings found.
@@ -86,6 +87,7 @@ pub(crate) fn check(d: &Draft<'_>) -> Findings {
     drain(d.drain_deadline, &mut f);
     lockdown(d, &mut f);
     catch_panics(d, &mut f);
+    reserves(d, &mut f);
     f
 }
 
@@ -596,6 +598,17 @@ fn drain(deadline: Duration, f: &mut Findings) {
     }
 }
 
+fn reserves(d: &Draft<'_>, f: &mut Findings) {
+    if d.reserved_percent > 100 {
+        f.error(
+            RuleId::ReserveOverflow,
+            Subject::Server,
+            "the lane reserves sum above 100%",
+            "lower the reserves until they sum to 100 or less",
+        );
+    }
+}
+
 fn catch_panics(d: &Draft<'_>, f: &mut Findings) {
     if d.catch_panics && cfg!(panic = "abort") {
         f.warn(
@@ -633,6 +646,7 @@ mod tests {
             has_control: false,
             has_tls: false,
             catch_panics: false,
+            reserved_percent: 0,
         })
     }
 
@@ -644,6 +658,27 @@ mod tests {
         ListenerSpec::tcp(name, addr).ingress(Ingress::Proxy(ProxySource::forwarded_for(
             TrustedProxies::parse(trusted).unwrap(),
         )))
+    }
+
+    #[test]
+    fn test_reserves_above_100_refused() {
+        let check_percent = |reserved_percent| {
+            let f = check(&Draft {
+                listeners: &[ListenerSpec::tcp("web", "127.0.0.1:0")],
+                profiles: &[],
+                limits: &Limits::new(),
+                keep_alive: &KeepAlive::new(),
+                workers: &Workers::auto(),
+                drain_deadline: Duration::from_secs(30),
+                has_control: false,
+                has_tls: false,
+                catch_panics: false,
+                reserved_percent,
+            });
+            rules(&f)
+        };
+        assert_eq!(check_percent(101), vec![RuleId::ReserveOverflow]);
+        assert!(check_percent(100).is_empty());
     }
 
     #[test]
@@ -857,6 +892,7 @@ mod tests {
                 has_control: false,
                 has_tls: false,
                 catch_panics: false,
+                reserved_percent: 0,
             })
         };
         let f = d(Limits::new()
@@ -887,6 +923,7 @@ mod tests {
             has_control: true,
             has_tls: false,
             catch_panics: false,
+            reserved_percent: 0,
         });
         let r = rules(&f);
         assert!(r.contains(&RuleId::DeadlineOrder));
@@ -919,6 +956,7 @@ mod tests {
             has_control: false,
             has_tls: false,
             catch_panics: false,
+            reserved_percent: 0,
         });
         assert!(
             f.warnings

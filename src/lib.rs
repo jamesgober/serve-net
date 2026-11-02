@@ -72,7 +72,7 @@ pub use error::{ConfigError, ConfigErrors, ConfigWarning, EndReason, RuleId, Ser
 pub use health::{Health, HealthIssue, ListenerInfo, ListenerState};
 pub use hooks::{
     Admit, Admitted, Checkpoint, CheckpointAt, DefaultHooks, Dispatch, HookSet, Hooks, InFlightCap,
-    Inline, NoCheckpoint, NoObserver, Observer, Shed, Verdict,
+    Inline, NoCheckpoint, NoObserver, Observer, Offload, OffloadJob, OffloadPool, Shed, Verdict,
 };
 #[cfg(feature = "http1")]
 pub use http::{
@@ -86,7 +86,7 @@ pub use net::{
     EventSink, Gate, Lane, NoControl, NoopSink, ProxyVersions, SimpleControl, TrustedProxies,
     WorkerId,
 };
-pub use notify::{NoNotify, Notify, SystemdNotify};
+pub use notify::{NoNotify, Notify, SystemdNotify, WatchdogPinger};
 pub use reload::{ReloadSummary, ServerConfig};
 pub use reply::{CompleteError, Reply, ReplyToken};
 pub use running::{Bound, DrainHandle, DrainReport, Running};

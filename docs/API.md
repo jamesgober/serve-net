@@ -1825,9 +1825,11 @@ The bundle of hook types a builder carries. Programs never name these types: the
 
 ```rust
 pub trait Admit: Send + Sync + 'static {
+    fn driver(&mut self, kind: DriverKind, connections: u32) { let _ = (kind, connections); }   // 0.5.0: before prepare
     fn prepare(&mut self, workers: u16, profiles: &ProfileTable) {
         let _ = (workers, profiles);
     }
+    fn reserved_percent(&self) -> u32 { 0 }                    // 0.5.0: above 100 refused at build
     fn admit(&self, worker: WorkerId, env: &Envelope) -> Result<Admitted, Shed>;
     fn release(&self, worker: WorkerId, env: &Envelope, admitted: Admitted);
 }
@@ -1886,7 +1888,7 @@ impl Admit for InFlightCap;
 
 The default admission control: a real cap on requests in flight per worker and per profile (`Budget::max_in_flight`, split into per-worker shares, rounded up, at least 1). Over the cap the request gets the busy refusal with `Retry-After` = `base` plus a jitter in `[0, base)` seconds, so refused clients do not all come back in the same second. Counters are per worker, cache-line padded, and written only by their worker with plain relaxed loads and stores. On the blocking driver each worker serves one connection at a time, so the per-worker cap is 1 by construction and the profile cap does the work.
 
-`reserve(lane, percent)` keeps a share of each worker's cap for one lane: a request takes from its own lane's reserve first, then from the shared pool; lanes without a reserve use only the shared pool, so a flood of ordinary traffic can never take the slots of health checks or administrators. Reserves summing above 100% are refused at `build`.
+`reserve(lane, percent)` keeps a share of each worker's cap for one lane: a request takes from its own lane's reserve first, then from the shared pool; lanes without a reserve use only the shared pool, so a flood of ordinary traffic can never take the slots of health checks or administrators. Reserves summing above 100% are refused at `build`. A reserve keeps at least one slot, but unless the reserves sum to 100% other lanes keep one too. A worker too small to hold a share counts the reserves across all workers instead, and the blocking driver, where every connection runs one request at most, takes the shares of its soft connection cap: the same promise for one contended atomic per request, about 20 ns [est.]. On larger workers a reserve costs an array index, and nothing when none is set.
 
 | Grade | Tier | Version | Cost |
 |---|---|---|---|
@@ -1942,7 +1944,7 @@ impl<P: OffloadPool> Offload<P> { pub fn new(pool: P) -> Self; }
 impl<P: OffloadPool> Dispatch for Offload<P>;
 ```
 
-`Offload` runs `Quick` services inline and submits `Io` and `Cpu` services to the pool as a job holding a detached head, the body, a copy of the envelope, and a reply token; the worker goes straight back to its other connections. A full pool hands the job back and serve-net answers the busy refusal: the queue is bounded, never unbounded. On the blocking driver `Offload` behaves as `Inline` (each thread is its connection's own) and `build` warns. P1, Tier 3, `0.5.0`; about 2-10 µs per offloaded request for hand-off and completion [est.].
+`Offload` runs `Quick` services inline and submits `Io` and `Cpu` services to the pool as a job holding a detached head, the body, a copy of the envelope, and a reply token. A full pool hands the job back and serve-net answers the busy refusal: the queue is bounded, never unbounded. On a reactor the worker goes straight back to its other connections; on the blocking driver its thread parks until the reply arrives, and the pool bounds how many slow calls run at once (hashing on 256 threads at a time is what this prevents). A panicking service answers the 500 refusal and leaves the pool's thread alive; a job dropped without running answers the same. A service inside a job may still call `reply.defer()`. A family without `Family::detach`, and a test connection, run the service on the worker. P1, Tier 3, `0.5.0`; about 2-10 µs per offloaded request for hand-off and completion, plus a copy of the head and body [est.]; `Quick` services pay nothing. The copy holds request data for as long as the job lives, and a wiping profile does not reach it.
 
 ### `Checkpoint`, `CheckpointAt`, `Verdict`, `NoCheckpoint`
 

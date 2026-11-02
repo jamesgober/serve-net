@@ -15,10 +15,26 @@
 
 - `ServerBuilder::catch_service_panics`: a caught panic answers 500, closes
   the connection, and reports `RequestEnd::ServicePanic`.
+- `InFlightCap::reserve`: capacity kept for one lane; ordinary traffic cannot
+  take it. Rule `ReserveOverflow` is now checked. `Admit::driver` and
+  `Admit::reserved_percent`, both with defaults.
+- `Offload`, `OffloadPool`, `OffloadJob`: `Io` and `Cpu` services run on a
+  bounded pool the owner provides; a full pool answers the busy refusal.
+  `Family::detach` and `DetachedRequest` for custom families.
+- `WatchdogPinger`: pings a service manager only while every worker is
+  healthy, so a stuck worker gets the process restarted.
 
 ### Changed
 
 - http-net 0.9.
+
+### Fixed
+
+- A drain could reset connections accepted as the door closed, with their
+  request unread, so a restart under load lost requests.
+- A blocking pool of 17 threads or fewer with no `max_connections` had a soft
+  connection cap of 1 and served one client at a time; the headroom is now at
+  most a quarter of the pool.
 
 ---
 

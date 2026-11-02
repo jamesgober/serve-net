@@ -11,6 +11,7 @@ use std::sync::{Arc, PoisonError};
 use crate::sync::Mutex;
 
 use crate::engine::Family;
+use crate::hooks::JobService;
 use crate::net::ConnectionId;
 
 /// The wake token serve-net uses for deferred replies.
@@ -36,8 +37,9 @@ pub(crate) enum SlotState<P> {
     Idle,
     /// A reply with this generation is outstanding.
     Waiting(u64),
-    /// The reply with this generation was completed.
-    Completed(u64, P),
+    /// The reply with this generation was completed; the flag closes the
+    /// connection after it.
+    Completed(u64, P, bool),
     /// The token of this generation was dropped without completing.
     Dropped(u64),
 }
@@ -78,6 +80,12 @@ pub struct Reply<F: Family> {
     pub(crate) parts: F::Parts,
     pub(crate) link: Option<Link<F::Parts>>,
     pub(crate) deferred: bool,
+    /// The service as an `Offload` job needs it; `None` keeps it on the worker.
+    pub(crate) job: Option<Arc<dyn JobService<F>>>,
+    /// Inside an offload job: the slot already waits for this generation.
+    pub(crate) offloaded: bool,
+    /// `Offload` found its pool full.
+    pub(crate) pool_full: bool,
 }
 
 impl<F: Family> Reply<F> {
@@ -86,6 +94,9 @@ impl<F: Family> Reply<F> {
             parts,
             link: None,
             deferred: false,
+            job: None,
+            offloaded: false,
+            pool_full: false,
         }
     }
 
@@ -105,7 +116,9 @@ impl<F: Family> Reply<F> {
         let parts = core::mem::take(&mut self.parts);
         let inner = match self.link.take() {
             Some(link) if !self.deferred => {
-                *link.slot.lock() = SlotState::Waiting(link.generation);
+                if !self.offloaded {
+                    *link.slot.lock() = SlotState::Waiting(link.generation);
+                }
                 self.deferred = true;
                 Some(TokenInner {
                     slot: link.slot,
@@ -197,7 +210,36 @@ impl<F: Family> ReplyToken<F> {
     ///
     /// `Expired` when nobody waits any more; `Busy` when the worker's
     /// completion queue is full.
-    pub fn complete(mut self) -> Result<(), CompleteError<F>> {
+    pub fn complete(self) -> Result<(), CompleteError<F>> {
+        self.finish(false)
+    }
+
+    /// Lets a service inside an offload job defer this reply further.
+    pub(crate) fn link_reply(&mut self) {
+        let link = self.inner.as_ref().map(|inner| Link {
+            slot: Arc::clone(&inner.slot),
+            generation: inner.generation,
+        });
+        let reply = self.reply();
+        reply.link = link;
+        reply.offloaded = true;
+    }
+
+    /// Stops answering for the reply: another token holds it now.
+    pub(crate) fn release(&mut self) {
+        self.inner = None;
+    }
+
+    /// Takes the reply back before anyone ran it.
+    pub(crate) fn release_to_idle(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            *inner.slot.lock() = SlotState::Idle;
+        }
+    }
+
+    /// [`complete`](Self::complete), closing the connection after the reply
+    /// when `close` is set.
+    pub(crate) fn finish(mut self, close: bool) -> Result<(), CompleteError<F>> {
         let Some(inner) = self.inner.take() else {
             return Err(CompleteError::Expired(self));
         };
@@ -210,7 +252,7 @@ impl<F: Family> ReplyToken<F> {
                 self.inner = Some(inner);
                 return Err(CompleteError::Expired(self));
             }
-            *state = SlotState::Completed(inner.generation, parts);
+            *state = SlotState::Completed(inner.generation, parts, close);
         }
         match inner
             .slot
@@ -223,7 +265,7 @@ impl<F: Family> ReplyToken<F> {
                 let mut state = inner.slot.lock();
                 let parts =
                     match core::mem::replace(&mut *state, SlotState::Waiting(inner.generation)) {
-                        SlotState::Completed(_, p) => p,
+                        SlotState::Completed(_, p, _) => p,
                         other => {
                             *state = other;
                             F::Parts::default()

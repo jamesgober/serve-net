@@ -23,12 +23,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::client::{ClientInfo, Scheme};
 use crate::config::{Compiled, KeepAlive, ProfileId, ProfileTable, ProxySource};
 use crate::engine::{
-    Engine, EngineEvent, Family, HeadContext, OutBuf, Refusal, RefusalKind, Service,
+    DetachedRequest, Engine, EngineEvent, Family, HeadContext, OutBuf, Refusal, RefusalKind,
+    Service,
 };
 use crate::envelope::{Envelope, RequestSeq};
 use crate::error::EndReason;
 use crate::hooks::{
-    Admit, Admitted, Checkpoint, CheckpointAt, Dispatch, Hooks, Observer, Shed, Verdict,
+    Admit, Admitted, Checkpoint, CheckpointAt, Dispatch, Hooks, JobService, Observer, Shed, Verdict,
 };
 use crate::net::{CloseReason, ConnectionId, ControlLine, ControlState, WorkerId};
 use crate::reply::{DeferSlot, Link, Reply, SlotState, WAKE_REPLY, Waker};
@@ -167,6 +168,20 @@ pub(crate) struct Shared<F: Family, S: Service<F>, H: Hooks> {
     pub(crate) counters: Arc<Counters>,
     /// Catch a panicking service (`catch_service_panics`).
     pub(crate) catch_panics: bool,
+}
+
+impl<F: Family, S: Service<F>, H: Hooks> JobService<F> for Shared<F, S, H> {
+    fn detach(&self, request: &F::Request<'_>) -> Option<Box<dyn DetachedRequest<F>>> {
+        self.family.detach(request)
+    }
+
+    fn call(&self, request: &F::Request<'_>, env: &Envelope, reply: &mut Reply<F>) -> Outcome {
+        self.service.call(request, env, reply)
+    }
+
+    fn panicked(&self, env: &Envelope) {
+        self.observer.service_error(env, "the service panicked");
+    }
 }
 
 impl<F: Family, S: Service<F>, H: Hooks> crate::notify::ServerEvents for Shared<F, S, H> {
@@ -455,6 +470,16 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         Step::Read
     }
 
+    /// Lets `Offload` run this connection's service on a pool.
+    pub(crate) fn offload_through(&mut self, service: Arc<dyn JobService<F>>) {
+        self.reply.job = Some(service);
+    }
+
+    /// The connection is past `on_open`: a drain can no longer take it for idle.
+    pub(crate) fn count_opened(&self, worker: WorkerId) {
+        self.shared.counters.count(worker.get(), Count::Opened);
+    }
+
     /// Bytes arrived; returns how many were consumed and what to do next.
     pub(crate) fn on_data<I: Io>(&mut self, io: &mut I, input: &[u8]) -> (usize, Step) {
         match self.state {
@@ -517,7 +542,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let taken = {
             let mut state = slot.lock();
             match core::mem::replace(&mut *state, SlotState::Idle) {
-                SlotState::Completed(g, parts) if g == generation => Some(Some(parts)),
+                SlotState::Completed(g, parts, close) if g == generation => {
+                    Some(Some((parts, close)))
+                }
                 SlotState::Dropped(g) if g == generation => Some(None),
                 other => {
                     *state = other;
@@ -527,11 +554,12 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         };
         match taken {
             None => Step::Park { until },
-            Some(Some(parts)) => {
+            Some(Some((parts, close))) => {
                 let old = core::mem::replace(&mut self.reply.parts, parts);
                 drop(old);
                 self.state = State::Writing;
-                let step = self.respond(io, Outcome::Done);
+                let outcome = if close { Outcome::Close } else { Outcome::Done };
+                let step = self.respond(io, outcome);
                 if step == Step::Read && self.state == State::AwaitHead {
                     return self.process(io, &[]).1;
                 }
@@ -1159,6 +1187,23 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 500,
                 None,
                 RequestEnd::ServicePanic,
+            );
+        }
+        if self.reply.pool_full {
+            self.reply.pool_full = false;
+            self.reply.link = None;
+            self.end = Some(EndReason::Shed);
+            let shed = Shed {
+                retry_after: None,
+                close: false,
+            };
+            shared.observer.request_shed(&self.env, &shed);
+            return self.refuse(
+                io,
+                RefusalKind::Busy,
+                503,
+                Some(Duration::from_secs(1)),
+                RequestEnd::Shed,
             );
         }
         let Some(outcome) = outcome else {

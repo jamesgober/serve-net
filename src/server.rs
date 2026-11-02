@@ -52,6 +52,7 @@ impl Server {
                 has_control: false,
                 has_tls: false,
                 catch_panics: false,
+                reserved_percent: 0,
                 notify: Arc::new(crate::NoNotify),
                 transport: None,
                 clock: None,
@@ -73,6 +74,7 @@ struct Config {
     has_control: bool,
     has_tls: bool,
     catch_panics: bool,
+    reserved_percent: u32,
     notify: Arc<dyn Notify>,
     transport: Option<net_io::Limits>,
     clock: Option<Arc<dyn net_io::Clock>>,
@@ -175,7 +177,11 @@ impl<H> ServerBuilder<H> {
 #[allow(clippy::type_complexity)]
 impl<A, D, K, O, G, E, C, T> ServerBuilder<HookSet<A, D, K, O, G, E, C, T>> {
     /// Replaces admission.
-    pub fn admit<A2: Admit>(self, admit: A2) -> ServerBuilder<HookSet<A2, D, K, O, G, E, C, T>> {
+    pub fn admit<A2: Admit>(
+        mut self,
+        admit: A2,
+    ) -> ServerBuilder<HookSet<A2, D, K, O, G, E, C, T>> {
+        self.config.reserved_percent = admit.reserved_percent();
         let HookSet {
             dispatch,
             checkpoint,
@@ -433,6 +439,7 @@ impl<H: Hooks> ServerBuilder<H> {
             has_control: c.has_control,
             has_tls: c.has_tls,
             catch_panics: c.catch_panics,
+            reserved_percent: c.reserved_percent,
         });
         if let Some(errors) = ConfigErrors::from_vec(findings.errors) {
             return Err(errors);
@@ -580,6 +587,7 @@ where
         let (soft, hard, threads) = connection_caps(&limits, &workers);
 
         let mut admit = hooks.admit;
+        admit.driver(workers.resolved(), soft);
         admit.prepare(threads, &profiles);
         let counters = Arc::new(Counters::new(threads));
         let runtime_listeners = listeners
@@ -774,8 +782,9 @@ impl net_io::Clock for SharedClock {
 pub(crate) fn connection_caps(limits: &Limits, workers: &Workers) -> (u32, u32, u16) {
     let asked = workers.blocking_threads();
     let soft = limits.max_connections.unwrap_or_else(|| {
+        // A small pool keeps most of its threads for clients.
         let t = u32::from(asked);
-        t.saturating_sub(limits.headroom_for(t)).max(1)
+        t.saturating_sub(limits.headroom_for(t).min(t / 4)).max(1)
     });
     let hard = soft.saturating_add(limits.headroom_for(soft));
     let threads = u16::try_from(hard).unwrap_or(u16::MAX).max(asked);

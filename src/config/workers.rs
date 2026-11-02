@@ -50,6 +50,13 @@ impl Workers {
         self.count
     }
 
+    /// The driver that runs: the blocking pool until net-io provides the
+    /// reactor.
+    #[allow(clippy::unused_self)]
+    pub(crate) fn resolved(&self) -> DriverKind {
+        DriverKind::Blocking
+    }
+
     /// The thread count the blocking pool runs with.
     pub(crate) fn blocking_threads(&self) -> u16 {
         self.count.unwrap_or(BLOCKING_DEFAULT)

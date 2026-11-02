@@ -69,7 +69,7 @@ fn loom_complete_races_cancel() {
         let state = slot.lock();
         match &*state {
             SlotState::Idle => {}
-            SlotState::Completed(7, _) => assert!(completed),
+            SlotState::Completed(7, ..) => assert!(completed),
             SlotState::Waiting(_) | SlotState::Dropped(_) | SlotState::Completed(..) => {
                 panic!("unexpected slot state")
             }

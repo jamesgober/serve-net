@@ -193,6 +193,14 @@ pub(crate) struct Parts {
     pub(crate) reloader: Reloader,
 }
 
+/// How often `settle_accepts` looks, how many quiet looks end it, and the most
+/// it waits: about 3 ms per drain, none on a request.
+const ACCEPT_SETTLE_TICK: Duration = Duration::from_millis(1);
+const ACCEPT_SETTLE_QUIET: u32 = 3;
+const ACCEPT_SETTLE_MAX: Duration = Duration::from_millis(50);
+/// The longest a drain waits for an accept thread to start it.
+const DRAIN_START_MAX: Duration = Duration::from_millis(100);
+
 /// What a bound and a running server hold.
 struct Inner {
     /// Locked by `reload` and `listeners`; a request never takes it.
@@ -247,6 +255,37 @@ impl Inner {
                 })
             })
             .collect()
+    }
+
+    /// Closes the door and waits until accepting has gone quiet and every
+    /// accepted connection reached `on_open`. An accept thread ends its batch
+    /// after the door closes, so a drain that starts first can count nothing
+    /// open and finish, and until `on_open` net-io takes a connection for
+    /// idle: either way the connection is reset with its request unread.
+    fn settle_accepts(&self) {
+        self.handle.close_door();
+        let give_up = Instant::now() + ACCEPT_SETTLE_MAX;
+        let mut last = self.handle.stats().accepted;
+        let mut quiet = 0;
+        while quiet < ACCEPT_SETTLE_QUIET && Instant::now() < give_up {
+            std::thread::sleep(ACCEPT_SETTLE_TICK);
+            let accepted = self.handle.stats().accepted;
+            let settled = accepted == last && self.counters.opened() >= accepted;
+            quiet = if settled { quiet + 1 } else { 0 };
+            last = accepted;
+        }
+    }
+
+    /// Waits for net-io's accept thread to start the drain from the control
+    /// line: it does so between batches, so nothing it accepted is left behind.
+    /// A server whose accept threads all failed has nobody to start it, so
+    /// the wait is bounded.
+    fn await_drain_start(&self) {
+        self.handle.wake_all();
+        let give_up = Instant::now() + DRAIN_START_MAX;
+        while !self.notifier.is_drain_started() && Instant::now() < give_up {
+            std::thread::sleep(ACCEPT_SETTLE_TICK);
+        }
     }
 
     /// Each TCP listener's name and address.
@@ -394,8 +433,10 @@ impl Running {
         let inner = self.inner.take().unwrap_or_else(|| unreachable!());
         inner.notifier.drain_deadline(deadline);
         let deadline = Instant::now() + deadline;
+        inner.settle_accepts();
         // Replies in flight read the line live and carry the close signal.
         inner.switch.request(deadline);
+        inner.await_drain_start();
         let (counters, notifier) = (Arc::clone(&inner.counters), Arc::clone(&inner.notifier));
         let report = DrainReport::from_net(inner.into_server().shutdown(deadline), &counters);
         notifier.drain_finished(&report);
@@ -420,6 +461,12 @@ impl Running {
         let report = DrainReport::from_net(inner.into_server().wait_for_stop(), &counters);
         notifier.drain_finished(&report);
         report
+    }
+
+    /// What a watchdog reads and reports through.
+    pub(crate) fn vitals(&self) -> (Arc<Counters>, Arc<Notifier>) {
+        let inner = self.inner();
+        (Arc::clone(&inner.counters), Arc::clone(&inner.notifier))
     }
 
     /// net-io's handle.
@@ -455,7 +502,9 @@ impl Drop for Running {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
             // A drop must not block for seconds: close everything now.
+            let notifier = Arc::clone(&inner.notifier);
             let _ = inner.into_server().shutdown(Instant::now());
+            notifier.finish();
         }
     }
 }

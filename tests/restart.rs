@@ -63,7 +63,7 @@ impl HttpService for Ends {
 }
 
 #[test]
-fn test_caught_service_panic_answers_500_and_the_server_lives() {
+fn test_panic_caught_500_and_done_called() {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
@@ -100,27 +100,24 @@ fn test_caught_service_panic_answers_500_and_the_server_lives() {
 mod restart {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use serve_net::{ListenerSpec, Server};
 
     const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
 
-    /// One request on a new connection; `true` when a whole 200 came back.
-    fn one_request(addr: SocketAddr) -> bool {
-        let Ok(mut s) = TcpStream::connect(addr) else {
-            return false;
-        };
+    /// One request on a new connection; a whole 200, or what went wrong.
+    fn one_request(addr: SocketAddr) -> Result<(), String> {
+        let mut s = TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
         let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
-        if s.write_all(GET).is_err() {
-            return false;
-        }
+        s.write_all(GET).map_err(|e| format!("write: {e}"))?;
         let mut got = Vec::new();
         match s.read_to_end(&mut got) {
-            Ok(_) => got.starts_with(b"HTTP/1.1 200"),
-            Err(_) => false,
+            Ok(_) if got.starts_with(b"HTTP/1.1 200") => Ok(()),
+            Ok(_) => Err(format!("reply: {}", String::from_utf8_lossy(&got))),
+            Err(e) => Err(format!("read after {} bytes: {e}", got.len())),
         }
     }
 
@@ -155,18 +152,20 @@ mod restart {
 
         let stop = Arc::new(AtomicBool::new(false));
         let served = Arc::new(AtomicU64::new(0));
-        let failed = Arc::new(AtomicU64::new(0));
+        let failed = Arc::new(Mutex::new(Vec::new()));
         let clients: Vec<_> = (0..4)
             .map(|_| {
                 let (stop, served, failed) =
                     (Arc::clone(&stop), Arc::clone(&served), Arc::clone(&failed));
                 std::thread::spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
-                        if one_request(addr) {
-                            served.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            failed.fetch_add(1, Ordering::Relaxed);
-                        }
+                        match one_request(addr) {
+                            Ok(()) => served.fetch_add(1, Ordering::Relaxed),
+                            Err(e) => {
+                                failed.lock().unwrap().push(e);
+                                0
+                            }
+                        };
                     }
                 })
             })
@@ -186,11 +185,8 @@ mod restart {
             c.join().unwrap();
         }
         assert!(served.load(Ordering::Relaxed) > 0);
-        assert_eq!(
-            failed.load(Ordering::Relaxed),
-            0,
-            "requests failed in the restart"
-        );
+        let failed = failed.lock().unwrap();
+        assert!(failed.is_empty(), "failed in the restart: {failed:?}");
         let _ = new.drain(Duration::from_secs(2));
     }
 }

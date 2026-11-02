@@ -1,13 +1,15 @@
 //! Telling a service manager or a supervisor what the server is doing.
 
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::error::ConfigErrors;
 use crate::reload::ReloadSummary;
-use crate::running::DrainReport;
+use crate::running::{DrainReport, Running};
+use crate::stats::Counters;
 
 /// Readiness for a service manager or a supervisor. Every method has an
 /// empty default.
@@ -57,6 +59,8 @@ pub(crate) struct Notifier {
     notify: Arc<dyn Notify>,
     events: Arc<dyn ServerEvents>,
     failing: AtomicBool,
+    drain_started: AtomicBool,
+    finished: AtomicBool,
 }
 
 impl Notifier {
@@ -65,12 +69,18 @@ impl Notifier {
             notify,
             events,
             failing: AtomicBool::new(false),
+            drain_started: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
         }
     }
 
     fn call(&self, f: impl FnOnce(&dyn Notify)) {
         f(self.notify.as_ref());
-        match self.notify.take_error() {
+        self.record(self.notify.take_error());
+    }
+
+    fn record(&self, error: Option<io::Error>) {
+        match error {
             Some(e) => {
                 self.failing.store(true, Ordering::Release);
                 self.events.notify_failed(&e);
@@ -79,18 +89,39 @@ impl Notifier {
         }
     }
 
+    /// One watchdog ping through the pinger's own [`Notify`].
+    fn ping(&self, notify: &dyn Notify) {
+        notify.watchdog();
+        self.record(notify.take_error());
+    }
+
     pub(crate) fn ready(&self) {
         self.call(|n| n.ready());
     }
 
     /// From net-io's `DrainStarted` event: every way a drain can begin.
     pub(crate) fn drain_started(&self, open_connections: u32) {
+        self.drain_started.store(true, Ordering::Release);
         self.events.drain_started(open_connections);
         self.call(|n| n.stopping());
     }
 
     pub(crate) fn drain_finished(&self, report: &DrainReport) {
+        self.finished.store(true, Ordering::Release);
         self.events.drain_finished(report);
+    }
+
+    pub(crate) fn is_drain_started(&self) -> bool {
+        self.drain_started.load(Ordering::Acquire)
+    }
+
+    /// The server closed without a drain.
+    pub(crate) fn finish(&self) {
+        self.finished.store(true, Ordering::Release);
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
     }
 
     /// Asks the manager for more time when a drain may outlast its default.
@@ -118,6 +149,119 @@ impl Notifier {
     pub(crate) fn is_failing(&self) -> bool {
         self.failing.load(Ordering::Acquire)
     }
+}
+
+/// Pings a service manager's watchdog while every worker is healthy.
+///
+/// A parked thread wakes at half `interval` and calls [`Notify::watchdog`]
+/// only if every worker made progress or sat outside a service call since the
+/// last wake, so a stuck worker stops the pings and the manager restarts the
+/// process. A service call that runs longer than `interval` looks stuck: keep
+/// slow work on an `Offload` pool or raise the interval. Pings go on through a
+/// drain and end when it finishes.
+///
+/// The thread is not started when `WATCHDOG_PID` names another process.
+/// Stopping or dropping the pinger ends the thread at once.
+///
+/// Cost: one thread, one relaxed read per worker per wake.
+///
+/// ```no_run
+/// # #[cfg(feature = "http1")]
+/// # fn main() -> Result<(), serve_net::ServeError> {
+/// use serve_net::{SystemdNotify, WatchdogPinger};
+/// use std::sync::Arc;
+/// # let server = serve_net::http("127.0.0.1:0", |_req, reply| { reply.text(200, "ok"); })?;
+/// if let (Some(notify), Some(interval)) =
+///     (SystemdNotify::from_env(), SystemdNotify::watchdog_interval())
+/// {
+///     let pinger = WatchdogPinger::start(&server, Arc::new(notify), interval);
+///     let _report = server.wait();
+///     pinger.stop();
+/// }
+/// # Ok(())
+/// # }
+/// # #[cfg(not(feature = "http1"))]
+/// # fn main() {}
+/// ```
+#[derive(Debug)]
+pub struct WatchdogPinger {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// The fastest a pinger wakes.
+const PING_FLOOR: Duration = Duration::from_millis(1);
+
+impl WatchdogPinger {
+    /// Starts pinging `notify` for `server`. A failed ping reaches
+    /// `Observer::notify_failed` and `health`, as every `Notify` failure does.
+    #[must_use = "dropping a WatchdogPinger stops the pings"]
+    pub fn start(server: &Running, notify: Arc<dyn Notify>, interval: Duration) -> Self {
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let (counters, notifier) = server.vitals();
+        let every = (interval / 2).max(PING_FLOOR);
+        let thread = watchdog_pid_is_ours().then(|| {
+            let stop = Arc::clone(&stop);
+            let pinger = Arc::clone(&notifier);
+            std::thread::Builder::new()
+                .name("serve-net-watchdog".into())
+                .spawn(move || ping_loop(&stop, &pinger, &counters, notify.as_ref(), every))
+                .map_err(|e| notifier.record(Some(e)))
+                .ok()
+        });
+        WatchdogPinger {
+            stop,
+            thread: thread.flatten(),
+        }
+    }
+
+    /// Stops the pings and joins the thread.
+    pub fn stop(self) {}
+}
+
+impl Drop for WatchdogPinger {
+    fn drop(&mut self) {
+        let (stopped, wake) = &*self.stop;
+        *stopped.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        wake.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn ping_loop(
+    stop: &(Mutex<bool>, Condvar),
+    notifier: &Notifier,
+    counters: &Counters,
+    notify: &dyn Notify,
+    every: Duration,
+) {
+    let (stopped, wake) = stop;
+    let mut before: Vec<u64> = counters.workers().map(|(progress, _)| progress).collect();
+    loop {
+        let guard = stopped.lock().unwrap_or_else(PoisonError::into_inner);
+        let (guard, _) = wake
+            .wait_timeout_while(guard, every, |stopped| !*stopped)
+            .unwrap_or_else(PoisonError::into_inner);
+        if *guard || notifier.is_finished() {
+            return;
+        }
+        drop(guard);
+        let mut healthy = true;
+        for ((progress, in_call), last) in counters.workers().zip(&mut before) {
+            healthy &= !in_call || progress != *last;
+            *last = progress;
+        }
+        if healthy {
+            notifier.ping(notify);
+        }
+    }
+}
+
+/// Whether `WATCHDOG_PID` is unset or names this process.
+fn watchdog_pid_is_ours() -> bool {
+    std::env::var("WATCHDOG_PID").map_or(true, |pid| pid.parse() == Ok(std::process::id()))
 }
 
 /// systemd's `sd_notify` in safe `std` code: one datagram per call to
@@ -177,10 +321,8 @@ impl SystemdNotify {
     /// `WATCHDOG_USEC`, when `WATCHDOG_PID` is unset or names this process.
     #[must_use]
     pub fn watchdog_interval() -> Option<Duration> {
-        if let Ok(pid) = std::env::var("WATCHDOG_PID") {
-            if pid.parse::<u32>().ok()? != std::process::id() {
-                return None;
-            }
+        if !watchdog_pid_is_ours() {
+            return None;
         }
         let usec: u64 = std::env::var("WATCHDOG_USEC").ok()?.parse().ok()?;
         (usec > 0).then(|| Duration::from_micros(usec))

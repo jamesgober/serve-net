@@ -3,13 +3,18 @@
 use core::fmt;
 use std::time::Duration;
 
-use http_net::{BodyPlan, Headers, Method, OutgoingBody, RequestHead, ResponseHeadRef, Version};
+use http_net::{
+    BodyPlan, Headers, Method, OutgoingBody, OwnedRequestHead, RequestHead, ResponseHeadRef,
+    Version,
+};
 
 use crate::Finished;
 use crate::client::{ClientInfo, IngressKind};
 use crate::config::{Limits, Profile, ProxyKind};
 use crate::engine::http1::engine_error;
-use crate::engine::{EngineError, Family, HeadContext, Http1, OutBuf, RefusalKind, Service};
+use crate::engine::{
+    DetachedRequest, EngineError, Family, HeadContext, Http1, OutBuf, RefusalKind, Service,
+};
 use crate::envelope::Envelope;
 use crate::forwarded::{self, FieldLines, Lines, WalkError};
 use crate::reply::Reply;
@@ -257,6 +262,27 @@ impl<'a> HttpRequest<'a> {
     #[must_use]
     pub fn detach_head(&self) -> DetachedHead {
         DetachedHead::of(&self.head)
+    }
+}
+
+/// A request a pool thread answers: the head, the normalized facts, the body.
+struct OwnedRequest {
+    head: OwnedRequestHead,
+    client: ClientInfo,
+    authority: Option<Box<str>>,
+    body: Box<[u8]>,
+}
+
+impl DetachedRequest<HttpFamily> for OwnedRequest {
+    fn with(&self, call: &mut dyn FnMut(&HttpRequest<'_>)) {
+        call(&HttpRequest {
+            head: HttpHead {
+                raw: self.head.view(),
+                client: self.client,
+                authority: self.authority.as_deref(),
+            },
+            body: &self.body,
+        });
     }
 }
 
@@ -680,6 +706,15 @@ impl Family for HttpFamily {
 
     fn request<'a>(&self, head: HttpHead<'a>, body: &'a [u8]) -> HttpRequest<'a> {
         HttpRequest { head, body }
+    }
+
+    fn detach(&self, request: &HttpRequest<'_>) -> Option<Box<dyn DetachedRequest<Self>>> {
+        Some(Box::new(OwnedRequest {
+            head: request.head.raw.to_owned(),
+            client: request.head.client,
+            authority: request.head.authority.map(Box::from),
+            body: Box::from(request.body),
+        }))
     }
 
     fn new_parts(&self) -> HttpParts {
