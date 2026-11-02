@@ -32,6 +32,7 @@ use crate::hooks::{
 use crate::net::{CloseReason, ConnectionId, ControlLine, ControlState, WorkerId};
 use crate::reply::{DeferSlot, Link, Reply, SlotState, WAKE_REPLY, Waker};
 use crate::service::{BodyPolicy, Finished, HeadAction, Outcome, RequestEnd};
+use crate::snapshot::Snapshot;
 use crate::stats::{Count, Counters};
 
 pub(crate) mod session;
@@ -107,6 +108,18 @@ pub(crate) struct ListenerRuntime {
     pub(crate) declared_scheme: Scheme,
     /// On a Unix socket: who may connect.
     pub(crate) unix: Option<UnixRuntime>,
+    /// The listener's soft connection cap.
+    pub(crate) cap: Arc<session::Cap>,
+}
+
+/// What a reload swaps: read through a snapshot, so a connection keeps a
+/// whole table and sees a new one at its next request head (D-062).
+#[derive(Debug)]
+pub(crate) struct Tables {
+    pub(crate) profiles: ProfileTable,
+    /// By net-io listener id; a removed listener leaves `None`.
+    pub(crate) listeners: Vec<Option<ListenerRuntime>>,
+    pub(crate) profile_caps: Vec<Arc<session::Cap>>,
 }
 
 /// A Unix listener's peer rule.
@@ -149,8 +162,7 @@ pub(crate) struct Shared<F: Family, S: Service<F>, H: Hooks> {
     /// live at each checkpoint: net-io's `draining()` is fixed for the length
     /// of one callback, and a drain may start while the service runs (D-047).
     pub(crate) control: Arc<crate::running::Merged<H::Control>>,
-    pub(crate) profiles: ProfileTable,
-    pub(crate) listeners: Vec<ListenerRuntime>,
+    pub(crate) tables: Arc<Snapshot<Tables>>,
     pub(crate) counters: Arc<Counters>,
 }
 
@@ -210,6 +222,8 @@ const BODY_RETAIN: usize = 64 * 1024;
 /// One connection.
 pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     shared: Arc<Shared<F, S, H>>,
+    tables: Arc<Tables>,
+    tables_version: u64,
     listener: usize,
     connection: ConnectionId,
     engine: F::Engine,
@@ -248,11 +262,14 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         now: Instant,
         worker: WorkerId,
     ) -> Self {
-        let profile_id = shared
+        let tables_version = shared.tables.version();
+        let tables = shared.tables.load();
+        let profile_id = tables
             .listeners
             .get(listener)
+            .and_then(Option::as_ref)
             .map_or(ProfileId(0), |l| l.profile);
-        let compiled = shared.profiles.compiled(profile_id);
+        let compiled = tables.profiles.compiled(profile_id);
         let (engine, wipe, lane, tag) = match compiled {
             Some(c) => (
                 shared.family.engine(&c.profile, &c.limits),
@@ -296,6 +313,8 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         };
         Conn {
             shared,
+            tables,
+            tables_version,
             listener,
             connection,
             engine,
@@ -331,7 +350,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     }
 
     fn compiled(&self) -> Option<&Compiled> {
-        self.shared.profiles.compiled(self.env.profile)
+        self.tables.profiles.compiled(self.env.profile)
     }
 
     fn limits(&self) -> crate::config::Limits {
@@ -348,6 +367,20 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         self.clock_base
             .1
             .saturating_add(now.saturating_duration_since(self.clock_base.0).as_secs())
+    }
+
+    /// Takes the newest tables, at a request head: one load when nothing
+    /// changed. A connection whose listener was removed keeps the tables it
+    /// has until it ends.
+    fn refresh_tables(&mut self) {
+        let version = self.shared.tables.version();
+        if version != self.tables_version {
+            let next = self.shared.tables.load();
+            self.tables_version = version;
+            if matches!(next.listeners.get(self.listener), Some(Some(_))) {
+                self.tables = next;
+            }
+        }
     }
 
     #[inline]
@@ -827,11 +860,13 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         }
         let limits = self.limits();
         let shared = Arc::clone(&self.shared);
-        let compiled = shared.profiles.compiled(self.env.profile);
+        self.refresh_tables();
+        let tables = Arc::clone(&self.tables);
+        let compiled = tables.profiles.compiled(self.env.profile);
         // Everything that borrows the engine's head happens in this block, so
         // the borrow ends before any refusal is written.
         let viewed = {
-            let listener = shared.listeners.get(self.listener);
+            let listener = tables.listeners.get(self.listener).and_then(Option::as_ref);
             let cx = HeadContext {
                 client: &self.client,
                 proxy: listener.and_then(|l| l.proxy.as_ref()),
@@ -1033,7 +1068,8 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         self.reply.deferred = false;
         shared.family.clear_parts(&mut self.reply.parts, self.wipe);
         let outcome = {
-            let listener = shared.listeners.get(self.listener);
+            let tables = Arc::clone(&self.tables);
+            let listener = tables.listeners.get(self.listener).and_then(Option::as_ref);
             let cx = HeadContext {
                 client: &self.client,
                 proxy: listener.and_then(|l| l.proxy.as_ref()),

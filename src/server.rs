@@ -10,8 +10,8 @@ use crate::config::{
     Ingress, KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId, ProfileTable,
     ProxySource, Workers,
 };
-use crate::conn::session::{Factory, Runtime};
-use crate::conn::{ListenerRuntime, Shared, UnixRuntime};
+use crate::conn::session::{Cap, Factory, Runtime};
+use crate::conn::{ListenerRuntime, Shared, Tables, UnixRuntime};
 use crate::engine::{Family, Service};
 use crate::error::{ConfigErrors, ConfigWarning, ServeError};
 use crate::health::{HealthState, Tap};
@@ -21,6 +21,7 @@ use crate::notify::{Notifier, Notify, ServerEvents};
 #[cfg(feature = "http1")]
 use crate::running::Running;
 use crate::running::{Bound, DrainSwitch, ListenerMeta, Merged, Parts};
+use crate::snapshot::Snapshot;
 use crate::stats::Counters;
 
 /// The entry point for Tier 2.
@@ -548,6 +549,7 @@ where
                     }),
                     _ => None,
                 },
+                cap: Cap::new(l.max_connections),
             })
             .collect::<Vec<_>>();
         // Filled after bind, once the socket files exist.
@@ -555,15 +557,11 @@ where
             .iter()
             .map(|l| l.unix.as_ref().map(|u| Arc::clone(&u.same_user)))
             .collect();
-        let listener_caps: Vec<Option<u32>> = listeners.iter().map(|l| l.max_connections).collect();
-        let profile_caps: Vec<Option<u32>> =
-            profiles.iter().map(|p| p.budget.max_connections).collect();
-        let rt = Arc::new(Runtime::new(
-            Some(soft),
-            &listener_caps,
-            &profile_caps,
-            threads,
-        ));
+        let profile_caps = profiles
+            .iter()
+            .map(|p| Cap::new(p.budget.max_connections))
+            .collect();
+        let rt = Arc::new(Runtime::new(Some(soft), threads));
 
         let global = net_io::Limits::builder()
             .max_connections(hard)
@@ -719,8 +717,11 @@ where
             checkpoint: hooks.checkpoint,
             observer: hooks.observer,
             control: Arc::clone(&merged),
-            profiles,
-            listeners: runtime_listeners,
+            tables: Arc::new(Snapshot::new(Tables {
+                profiles,
+                listeners: runtime_listeners.into_iter().map(Some).collect(),
+                profile_caps,
+            })),
             counters: Arc::clone(&counters),
         });
         for l in &listeners {
