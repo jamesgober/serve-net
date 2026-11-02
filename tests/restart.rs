@@ -1,7 +1,7 @@
 //! T-30: a restart through a shared listening socket refuses and resets
-//! nothing (Linux and macOS; net-io makes the same promise for Windows at its
-//! 0.5). T-20 and the head-read signal sit here too: both need a real server's
-//! view of a request.
+//! nothing (Linux and macOS; Windows is open, see the module below). T-20 and
+//! the head-read signal sit here too: both need a real server's view of a
+//! request.
 
 #![cfg(feature = "http1")]
 
@@ -96,6 +96,9 @@ fn test_panic_caught_500_and_done_called() {
     assert_eq!(ends[1], RequestEnd::Replied);
 }
 
+// Not on Windows yet: two servers on one socket pass on a large machine and
+// lose connections on a small one (dev/ROADMAP.md, Windows restart).
+#[cfg(unix)]
 mod restart {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};

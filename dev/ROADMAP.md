@@ -108,7 +108,8 @@ Exit: on net-io's reactor, 10,000 idle keep-alive connections with bounded memor
 - [x] API done: `Budget::dedicated_workers` (blocking driver, D-074), `BodyPolicy::Stream`, `HttpBody::Chunk`, `HttpReply::stream`, `ReplyStream`, `Outcome::More` (D-073), `catch_service_panics`, `InFlightCap::reserve` (D-069), `Offload`, `OffloadPool`, `OffloadJob` (D-071), `WatchdogPinger` (D-068).
 - [x] Threat tests T-25, T-27, T-37.
 - [x] `docs/PLATFORM-NOTES.md`.
-- Waiting on net-io 0.5 (not published; a hard reason): `Workers::reactor`, the `completion_queue` mapping, `dedicated_workers` as a worker set of its own, the 10,000 idle connections exit, the Windows restart test, and dropping the drain workaround of D-072 once net-io fixes the accept race.
+- Waiting on net-io 0.5 (not published; a hard reason): `Workers::reactor`, the `completion_queue` mapping, `dedicated_workers` as a worker set of its own, and dropping the drain workaround of D-072 once net-io fixes the accept race.
+- Open on Windows: T-30. `tests/restart.rs` passes on a 24-core machine and fails on CI's small runners with connection resets and connects that time out, in net-io 0.5's in-process hand-off of one socket to two servers. Reported to net-io; the test stays Unix only until it passes there.
 
 ## v0.6.0 - Optimisation
 Exit: NFR-1, NFR-2, NFR-3, NFR-5 met, or each gap recorded in `docs/PERFORMANCE.md` with its cause and the plan to close it before 1.0 (a missed 20% target blocks 1.0); `docs/PERFORMANCE.md` published.
@@ -149,6 +150,7 @@ Exit: every item in the register below is closed or carried into `docs/STABILITY
 | The crate-level `allow(dead_code)` without the `http1` feature | 0.3 | gate the forwarded walk and the HTTP head context on the feature instead |
 | `Running` keeps its server in an `Option` and reaches it through `unreachable!()` after `drain` or `wait` took it | 0.3 | a shape with no unreachable path |
 | Idle memory is about 8.9 KB per connection against a 4 KiB target | D-076 | add the idle trim once net-io returns the output buffer after `on_timeout`; due at 0.6 (P-5) |
+| T-30 is not met on Windows | CI, 0.5 | net-io to explain two servers on one socket on Windows; then run `tests/restart.rs` there |
 | A drain settles accepts by watching counters (at most 150 ms), and a listener removed by reload can reset connections in the accept window | D-072 | drop the workaround when net-io fixes the race; reported to net-io |
 | An offload job copies the head and the body, and the copy outlives the worker's wipe | D-071 | measure the copy; hand the body over without one, and wipe the copy under a wiping profile |
 | A service that streams stays on the worker, and a slow generator on the reactor stalls that worker; a streamed reply cannot be deferred once its head has left | D-073 | decide with real use whether parts should go through a pool or a token |

@@ -67,6 +67,10 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The test is client and server in one process: 20,000 descriptors.
+      - name: Raise the descriptor limit
+        if: runner.os == 'macOS'
+        run: sudo sysctl -w kern.maxfiles=65536 kern.maxfilesperproc=65536
       - name: Hold them
         shell: bash
         run: |
