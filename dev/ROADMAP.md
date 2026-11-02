@@ -149,7 +149,6 @@ Exit: every item in the register below is closed or carried into `docs/STABILITY
 | Two `impl InFlightCap` blocks (the index-based internals for tests) | 0.3 | fold into one |
 | serve-net handles no signals; every first program writes a stop channel | OD-8, hello-serve API friction | decide with the examples and a real deployment, as OD-8 planned for 0.9 |
 | Showing transport counters by close reason needed hand-built `CloseReason` values | hello-serve API friction | net-io 0.4 added `Stats::closes` and `Stats::refusals`; check serve-net's `Stats` reads as easily |
-| http-net is pinned at 0.6 while later versions exist | 0.3 | take the current http-net, with the allocation and benchmark tests as the check |
 | `InFlightCap` budgets (`max_in_flight`) keep their start-up values across a reload, and http-net's engine limits apply to new connections only | D-063 | give admission a reload path that costs nothing on the hot path (atomics sized at start), or document it as final |
 | `DetachedHead` makes one plain copy per detach; the API describes pooled buffers | D-065 | pool per worker (with `Offload`, 0.5), or correct the API |
 | net-io's PROXY listeners and TLS cannot change on a live listener | D-063 | fine as `ReloadListener`, or ask net-io for it if a deployment needs it |
