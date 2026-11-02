@@ -101,7 +101,6 @@ pub(crate) trait Io {
 /// One listener's runtime facts.
 #[derive(Debug, Clone)]
 pub(crate) struct ListenerRuntime {
-    #[allow(dead_code)] // reported to the observer with listener events (0.4)
     pub(crate) name: String,
     pub(crate) profile: ProfileId,
     pub(crate) proxy: Option<ProxySource>,
@@ -153,6 +152,18 @@ pub(crate) struct Shared<F: Family, S: Service<F>, H: Hooks> {
     pub(crate) profiles: ProfileTable,
     pub(crate) listeners: Vec<ListenerRuntime>,
     pub(crate) counters: Arc<Counters>,
+}
+
+impl<F: Family, S: Service<F>, H: Hooks> crate::notify::ServerEvents for Shared<F, S, H> {
+    fn drain_started(&self, open_connections: u32) {
+        self.observer.drain_started(open_connections);
+    }
+    fn drain_finished(&self, report: &crate::running::DrainReport) {
+        self.observer.drain_finished(report);
+    }
+    fn notify_failed(&self, error: &std::io::Error) {
+        self.observer.notify_failed(error);
+    }
 }
 
 /// Where the machine is.

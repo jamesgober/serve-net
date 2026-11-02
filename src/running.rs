@@ -12,6 +12,7 @@ use crate::conn::session::Runtime;
 use crate::error::ServeError;
 use crate::health::{Health, HealthState, ListenerInfo, ListenerState};
 use crate::net::{ControlLine, ControlState};
+use crate::notify::Notifier;
 use crate::stats::{Counters, Stats};
 
 /// The control line net-io reads: the owner's line merged with serve-net's
@@ -130,12 +131,14 @@ impl DrainReport {
 pub struct DrainHandle {
     switch: Arc<dyn DrainSwitch>,
     handle: net_io::ServerHandle,
+    notifier: Arc<Notifier>,
 }
 
 impl DrainHandle {
     /// Starts a drain that ends at most `deadline` from now, and returns at
     /// once; [`Running::wait`] returns its report.
     pub fn drain(&self, deadline: Duration) {
+        self.notifier.drain_deadline(deadline);
         self.switch.request(Instant::now() + deadline);
         // net-io's accept thread runs the drain; wake every thread waiting in
         // the kernel so the line is read now (D-043).
@@ -173,6 +176,7 @@ pub(crate) struct Parts {
     pub(crate) rt: Arc<Runtime>,
     pub(crate) counters: Arc<Counters>,
     pub(crate) health: Arc<HealthState>,
+    pub(crate) notifier: Arc<Notifier>,
 }
 
 /// What a bound and a running server hold.
@@ -185,6 +189,7 @@ struct Inner {
     _rt: Arc<Runtime>,
     counters: Arc<Counters>,
     health: Arc<HealthState>,
+    notifier: Arc<Notifier>,
 }
 
 impl Inner {
@@ -246,6 +251,7 @@ impl Bound {
                 _rt: parts.rt,
                 counters: parts.counters,
                 health: parts.health,
+                notifier: parts.notifier,
             },
         }
     }
@@ -268,6 +274,7 @@ impl Bound {
     /// [`ServeError::Start`] when net-io refuses to open the door.
     pub fn open(self) -> Result<Running, ServeError> {
         self.inner.server.open_door().map_err(ServeError::Start)?;
+        self.inner.notifier.ready();
         Ok(Running {
             inner: Some(self.inner),
         })
@@ -327,19 +334,24 @@ impl Running {
     #[must_use]
     pub fn health(&self) -> Health {
         let inner = self.inner();
-        inner
-            .health
-            .compute(&inner.names, &inner.counters, inner.switch.is_draining())
+        inner.health.compute(
+            &inner.names,
+            &inner.counters,
+            inner.switch.is_draining(),
+            inner.notifier.is_failing(),
+        )
     }
 
     /// Drains with `deadline` and shuts the server down.
     pub fn drain(mut self, deadline: Duration) -> DrainReport {
         let inner = self.inner.take().unwrap_or_else(|| unreachable!());
+        inner.notifier.drain_deadline(deadline);
         let deadline = Instant::now() + deadline;
         // Replies in flight read the line live and carry the close signal.
         inner.switch.request(deadline);
-        let report = inner.server.shutdown(deadline);
-        DrainReport::from_net(report, &inner.counters)
+        let report = DrainReport::from_net(inner.server.shutdown(deadline), &inner.counters);
+        inner.notifier.drain_finished(&report);
+        report
     }
 
     /// A handle that starts a drain from any thread.
@@ -349,14 +361,16 @@ impl Running {
         DrainHandle {
             switch: Arc::clone(&inner.switch),
             handle: inner.server.handle(),
+            notifier: Arc::clone(&inner.notifier),
         }
     }
 
     /// Parks until a drain is asked for, then drains and shuts down.
     pub fn wait(mut self) -> DrainReport {
         let inner = self.inner.take().unwrap_or_else(|| unreachable!());
-        let report = inner.server.wait_for_stop();
-        DrainReport::from_net(report, &inner.counters)
+        let report = DrainReport::from_net(inner.server.wait_for_stop(), &inner.counters);
+        inner.notifier.drain_finished(&report);
+        report
     }
 
     /// net-io's handle.

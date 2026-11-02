@@ -19,7 +19,7 @@ use crate::client::{ClientInfo, IngressKind, Scheme};
 use crate::config::ProfileId;
 use crate::config::ProxyKind;
 use crate::engine::{Family, Service};
-use crate::hooks::Hooks;
+use crate::hooks::{Hooks, Observer};
 use crate::net::{ConnectionId, WorkerId};
 use crate::reply::{PostFail, Waker};
 
@@ -341,6 +341,11 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::SessionFactory for Fa
             });
         }
         let (seat, over_cap) = Seat::take(&self.rt, listener, runtime.profile);
+        if over_cap {
+            self.shared
+                .observer
+                .capacity_refused(&runtime.name, runtime.profile);
+        }
         let mut conn = Conn::new(
             Arc::clone(&self.shared),
             listener,

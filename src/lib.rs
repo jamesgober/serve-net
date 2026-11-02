@@ -48,6 +48,7 @@ mod http;
 #[cfg(all(serve_net_loom, test, feature = "http1"))]
 mod loom_tests;
 mod net;
+mod notify;
 mod reply;
 mod running;
 mod server;
@@ -83,6 +84,7 @@ pub use net::{
     EventSink, Gate, Lane, NoControl, NoopSink, ProxyVersions, SimpleControl, TrustedProxies,
     WorkerId,
 };
+pub use notify::{NoNotify, Notify, SystemdNotify};
 pub use reply::{CompleteError, Reply, ReplyToken};
 pub use running::{Bound, DrainHandle, DrainReport, Running};
 pub use server::{Built, Server, ServerBuilder};

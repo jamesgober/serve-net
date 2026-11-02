@@ -176,8 +176,17 @@ impl HealthState {
     }
 
     /// Computes health. `names` are the listener names in declaration order.
-    pub(crate) fn compute(&self, names: &[String], counters: &Counters, draining: bool) -> Health {
+    pub(crate) fn compute(
+        &self,
+        names: &[String],
+        counters: &Counters,
+        draining: bool,
+        notify_failing: bool,
+    ) -> Health {
         let mut issues = Vec::new();
+        if notify_failing {
+            issues.push(HealthIssue::NotifyFailing);
+        }
         let mut failing_listeners = 0;
         for (i, name) in names.iter().enumerate() {
             if self.listener_failing(i) {
@@ -233,12 +242,16 @@ impl HealthState {
 pub(crate) struct Tap<E: EventSink> {
     pub(crate) inner: E,
     pub(crate) state: Arc<HealthState>,
+    pub(crate) notifier: Arc<crate::notify::Notifier>,
 }
 
 impl<E: EventSink> EventSink for Tap<E> {
     #[inline]
     fn event(&self, event: &Event) {
         self.state.on_event(event);
+        if let Event::DrainStarted { open } = event {
+            self.notifier.drain_started(*open);
+        }
         self.inner.event(event);
     }
 }
@@ -254,7 +267,7 @@ mod tests {
         let state = HealthState::new(1, Duration::from_secs(30));
         let counters = Counters::new(1);
         let names = vec!["web".to_owned()];
-        assert_eq!(state.compute(&names, &counters, false), Health::Ok);
+        assert_eq!(state.compute(&names, &counters, false, false), Health::Ok);
         for _ in 0..10 {
             counters.count(0, Count::Requests);
         }
@@ -268,17 +281,17 @@ mod tests {
                 },
             );
         }
-        let h = state.compute(&names, &counters, false);
+        let h = state.compute(&names, &counters, false, false);
         assert!(
             matches!(&h, Health::Degraded(i) if matches!(i[0], HealthIssue::Overloaded { shed_permille: 500 })),
             "{h:?}"
         );
         // A worker inside a call with no progress since the last check: stalled.
         counters.in_call(0, true);
-        let _ = state.compute(&names, &counters, false);
-        let h = state.compute(&names, &counters, true);
+        let _ = state.compute(&names, &counters, false, false);
+        let h = state.compute(&names, &counters, true, false);
         assert!(matches!(h, Health::Failing(_)), "{h:?}");
         counters.in_call(0, false);
-        assert_eq!(state.compute(&names, &counters, false), Health::Ok);
+        assert_eq!(state.compute(&names, &counters, false, false), Health::Ok);
     }
 }

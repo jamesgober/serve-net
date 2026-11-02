@@ -2030,6 +2030,7 @@ pub trait Notify: Send + Sync + 'static {
     fn status(&self, line: &str) {}
     fn watchdog(&self) {}
     fn extend_timeout(&self, by: Duration) {}
+    fn take_error(&self) -> Option<io::Error> { None }   // the last failure, taken
 }
 
 #[derive(Clone, Copy, Debug, Default)]

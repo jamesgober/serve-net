@@ -668,3 +668,124 @@ fn test_loopback_inherited_without_systemd_uses_the_fallback() {
     assert!(a.ends_with("fallback"), "{a}");
     let _ = server.drain(Duration::from_secs(2));
 }
+
+/// Records what a service manager and an observer would see.
+#[derive(Default)]
+struct Log(std::sync::Mutex<Vec<String>>);
+
+impl Log {
+    fn push(&self, line: impl Into<String>) {
+        self.0.lock().unwrap().push(line.into());
+    }
+    fn lines(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+struct Manager {
+    log: std::sync::Arc<Log>,
+    fail: bool,
+}
+
+impl serve_net::Notify for Manager {
+    fn ready(&self) {
+        self.log.push("ready");
+    }
+    fn stopping(&self) {
+        self.log.push("stopping");
+    }
+    fn extend_timeout(&self, by: Duration) {
+        self.log.push(format!("extend {}", by.as_secs()));
+    }
+    fn take_error(&self) -> Option<std::io::Error> {
+        self.fail.then(|| std::io::Error::other("no manager"))
+    }
+}
+
+struct Watch(std::sync::Arc<Log>);
+
+impl serve_net::Observer for Watch {
+    fn capacity_refused(&self, listener: &str, _profile: serve_net::ProfileId) {
+        self.0.push(format!("capacity {listener}"));
+    }
+    fn drain_started(&self, open: u32) {
+        self.0.push(format!("drain_started {open}"));
+    }
+    fn drain_finished(&self, report: &serve_net::DrainReport) {
+        self.0.push(format!("drain_finished {}", report.killed));
+    }
+    fn public_bind(&self, listener: &str, reason: &'static str) {
+        self.0.push(format!("public {listener} {reason}"));
+    }
+    fn notify_failed(&self, error: &std::io::Error) {
+        self.0.push(format!("notify_failed {error}"));
+    }
+}
+
+#[test]
+fn test_loopback_notify_and_observer_follow_the_lifecycle() {
+    use serve_net::{Limits, ListenerSpec, Server};
+    let log = std::sync::Arc::new(Log::default());
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .limits(Limits::new().max_connections(1))
+        .notify(Manager {
+            log: std::sync::Arc::clone(&log),
+            fail: false,
+        })
+        .observer(Watch(std::sync::Arc::clone(&log)))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "ok");
+        }))
+        .unwrap();
+    assert_eq!(log.lines(), ["ready"]);
+    let addr = server.local_addr().unwrap();
+    let mut held = connect(addr);
+    let a = exchange(&mut held, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(a.starts_with("HTTP/1.1 200"), "{a}");
+    let mut over = connect(addr);
+    let b = exchange(&mut over, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(b.starts_with("HTTP/1.1 503"), "{b}");
+    drop((held, over));
+    let report = server.drain(Duration::from_secs(10));
+    assert_eq!(report.killed, 0);
+    let lines = log.lines();
+    assert_eq!(lines[1], "capacity web");
+    assert_eq!(lines[2], "extend 10", "{lines:?}");
+    assert!(lines[3].starts_with("drain_started "), "{lines:?}");
+    assert_eq!(lines[4], "stopping");
+    assert_eq!(lines[5], "drain_finished 0");
+}
+
+#[test]
+fn test_loopback_notify_failure_reaches_observer_and_health() {
+    use serve_net::{Health, HealthIssue, ListenerSpec, Server};
+    let log = std::sync::Arc::new(Log::default());
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .notify(Manager {
+            log: std::sync::Arc::clone(&log),
+            fail: true,
+        })
+        .observer(Watch(std::sync::Arc::clone(&log)))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "ok");
+        }))
+        .unwrap();
+    // A failing manager never stops the server.
+    let mut c = connect(server.local_addr().unwrap());
+    let a = exchange(&mut c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(a.starts_with("HTTP/1.1 200"), "{a}");
+    assert!(
+        log.lines().iter().any(|l| l == "notify_failed no manager"),
+        "{:?}",
+        log.lines()
+    );
+    let health = server.health();
+    assert!(
+        matches!(&health, Health::Degraded(i) if i.contains(&HealthIssue::NotifyFailing)),
+        "{health:?}"
+    );
+    drop(c);
+    let _ = server.drain(Duration::from_secs(2));
+}

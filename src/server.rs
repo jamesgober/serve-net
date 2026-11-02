@@ -17,6 +17,7 @@ use crate::error::{ConfigErrors, ConfigWarning, ServeError};
 use crate::health::{HealthState, Tap};
 use crate::hooks::{Admit, Checkpoint, DefaultHooks, Dispatch, HookSet, Hooks, Observer};
 use crate::net::{ControlLine, EventSink, Gate};
+use crate::notify::{Notifier, Notify, ServerEvents};
 #[cfg(feature = "http1")]
 use crate::running::Running;
 use crate::running::{Bound, DrainSwitch, ListenerMeta, Merged, Parts};
@@ -48,6 +49,7 @@ impl Server {
                 accept_failure_window: Duration::from_secs(30),
                 has_control: false,
                 has_tls: false,
+                notify: Arc::new(crate::NoNotify),
             },
             hooks: DefaultHooks::default(),
         }
@@ -65,6 +67,7 @@ struct Config {
     accept_failure_window: Duration,
     has_control: bool,
     has_tls: bool,
+    notify: Arc<dyn Notify>,
 }
 
 /// Configuration and hooks; nothing is checked until [`build`](Self::build).
@@ -108,6 +111,12 @@ impl<H> ServerBuilder<H> {
     /// The deadline `wait` uses when a drain is requested without one (default 30 s).
     pub fn drain_deadline(mut self, deadline: Duration) -> Self {
         self.config.drain_deadline = deadline;
+        self
+    }
+
+    /// Readiness for a service manager or a supervisor (default `NoNotify`).
+    pub fn notify<N: Notify>(mut self, notify: N) -> Self {
+        self.config.notify = Arc::new(notify);
         self
     }
 
@@ -398,6 +407,7 @@ impl<H: Hooks> ServerBuilder<H> {
             workers: c.workers,
             drain_deadline: c.drain_deadline,
             accept_failure_window: c.accept_failure_window,
+            notify: c.notify,
             warnings: findings.warnings,
             hooks: self.hooks,
         })
@@ -447,6 +457,7 @@ pub struct Built<H: Hooks = DefaultHooks> {
     pub(crate) workers: Workers,
     pub(crate) drain_deadline: Duration,
     pub(crate) accept_failure_window: Duration,
+    pub(crate) notify: Arc<dyn Notify>,
     pub(crate) warnings: Vec<ConfigWarning>,
     pub(crate) hooks: H,
 }
@@ -504,6 +515,7 @@ where
             workers,
             drain_deadline,
             accept_failure_window,
+            notify,
             hooks,
             ..
         } = self;
@@ -711,6 +723,15 @@ where
             listeners: runtime_listeners,
             counters: Arc::clone(&counters),
         });
+        for l in &listeners {
+            if let Some(reason) = l.public_bind {
+                shared.observer.public_bind(&l.name, reason);
+            }
+        }
+        let notifier = Arc::new(Notifier::new(
+            notify,
+            Arc::clone(&shared) as Arc<dyn ServerEvents>,
+        ));
         let factory = Factory {
             shared,
             rt: Arc::clone(&rt),
@@ -719,6 +740,7 @@ where
         let events = Tap {
             inner: hooks.events,
             state: Arc::clone(&health),
+            notifier: Arc::clone(&notifier),
         };
         let server = net
             .sessions(factory)
@@ -761,6 +783,7 @@ where
             rt,
             counters,
             health,
+            notifier,
         }))
     }
 }
