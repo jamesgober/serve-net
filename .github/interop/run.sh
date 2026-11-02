@@ -7,7 +7,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 fifo="$(mktemp -u)"
 mkfifo "$fifo"
 
-cargo run --quiet --example interop <"$fifo" &
+cargo build --quiet --example interop
+./target/debug/examples/interop <"$fifo" &
 server=$!
 exec 3>"$fifo"
 
@@ -26,28 +27,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-wait_for() {
+check() {
+    local name="$1" url="$2" want="$3"
+    shift 3
+    local got=""
+    # A front end can answer before its upstream does: wait for the right text.
     for _ in $(seq 1 100); do
-        if curl -s -o /dev/null --max-time 1 "$1"; then
+        got="$(curl -s --max-time 2 "$@" "$url" || true)"
+        if [ "$got" = "$want" ]; then
+            echo "ok   $name: $got"
             return 0
         fi
         sleep 0.2
     done
-    echo "$1 never answered"
-    return 1
-}
-
-check() {
-    local name="$1" url="$2" want="$3"
-    shift 3
-    wait_for "$url"
-    local got
-    got="$(curl -s --max-time 5 "$@" "$url")"
-    if [ "$got" != "$want" ]; then
-        echo "FAIL $name: got [$got], want [$want]"
-        exit 1
-    fi
-    echo "ok   $name: $got"
+    echo "FAIL $name: got [$got], want [$want]"
+    exit 1
 }
 
 # The proxy appends the address it saw (127.0.0.1, trusted); the walk from the

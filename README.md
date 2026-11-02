@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: <code>0.3.0</code>, the first working server.</strong> HTTP/1.1 over net-io's blocking driver, directly or behind a reverse proxy. The public API is locked in <a href="./docs/API.md"><code>docs/API.md</code></a>; the design and every decision behind it are in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. <code>0.4.0</code> adds PROXY protocol, Unix sockets, FastCGI, TLS, WebSocket upgrades, and restarts without dropped connections.
+        <strong>Status: <code>0.4.0</code>.</strong> HTTP/1.1 over net-io's blocking driver: directly, over TLS through an acceptor you supply, behind forwarded headers or the PROXY protocol, or on a Unix socket, with systemd activation, live reload, and restarts that drop nothing. See <a href="./docs/DEPLOYMENT.md"><code>docs/DEPLOYMENT.md</code></a>. The public API is locked in <a href="./docs/API.md"><code>docs/API.md</code></a>; the design and every decision behind it are in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. <code>0.5.0</code> adds the reactor driver, FastCGI, WebSocket upgrades, and streaming bodies.
     </blockquote>
 </div>
 
@@ -40,7 +40,7 @@
 
 ```toml
 [dependencies]
-serve-net = "0.3"
+serve-net = "0.4"
 ```
 
 ```rust

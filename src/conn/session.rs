@@ -217,10 +217,10 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::Session for ServeSess
     }
 
     fn on_writable(&mut self, cx: &mut SessionContext<'_>) -> net_io::Step {
-        // A parked reply keeps waiting; any other interrupted step continues
-        // with what the machine does after a write (pipelined input already
-        // in the engine).
-        if let Some(s @ Step::Park { .. }) = self.resume.take() {
+        // A parked reply keeps waiting, a refusal closes; any other interrupted
+        // step continues with what the machine does after a write (pipelined
+        // input already in the engine).
+        if let Some(s @ (Step::Park { .. } | Step::Close)) = self.resume.take() {
             return step(s);
         }
         let mut io = NetIo {
@@ -255,6 +255,12 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::Session for ServeSess
             rt: &self.rt,
         };
         let s = self.conn.on_timeout(&mut io, which);
+        // net-io turns a `Close` from here into an immediate close, so a
+        // refusal the machine just wrote goes out first (D-064).
+        if s == Step::Close && !cx.output().is_empty() {
+            self.resume = Some(Step::Close);
+            return net_io::Step::Write;
+        }
         handed(s, cx, &mut self.resume)
     }
 

@@ -135,7 +135,7 @@ A supervisor (or systemd, through a socket unit) keeps the listening socket open
 2. The new process reports ready.
 3. The old process calls `close_door`, then `drain(deadline)`, and exits.
 
-Nothing is refused or reset at any step, because the socket was never closed. net-io's `send_listeners` and `recv_listeners` move sockets between processes on Unix, with credential checks.
+Nothing is refused or reset at any step, because the socket was never closed (tested on Linux and macOS; Windows follows with net-io 0.5). net-io's `send_listeners` and `recv_listeners` move sockets between processes on Unix, with credential checks.
 
 ## Stopping
 

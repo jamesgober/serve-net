@@ -789,3 +789,153 @@ fn test_loopback_notify_failure_reaches_observer_and_health() {
     drop(c);
     let _ = server.drain(Duration::from_secs(2));
 }
+
+#[test]
+fn test_loopback_transport_limits_reach_net_io() {
+    use serve_net::{ListenerSpec, Server};
+    let one_per_source = net_io::Limits::builder()
+        .max_per_source(1, net_io::PrefixPolicy::DEFAULT)
+        .build()
+        .unwrap();
+    for server in [
+        // Server-wide, and per listener.
+        Server::builder()
+            .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+            .transport_limits(one_per_source.clone())
+            .serve(serve_net::handler(|_r, reply| {
+                reply.text(200, "ok");
+            }))
+            .unwrap(),
+        Server::builder()
+            .listener(
+                ListenerSpec::tcp("web", "127.0.0.1:0").transport_limits(one_per_source.clone()),
+            )
+            .serve(serve_net::handler(|_r, reply| {
+                reply.text(200, "ok");
+            }))
+            .unwrap(),
+    ] {
+        let addr = server.local_addr().unwrap();
+        let mut held = connect(addr);
+        let a = exchange(&mut held, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(a.starts_with("HTTP/1.1 200"), "{a}");
+        let mut extra = connect(addr);
+        let _ = extra.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        let mut buf = [0u8; 16];
+        assert!(!matches!(extra.read(&mut buf), Ok(n) if n > 0));
+        let _ = server.drain(Duration::from_secs(1));
+    }
+}
+
+#[test]
+fn test_loopback_a_slow_body_is_answered_by_the_request_deadline() {
+    use serve_net::{Limits, ListenerSpec, Server};
+    let clock = std::sync::Arc::new(net_io::ManualClock::new());
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .limits(
+            Limits::new()
+                .request_timeout(Duration::from_secs(120))
+                .min_rate(0, Duration::from_secs(10)),
+        )
+        .clock(std::sync::Arc::clone(&clock))
+        .serve(serve_net::handler(|_r, reply| {
+            reply.text(200, "ok");
+        }))
+        .unwrap();
+    let mut c = connect(server.local_addr().unwrap());
+    c.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    // Longer than net-io's default read timeout, shorter than the deadline.
+    clock.advance(Duration::from_secs(60));
+    server.server_handle().wake_all();
+    let mut buf = [0u8; 256];
+    c.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let early = c.read(&mut buf);
+    assert!(
+        early.is_err(),
+        "before the request deadline: {early:?} {:?}",
+        String::from_utf8_lossy(&buf)
+    );
+    // Past the deadline, short of the read timeout behind it.
+    clock.advance(Duration::from_millis(60_500));
+    server.server_handle().wake_all();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut got = String::new();
+    let _ = c.read_to_string(&mut got);
+    assert!(got.starts_with("HTTP/1.1 408"), "{got}");
+    let _ = server.drain(Duration::from_secs(1));
+}
+
+#[test]
+fn test_loopback_listen_options_apply() {
+    use serve_net::{ListenerSpec, Server};
+    let server = Server::builder()
+        .listener(
+            ListenerSpec::tcp("web", "127.0.0.1:0")
+                .listen_options(net_io::ListenOptions::default()),
+        )
+        .serve(serve_net::handler(|_r, reply| {
+            reply.text(200, "ok");
+        }))
+        .unwrap();
+    let mut c = connect(server.local_addr().unwrap());
+    let a = exchange(&mut c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(a.starts_with("HTTP/1.1 200"), "{a}");
+    let _ = server.drain(Duration::from_secs(1));
+}
+
+#[test]
+fn test_loopback_manual_clock_drives_the_head_deadline() {
+    use serve_net::{Limits, ListenerSpec, Server};
+    let clock = std::sync::Arc::new(net_io::ManualClock::new());
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .limits(Limits::new().head_timeout(Duration::from_secs(5)))
+        .clock(std::sync::Arc::clone(&clock))
+        .serve(serve_net::handler(|_r, reply| {
+            reply.text(200, "ok");
+        }))
+        .unwrap();
+    let mut c = connect(server.local_addr().unwrap());
+    c.write_all(b"GET / HT").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    // No real time passes; the clock says the deadline did.
+    clock.advance(Duration::from_secs(6));
+    // A worker blocked in a read learns of it when woken.
+    server.server_handle().wake_all();
+    let mut got = String::new();
+    let _ = c.read_to_string(&mut got);
+    assert!(got.starts_with("HTTP/1.1 408"), "{got}");
+    let _ = server.drain(Duration::from_secs(1));
+}
+
+#[test]
+fn test_detached_head_is_owned_and_redacts_credentials() {
+    let site = serve_net::handler(|req, reply| {
+        let head = req.detach_head();
+        let seen = std::thread::spawn(move || {
+            let debug = format!("{head:?}");
+            assert!(
+                debug.contains("<redacted>") && !debug.contains("s3cret"),
+                "{debug}"
+            );
+            assert_eq!(head.method_str(), "POST");
+            assert_eq!(head.query(), Some("a=1"));
+            assert_eq!(head.header("X-Tag"), Some(&b"one"[..]));
+            assert_eq!(head.header_all("x-tag").count(), 2);
+            assert_eq!(head.headers().len(), 5);
+            head.path().to_owned()
+        })
+        .join()
+        .unwrap();
+        reply.text(200, &seen);
+    });
+    let reply = serve_net::testing::respond(
+        &site,
+        b"POST /jobs?a=1 HTTP/1.1\r\nHost: a\r\nX-Tag: one\r\nX-Tag: two\r\nCookie: id=s3cret\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert_eq!(reply.text(), "/jobs");
+}

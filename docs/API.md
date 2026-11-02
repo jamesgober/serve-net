@@ -1,7 +1,7 @@
 # serve-net - API Reference
 
 > Reference for every public item in `serve-net`, with signatures, behaviour, errors, costs, and examples.
-> **Current release: `0.3.0` (the first working server).** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
+> **Current release: `0.4.0`.** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -149,8 +149,8 @@ Every cost is a target on reference hardware. Numbers marked **[est.]** are esti
 |---|---|---|---|
 | (none) | always | the server, listeners, ingress, profiles, limits, hooks, snapshots, the engine and family traits | `0.3.0` |
 | `http1` | on | the HTTP family over http-net: `HttpService`, `HttpRequest`, `HttpReply`, `engine::Http1`, the Tier 1 functions `http` and `http_behind_proxy`, `testing` | `0.3.0` |
-| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.4.0` |
-| `ws` | off | WebSocket upgrades over ws-net: `engine::WebSocket`, `UpgradeTarget::WebSocket` (implies `http1`) | `0.4.0` |
+| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.5.0` |
+| `ws` | off | WebSocket upgrades over ws-net: `engine::WebSocket`, `UpgradeTarget::WebSocket` (implies `http1`) | `0.5.0` |
 | `h2` | off | HTTP/2 over h2-net: `engine::H2`, ALPN `h2` | after `1.0.0`, or earlier as a minor version when h2-net reaches its 0.3 |
 
 Features are additive. `--no-default-features` builds the server with custom families only and passes CI on its own. The crate has no third-party runtime dependency in any feature combination; its first-party dependencies are net-io (always), http-net, fcgi-net, ws-net, and h2-net (by feature), each at a published version.
@@ -308,7 +308,7 @@ A FastCGI responder for Apache (`mod_fcgid`, `mod_proxy_fcgi`) or nginx (`fastcg
 
 | Grade | Tier | Version | Feature |
 |---|---|---|---|
-| P1 | 1 | `0.4.0` | `fastcgi` |
+| P1 | 1 | `0.5.0` | `fastcgi` |
 
 Errors: `ServeError::Inherited` ("descriptor 0 is not a listening socket: the process was not started by a FastCGI process manager; use FastCgiListen::Tcp or Unix"), `ServeError::Bind`, `ServeError::Config` (`PublicBind`). `DescriptorZero` and `Unix` are Unix only (mod_fcgid on Windows uses named pipes, after `1.0.0`).
 
@@ -785,7 +785,7 @@ impl ListenerSpec {
     pub fn tcp<A: ToSocketAddrs>(name: &str, addr: A) -> Self;
     pub fn unix(name: &str, path: impl Into<PathBuf>) -> Self;                     // P1, 0.4.0
     pub fn inherited(name: &str) -> Self;                                           // P1, 0.4.0
-    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.4.0, Unix
+    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.5.0, Unix
     pub fn handed_off(name: &str, listener: net_io::ListenerHandle) -> Self;        // P0, 0.4.0
 }
 ```
@@ -911,7 +911,7 @@ pub enum Ingress {
     DirectTls,                                  // P0, 0.4.0: the same over TLS (net-io's TLS seam)
     Proxy(ProxySource),                         // behind a reverse proxy or load balancer
     Unix(UnixPeerTrust, Option<ProxySource>),   // P1, 0.4.0: None means the local peer is the client
-    FastCgi(FastCgiIngress),                    // P1, 0.4.0, feature fastcgi
+    FastCgi(FastCgiIngress),                    // P1, 0.5.0, feature fastcgi
 }
 impl Default for Ingress;   // Direct
 ```
@@ -928,7 +928,7 @@ How clients reach a listener, and therefore where the real client comes from. Ex
 
 | Grade | Tier | Version |
 |---|---|---|
-| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`, `FastCgi`) |
+| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`); `0.5.0` (`FastCgi`) |
 
 Errors (at `build`): `ForwardedOnDirect`, `TwoClientSources`, `PublicBind`, `TrustEmpty`, `TrustWildcard`, `TrustTooBroad`, `FastCgiTrust`, `TlsOnFastCgi`, `TlsWithoutAcceptor`, `PeerCredentialsUnavailable`.
 
@@ -1242,8 +1242,8 @@ The compiled, immutable table, published through a [`Snapshot`](#snapshot) so a 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EngineChoice {
     #[default] Http1,
-    FastCgi,                                       // P1, 0.4.0
-    Http1OrH2ByAlpn,                               // P1, 0.4.0 (h2 with feature h2)
+    FastCgi,                                       // P1, 0.5.0
+    Http1OrH2ByAlpn,                               // P1, 0.5.0 (h2 with feature h2)
     Custom { alpn: &'static [&'static str] },      // a family given to bind_family; ALPN ids it serves
 }
 ```
@@ -1269,7 +1269,7 @@ pub trait HttpService: Send + Sync {
 
     fn call(&self, request: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome;
 
-    fn upgraded(&self, env: &Envelope, conn: UpgradedConn) {           // P1, 0.4.0
+    fn upgraded(&self, env: &Envelope, conn: UpgradedConn) {           // P1, 0.5.0
         let _ = (env, conn);
     }
 
@@ -1378,7 +1378,7 @@ pub enum HeadAction {
     Proceed,                                          // the profile's body policy
     ProceedWith(BodyPolicy),
     Refuse { status: u16, retry_after: Option<Duration> },
-    Upgrade(UpgradeTarget),                           // P1, 0.4.0
+    Upgrade(UpgradeTarget),                           // P1, 0.5.0
 }
 impl HeadAction {
     pub const fn refuse(status: u16) -> Self;         // Refuse { status, retry_after: None }
@@ -1789,7 +1789,7 @@ assert_eq!(small.count(), Some(32));
 
 The head deadline is short because a legitimate client sends a head in one or two packets, and a long head deadline is exactly the budget slowloris needs. The idle timeout behind a front end is long because the front end decides when to reuse a connection.
 
-The transport values serve-net sets on net-io for each listener: `idle_timeout` (keep-alive idle), `write_timeout` (`write_stall`), `min_rate`, `output_budget` (`max_pending_output`), `completion_queue` (`max_deferred_per_worker`), `graceful_linger` (`linger`), `max_connections` and `max_per_listener` (soft caps plus headroom), `backlog`. Everything else (`handshake_timeout`, `read_timeout`, `park_timeout`, `max_per_source`, `read_class`, `buffer_budget`, `tick`, ...) keeps net-io's defaults unless `transport_limits` sets it.
+The transport values serve-net sets on net-io for each listener: `idle_timeout` (keep-alive idle), `read_timeout` (the larger of `head_timeout` and `request_timeout` plus 1 s, so the deadline that answers 408 fires first), `write_timeout` (`write_stall`), `min_rate`, `output_budget` (`max_pending_output`), `graceful_linger` (`linger`), `max_connections` and `max_per_listener` (soft caps plus headroom), `backlog`, and from the reactor driver on `completion_queue` (`max_deferred_per_worker`; a blocking worker holds one connection). `transport_limits` wins over the mapped `read_timeout`. Everything else (`handshake_timeout`, `park_timeout`, `max_per_source`, `read_class`, `buffer_budget`, `tick`, ...) keeps net-io's defaults unless `transport_limits` sets it.
 
 ---
 

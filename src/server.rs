@@ -52,6 +52,8 @@ impl Server {
                 has_control: false,
                 has_tls: false,
                 notify: Arc::new(crate::NoNotify),
+                transport: None,
+                clock: None,
             },
             hooks: DefaultHooks::default(),
         }
@@ -70,6 +72,8 @@ struct Config {
     has_control: bool,
     has_tls: bool,
     notify: Arc<dyn Notify>,
+    transport: Option<net_io::Limits>,
+    clock: Option<Arc<dyn net_io::Clock>>,
 }
 
 /// Configuration and hooks; nothing is checked until [`build`](Self::build).
@@ -113,6 +117,20 @@ impl<H> ServerBuilder<H> {
     /// The deadline `wait` uses when a drain is requested without one (default 30 s).
     pub fn drain_deadline(mut self, deadline: Duration) -> Self {
         self.config.drain_deadline = deadline;
+        self
+    }
+
+    /// The base net-io limits for every listener; what serve-net maps from
+    /// its own limits is set on top.
+    pub fn transport_limits(mut self, limits: net_io::Limits) -> Self {
+        self.config.transport = Some(limits);
+        self
+    }
+
+    /// The clock net-io's deadlines run on; serve-net reads time from net-io,
+    /// so a `net_io::ManualClock` makes every deadline deterministic in tests.
+    pub fn clock<K: net_io::Clock>(mut self, clock: Arc<K>) -> Self {
+        self.config.clock = Some(clock);
         self
     }
 
@@ -422,6 +440,8 @@ impl<H: Hooks> ServerBuilder<H> {
             drain_deadline: c.drain_deadline,
             accept_failure_window: c.accept_failure_window,
             notify: c.notify,
+            transport: c.transport,
+            clock: c.clock,
             has_control: c.has_control,
             has_tls: c.has_tls,
             warnings: findings.warnings,
@@ -474,6 +494,8 @@ pub struct Built<H: Hooks = DefaultHooks> {
     pub(crate) drain_deadline: Duration,
     pub(crate) accept_failure_window: Duration,
     pub(crate) notify: Arc<dyn Notify>,
+    pub(crate) transport: Option<net_io::Limits>,
+    pub(crate) clock: Option<Arc<dyn net_io::Clock>>,
     pub(crate) has_control: bool,
     pub(crate) has_tls: bool,
     pub(crate) warnings: Vec<ConfigWarning>,
@@ -534,6 +556,8 @@ where
             drain_deadline,
             accept_failure_window,
             notify,
+            transport,
+            clock,
             has_control,
             has_tls,
             hooks,
@@ -559,7 +583,9 @@ where
             .collect();
         let rt = Arc::new(Runtime::new(Some(soft), threads));
 
-        let global = net_io::Limits::builder()
+        let global = transport
+            .as_ref()
+            .map_or_else(net_io::Limits::builder, net_io::Limits::to_builder)
             .max_connections(hard)
             .drain_timeout(drain_deadline)
             .build()
@@ -570,6 +596,9 @@ where
             .workers(threads)
             .limits(global)
             .control(Arc::clone(&merged));
+        if let Some(clock) = clock {
+            net = net.clock(Arc::new(SharedClock(clock)));
+        }
         // systemd's sockets, matched to inherited listeners by name or position.
         let mut inherited = if listeners
             .iter()
@@ -620,7 +649,15 @@ where
                     });
                 }
             }
-            let net_spec = net_listener(spec, adopted, &profiles, &limits, hard, true)?;
+            let net_spec = net_listener(
+                spec,
+                adopted,
+                &profiles,
+                &limits,
+                transport.as_ref(),
+                hard,
+                true,
+            )?;
             net = net.listener(net_spec);
         }
         let tables = Arc::new(Snapshot::new(Tables {
@@ -679,6 +716,7 @@ where
         }
         let listeners = listeners.iter().map(listener_meta).collect();
         let reloader = Reloader {
+            transport,
             tables,
             rt: Arc::clone(&rt),
             notifier: Arc::clone(&notifier),
@@ -696,6 +734,19 @@ where
             notifier,
             reloader,
         }))
+    }
+}
+
+/// How far net-io's read timeout sits behind serve-net's request deadlines,
+/// so the deadline with an answer fires first.
+const READ_MARGIN: Duration = Duration::from_secs(1);
+
+/// The owner's clock, type-erased in the builder.
+struct SharedClock(Arc<dyn net_io::Clock>);
+
+impl net_io::Clock for SharedClock {
+    fn now(&self) -> std::time::Instant {
+        self.0.now()
     }
 }
 
@@ -759,6 +810,7 @@ pub(crate) fn net_listener(
     adopted: Option<net_io::ListenerHandle>,
     profiles: &ProfileTable,
     limits: &Limits,
+    base: Option<&net_io::Limits>,
     hard: u32,
     named: bool,
 ) -> Result<net_io::ListenerSpec, ServeError> {
@@ -777,7 +829,10 @@ pub(crate) fn net_listener(
                 reason: "the listener has no socket",
             });
         }
-        (ListenerSource::Tcp(addr), None) => net_io::ListenerSpec::tcp(*addr),
+        (ListenerSource::Tcp(addr), None) => match &spec.listen_options {
+            Some(options) => net_io::ListenerSpec::tcp_with(*addr, *options),
+            None => net_io::ListenerSpec::tcp(*addr),
+        },
         (ListenerSource::Unix(path), None) => {
             let m = spec.unix_mode;
             let mut options = net_io::LocalOptions::new().mode(m.mode);
@@ -802,10 +857,32 @@ pub(crate) fn net_listener(
         || KeepAlive::new().idle_for(behind),
         |c| c.keep_alive.idle_for(behind),
     );
-    let stall = compiled.map_or(limits.write_stall, |c| c.limits.write_stall);
-    let mut own = net_io::Limits::builder()
+    let effective = compiled.map_or(limits, |c| &c.limits);
+    let stall = effective.write_stall;
+    // serve-net's own deadlines decide how long a head and a body may take,
+    // and they answer 408; net-io's read timeout only backs them up.
+    let read = effective.head_timeout.max(effective.request_timeout) + READ_MARGIN;
+    let mut own = spec
+        .transport
+        .as_ref()
+        .map_or_else(net_io::Limits::builder, net_io::Limits::to_builder)
         .idle_timeout(idle)
-        .write_timeout(stall);
+        .write_timeout(stall)
+        .output_budget(effective.max_pending_output)
+        .min_rate(if effective.min_rate_bytes == 0 {
+            net_io::MinRate::off()
+        } else {
+            net_io::MinRate::new(effective.min_rate_bytes, effective.min_rate_window)
+        })
+        .graceful_linger(effective.linger_total, effective.linger_bytes);
+    let read_set = spec
+        .transport
+        .as_ref()
+        .or(base)
+        .is_some_and(|t| t.read_timeout().is_some());
+    if !read_set {
+        own = own.read_timeout(read);
+    }
     if let Some(n) = spec.backlog {
         own = own.backlog(n);
     }

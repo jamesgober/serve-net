@@ -13,6 +13,54 @@
 
 ---
 
+## [0.4.0] - 2026-11-02
+
+Deployment: behind any front end, over Unix sockets, under systemd, and
+through a restart or a reload without dropping a connection.
+
+### Added
+
+- PROXY protocol ingress (`ProxySource::proxy_protocol`): v1 and v2, `LOCAL`,
+  a trusted list per listener, the SSL and authority fields.
+- Unix socket listeners: `ListenerSpec::unix`, `UnixMode`, `UnixPeerTrust`,
+  `Ingress::Unix`, `ClientInfo::peer_credentials`.
+- `ListenerSpec::inherited` with `fallback_bind` (systemd socket activation)
+  and `handed_off`; `ServeError::Inherited` and `HandOff`.
+- The TLS seam: `Ingress::DirectTls` and `ServerBuilder::tls`, for any
+  `net_io::TlsAcceptor`.
+- `Running::reload`, `ServerConfig`, `ReloadSummary`, `ServerBuilder::config`;
+  `ServeError::Reload` and `ReloadBind`.
+- `Notify`, `NoNotify`, `SystemdNotify`, `ServerBuilder::notify`.
+- `Finished::head_reads`.
+- From the 0.3 API, missing in 0.3.0: `ServerBuilder::transport_limits` and
+  `clock`, `ListenerSpec::listen_options` and `transport_limits`,
+  `HttpRequest::detach_head` and `DetachedHead`, `Observer::drain_started`,
+  `drain_finished`, and calls to `capacity_refused` and `public_bind`.
+- `Observer::reloaded`, `reload_refused`, `notify_failed`.
+- Rules `IngressSource` and `ReloadListener`.
+- `docs/DEPLOYMENT.md`; an interop CI job with real nginx, Apache, and HAProxy.
+
+### Changed
+
+- net-io 0.4.
+- `Family::head` takes `&HeadContext<'a>`, the head's own lifetime.
+- `ListenerSource` gains `Unix`, `Inherited`, and `HandedOff`.
+
+### Fixed
+
+- A head, body, or reply timeout closed the connection silently on real
+  sockets; the 408 or 503 now reaches the client.
+- serve-net's `min_rate`, `max_pending_output`, and `linger` were not passed
+  to net-io, and net-io's 30 s read timeout could cut off a longer
+  `request_timeout`.
+
+### Moved
+
+- FastCGI, WebSocket upgrades, `Http1OrH2ByAlpn`, and an end-to-end TLS test
+  move to 0.5.0: fcgi-net, ws-net, and tls-net are not built yet.
+
+---
+
 ## [0.3.0] - 2026-10-29
 
 The first working server: HTTP/1.1 over net-io 0.3's blocking driver, with
@@ -115,7 +163,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/serve-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/serve-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/serve-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/serve-net/releases/tag/v0.1.0

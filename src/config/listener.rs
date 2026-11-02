@@ -57,6 +57,8 @@ pub struct ListenerSpec {
     pub(crate) unix_mode: UnixMode,
     pub(crate) world_writable: Option<&'static str>,
     pub(crate) handle: Option<net_io::ListenerHandle>,
+    pub(crate) listen_options: Option<net_io::ListenOptions>,
+    pub(crate) transport: Option<net_io::Limits>,
 }
 
 /// A Unix socket file's permissions.
@@ -115,6 +117,8 @@ impl ListenerSpec {
             unix_mode: UnixMode::default(),
             world_writable: None,
             handle: None,
+            listen_options: None,
+            transport: None,
         }
     }
 
@@ -209,6 +213,20 @@ impl ListenerSpec {
     /// The accept queue length (1 to 65,535; default 1,024).
     pub fn backlog(mut self, n: u32) -> Self {
         self.backlog = Some(n);
+        self
+    }
+
+    /// net-io's socket options for this listener (TCP): reuse port,
+    /// IPv6-only, buffers, defer accept.
+    pub fn listen_options(mut self, options: net_io::ListenOptions) -> Self {
+        self.listen_options = Some(options);
+        self
+    }
+
+    /// net-io values for this listener only; what serve-net maps from its
+    /// own limits is set on top.
+    pub fn transport_limits(mut self, limits: net_io::Limits) -> Self {
+        self.transport = Some(limits);
         self
     }
 

@@ -8,8 +8,9 @@
 //!
 //! ## Status
 //!
-//! `0.3.0`: the first working server, HTTP/1.1 over net-io's blocking
-//! driver. The public API is locked in `docs/API.md`, and the design behind
+//! `0.4.0`: HTTP/1.1 over net-io's blocking driver, directly, over TLS, behind
+//! a reverse proxy, or on a Unix socket, with live reload and restarts that
+//! drop nothing. The public API is locked in `docs/API.md`, and the design behind
 //! it in `dev/PLAN.md` (both in the
 //! [repository](https://github.com/jamesgober/serve-net)).
 //!
@@ -75,8 +76,8 @@ pub use hooks::{
 };
 #[cfg(feature = "http1")]
 pub use http::{
-    Fields, Handler, HttpBody, HttpFamily, HttpHead, HttpParts, HttpReply, HttpRequest,
-    HttpService, handler, http, http_behind_proxy,
+    DetachedHead, Fields, Handler, HttpBody, HttpFamily, HttpHead, HttpParts, HttpReply,
+    HttpRequest, HttpService, handler, http, http_behind_proxy,
 };
 #[cfg(feature = "http1")]
 pub use http_net::{Method, Version};

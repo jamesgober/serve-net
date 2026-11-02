@@ -81,6 +81,7 @@ pub struct ReloadSummary {
 
 /// What a reload needs from the server it runs on.
 pub(crate) struct Reloader {
+    pub(crate) transport: Option<net_io::Limits>,
     pub(crate) tables: Arc<Snapshot<Tables>>,
     pub(crate) rt: Arc<Runtime>,
     pub(crate) notifier: Arc<Notifier>,
@@ -189,6 +190,7 @@ impl Reloader {
                 None,
                 &table,
                 &limits,
+                self.transport.as_ref(),
                 hard,
                 !in_use.contains(&spec.name),
             )

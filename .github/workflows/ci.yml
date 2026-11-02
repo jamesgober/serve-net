@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Each test server holds a descriptor set per worker (256 by default).
+  RUST_TEST_THREADS: "4"
   RUSTFLAGS: "-D warnings"
   # Run every JS action on Node.js 24 ahead of GitHub's forced migration,
   # silencing "Node.js 20 actions are deprecated" runner warnings.
