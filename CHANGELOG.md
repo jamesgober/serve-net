@@ -26,12 +26,17 @@
   not memory. Provided `Family` methods for custom families.
 - `Budget::dedicated_workers`: workers kept for one profile, out of reach of
   a flood on other listeners.
+- `Workers::reactor`, and `Workers::auto()` now picks the reactor: one worker
+  per logical CPU, thousands of connections on each. A service that blocks
+  delays every connection of its worker; use `Offload`, or `Workers::blocking`.
 - `WatchdogPinger`: pings a service manager only while every worker is
   healthy, so a stuck worker gets the process restarted.
 
 ### Changed
 
-- http-net 0.9.
+- http-net 0.9, net-io 0.5.
+- The default driver is the reactor, and `Limits::max_deferred_per_worker`
+  reaches net-io's completion queue on it.
 - `Outcome` and `BodyPolicy` gain a variant each; both are `#[non_exhaustive]`.
 
 ### Fixed

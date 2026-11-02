@@ -148,6 +148,7 @@ Exit: every item in the register below is closed or carried into `docs/STABILITY
 | Gate denials: a status outside 400 to 599 becomes 403 | D-050 | confirm with bouncer-io's codes |
 | The crate-level `allow(dead_code)` without the `http1` feature | 0.3 | gate the forwarded walk and the HTTP head context on the feature instead |
 | `Running` keeps its server in an `Option` and reaches it through `unreachable!()` after `drain` or `wait` took it | 0.3 | a shape with no unreachable path |
+| Idle memory is about 8.9 KB per connection against a 4 KiB target | D-076 | add the idle trim once net-io returns the output buffer after `on_timeout`; due at 0.6 (P-5) |
 | A drain settles accepts by watching counters (at most 150 ms), and a listener removed by reload can reset connections in the accept window | D-072 | drop the workaround when net-io fixes the race; reported to net-io |
 | An offload job copies the head and the body, and the copy outlives the worker's wipe | D-071 | measure the copy; hand the body over without one, and wipe the copy under a wiping profile |
 | A service that streams stays on the worker, and a slow generator on the reactor stalls that worker; a streamed reply cannot be deferred once its head has left | D-073 | decide with real use whether parts should go through a pool or a token |

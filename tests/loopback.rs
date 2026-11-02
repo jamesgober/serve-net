@@ -44,6 +44,17 @@ fn exchange(stream: &mut TcpStream, request: &[u8]) -> String {
     }
 }
 
+/// Whether a new connection gets an answer. A refusal may be a reset, and
+/// the reset may arrive while the client still connects.
+fn served(addr: SocketAddr) -> bool {
+    let Ok(mut c) = TcpStream::connect(addr) else {
+        return false;
+    };
+    let _ = c.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    matches!(c.read(&mut [0u8; 64]), Ok(n) if n > 0)
+}
+
 fn connect(addr: SocketAddr) -> TcpStream {
     let s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -167,6 +178,12 @@ fn test_loopback_mixed_server_keeps_per_source_cap_on_direct_listener() {
             )),
         )
         .listener(ListenerSpec::tcp("direct", "127.0.0.1:0"))
+        .transport_limits(
+            net_io::Limits::builder()
+                .max_per_source(16, net_io::PrefixPolicy::DEFAULT)
+                .build()
+                .unwrap(),
+        )
         .serve(serve_net::handler(|_req, reply| {
             reply.text(200, "ok");
         }))
@@ -174,7 +191,7 @@ fn test_loopback_mixed_server_keeps_per_source_cap_on_direct_listener() {
     let listeners = server.listeners();
     let proxied = listeners[0].local.socket_addr().unwrap();
     let direct = listeners[1].local.socket_addr().unwrap();
-    // The proxy listener takes more than the per-source default from one peer.
+    // The proxy listener takes more than the per-source cap from one peer.
     let mut through: Vec<TcpStream> = (0..20).map(|_| connect(proxied)).collect();
     for (i, c) in through.iter_mut().enumerate() {
         let a = exchange(
@@ -183,19 +200,14 @@ fn test_loopback_mixed_server_keeps_per_source_cap_on_direct_listener() {
         );
         assert!(a.starts_with("HTTP/1.1 200"), "proxied {i}: {a}");
     }
-    // The direct listener still caps one address at net-io's default (16 on
-    // the blocking driver): the 17th connection is not served.
+    // The direct listener still caps one address: the 17th is not served.
     let mut held: Vec<TcpStream> = (0..16).map(|_| connect(direct)).collect();
     for (i, c) in held.iter_mut().enumerate() {
         let a = exchange(c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
         assert!(a.starts_with("HTTP/1.1 200"), "direct {i}: {a}");
     }
-    let mut extra = connect(direct);
-    let _ = extra.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-    let mut buf = [0u8; 64];
-    let served = matches!(extra.read(&mut buf), Ok(n) if n > 0);
-    assert!(!served, "a 17th connection from one address was served");
-    drop((through, held, extra));
+    assert!(!served(direct), "a 17th connection from one address");
+    drop((through, held));
     let _ = server.drain(Duration::from_secs(2));
 }
 
@@ -743,8 +755,10 @@ fn test_loopback_notify_and_observer_follow_the_lifecycle() {
     let mut held = connect(addr);
     let a = exchange(&mut held, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     assert!(a.starts_with("HTTP/1.1 200"), "{a}");
+    // The refusal comes at once, with no request to read.
     let mut over = connect(addr);
-    let b = exchange(&mut over, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut b = String::new();
+    let _ = over.read_to_string(&mut b);
     assert!(b.starts_with("HTTP/1.1 503"), "{b}");
     drop((held, over));
     let report = server.drain(Duration::from_secs(10));
@@ -819,10 +833,7 @@ fn test_loopback_transport_limits_reach_net_io() {
         let mut held = connect(addr);
         let a = exchange(&mut held, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
         assert!(a.starts_with("HTTP/1.1 200"), "{a}");
-        let mut extra = connect(addr);
-        let _ = extra.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-        let mut buf = [0u8; 16];
-        assert!(!matches!(extra.read(&mut buf), Ok(n) if n > 0));
+        assert!(!served(addr), "a second connection from one address");
         let _ = server.drain(Duration::from_secs(1));
     }
 }
@@ -842,6 +853,8 @@ fn test_loopback_a_slow_body_is_answered_by_the_request_deadline() {
                 .request_timeout(Duration::from_secs(120))
                 .min_rate(0, Duration::from_secs(10)),
         )
+        // The reactor never closes a connection on a frozen clock (reported).
+        .workers(serve_net::Workers::blocking(8))
         .clock(std::sync::Arc::clone(&clock))
         .serve(serve_net::handler(|_r, reply| {
             reply.text(200, "ok");
@@ -910,6 +923,8 @@ fn test_loopback_manual_clock_drives_the_head_deadline() {
     let server = Server::builder()
         .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
         .limits(Limits::new().head_timeout(Duration::from_secs(5)))
+        // The reactor never closes a connection on a frozen clock (reported).
+        .workers(serve_net::Workers::blocking(8))
         .clock(std::sync::Arc::clone(&clock))
         .serve(serve_net::handler(|_r, reply| {
             reply.text(200, "ok");

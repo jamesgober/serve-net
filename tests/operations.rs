@@ -124,6 +124,7 @@ fn test_bulk_flood_critical_lane_still_admitted() {
         .profile(Profile::new(ProfileId(0)).lane(Lane(4)))
         .profile(Profile::new(ProfileId(1)).lane(Lane(0)))
         .limits(serve_net::Limits::new().max_connections(8))
+        .workers(serve_net::Workers::blocking(8))
         .admit(InFlightCap::new().reserve(Lane(0), 50))
         .serve(serve_net::handler(move |req, reply| {
             if req.path() == "/slow" {
@@ -170,6 +171,62 @@ fn test_bulk_flood_critical_lane_still_admitted() {
     let _ = server.drain(Duration::from_secs(1));
 }
 
+/// T-25 on the reactor: one worker holds many requests, parked on deferred
+/// replies, and the reserve is a share of that worker's cap.
+#[test]
+fn test_bulk_flood_critical_lane_still_admitted_on_the_reactor() {
+    use serve_net::{InFlightCap, Lane, Profile, ProfileId, ReplyToken, Workers};
+
+    let held: Arc<Mutex<Vec<ReplyToken>>> = Arc::default();
+    let parked = Arc::clone(&held);
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("bulk", "127.0.0.1:0").profile(ProfileId(0)))
+        .listener(ListenerSpec::tcp("admin", "127.0.0.1:0").profile(ProfileId(1)))
+        .profile(Profile::new(ProfileId(0)).lane(Lane(4)))
+        .profile(Profile::new(ProfileId(1)).lane(Lane(0)))
+        .workers(Workers::reactor(1))
+        .admit(InFlightCap::new().per_worker(4).reserve(Lane(0), 50))
+        .serve(serve_net::handler(move |req, reply| {
+            reply.text(200, "ok");
+            if req.path() == "/slow" {
+                parked.lock().unwrap().push(reply.defer());
+            }
+        }))
+        .unwrap();
+    let addrs: Vec<SocketAddr> = server
+        .listeners()
+        .iter()
+        .map(|l| l.local.socket_addr().unwrap())
+        .collect();
+    let (bulk, admin) = (addrs[0], addrs[1]);
+
+    const SLOW: &[u8] = b"GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    let waiting: Vec<_> = (0..2)
+        .map(|_| std::thread::spawn(move || ask(bulk, SLOW)))
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while held.lock().unwrap().len() < 2 {
+        assert!(Instant::now() < deadline, "the bulk requests never parked");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        ask(bulk, GET).starts_with("HTTP/1.1 503"),
+        "the flood stops"
+    );
+    assert!(
+        ask(admin, GET).starts_with("HTTP/1.1 200"),
+        "the lane answers"
+    );
+
+    for token in held.lock().unwrap().drain(..) {
+        token.complete().unwrap();
+    }
+    for w in waiting {
+        assert!(w.join().unwrap().starts_with("HTTP/1.1 200"));
+    }
+    let _ = server.drain(Duration::from_secs(1));
+}
+
 /// T-25 again, for connections: a flood fills every seat it may take; the
 /// dedicated listener still gets a worker.
 #[test]
@@ -185,6 +242,7 @@ fn test_bulk_flood_dedicated_workers_stay_free() {
         .profile(Profile::new(ProfileId(0)))
         .profile(Profile::new(ProfileId(1)).budget(Budget::new().dedicated_workers(1)))
         .limits(Limits::new().max_connections(3))
+        .workers(serve_net::Workers::blocking(8))
         .serve(serve_net::handler(move |req, reply| {
             if req.path() == "/slow" {
                 entered_tx.lock().unwrap().send(()).unwrap();

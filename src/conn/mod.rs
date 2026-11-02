@@ -170,6 +170,9 @@ pub(crate) struct Shared<F: Family, S: Service<F>, H: Hooks> {
     pub(crate) counters: Arc<Counters>,
     /// Catch a panicking service (`catch_service_panics`).
     pub(crate) catch_panics: bool,
+    /// Shorten keep-alive as capacity fills: on the blocking driver an idle
+    /// connection holds a thread; on the reactor it holds almost nothing.
+    pub(crate) adaptive_keep_alive: bool,
 }
 
 impl<F: Family, S: Service<F>, H: Hooks> JobService<F> for Shared<F, S, H> {
@@ -803,8 +806,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             return Step::Close;
         }
         // The engine keeps its buffer between requests: releasing it here would
-        // cost an allocation per keep-alive request. Idle memory is returned
-        // through per-worker engine pools with the reactor driver (0.5).
+        // cost an allocation per keep-alive request (D-076).
         io.set_exchange_deadline(None);
         io.set_phase(Phase::Idle);
         Step::Read
@@ -1462,7 +1464,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let now = io.now();
         // Keep-alive under pressure (FR-58): above PRESSURE_SHORTEN the next
         // idle wait is `under_pressure`; above PRESSURE_CLOSE the reply closes.
-        let pressure = if k.under_pressure.is_zero() {
+        let pressure = if k.under_pressure.is_zero() || !shared.adaptive_keep_alive {
             0.0
         } else {
             io.pressure()

@@ -8,7 +8,7 @@ use crate::config::ProxyKind;
 use crate::config::validate::{self, Draft};
 use crate::config::{
     Ingress, KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId, ProfileTable,
-    ProxySource, Workers,
+    ProxySource, REACTOR_CONNECTIONS, Workers,
 };
 use crate::conn::session::{Cap, Factory, Runtime};
 use crate::conn::{ListenerRuntime, Shared, Tables, UnixRuntime};
@@ -16,7 +16,7 @@ use crate::engine::{Family, Service};
 use crate::error::{ConfigErrors, ConfigWarning, ServeError};
 use crate::health::{HealthState, Tap};
 use crate::hooks::{Admit, Checkpoint, DefaultHooks, Dispatch, HookSet, Hooks, Observer};
-use crate::net::{ControlLine, EventSink, Gate};
+use crate::net::{ControlLine, DriverKind, EventSink, Gate};
 use crate::notify::{Notifier, Notify, ServerEvents};
 use crate::reload::{Reloader, ServerConfig, transport_key};
 #[cfg(feature = "http1")]
@@ -609,16 +609,23 @@ where
             .collect();
         let rt = Arc::new(Runtime::new(Some(shared_seats(soft, &profiles)), threads));
 
-        let global = transport
+        let mut global = transport
             .as_ref()
             .map_or_else(net_io::Limits::builder, net_io::Limits::to_builder)
-            .max_connections(hard)
-            .drain_timeout(drain_deadline)
-            .build()
-            .map_err(ServeError::Start)?;
+            .drain_timeout(drain_deadline);
+        let reactor = workers.resolved() == DriverKind::Reactor;
+        if reactor {
+            global = global.completion_queue(limits.max_deferred_per_worker);
+        }
+        // With no cap asked for, the reactor's own default fits what
+        // descriptors the process has, where a fixed cap would refuse to start.
+        if !reactor || limits.max_connections.is_some() {
+            global = global.max_connections(hard);
+        }
+        let global = global.build().map_err(ServeError::Start)?;
         let merged = Arc::new(Merged::new(Arc::clone(&hooks.control)));
         let mut net = net_io::ServerBuilder::new()
-            .driver(workers.kind())
+            .driver(workers.resolved())
             .workers(threads)
             .limits(global)
             .control(Arc::clone(&merged));
@@ -703,6 +710,7 @@ where
             tables: Arc::clone(&tables),
             counters: Arc::clone(&counters),
             catch_panics,
+            adaptive_keep_alive: !reactor,
         });
         for l in &listeners {
             if let Some(reason) = l.public_bind {
@@ -785,14 +793,24 @@ impl net_io::Clock for SharedClock {
 /// be written when the pool covers the soft cap plus its headroom (D-043,
 /// D-044).
 pub(crate) fn connection_caps(limits: &Limits, workers: &Workers) -> (u32, u32, u16) {
+    let blocking = workers.resolved() == DriverKind::Blocking;
     let asked = workers.blocking_threads();
+    let pool = if blocking {
+        u32::from(asked)
+    } else {
+        REACTOR_CONNECTIONS
+    };
     let soft = limits.max_connections.unwrap_or_else(|| {
         // A small pool keeps most of its threads for clients.
-        let t = u32::from(asked);
-        t.saturating_sub(limits.headroom_for(t).min(t / 4)).max(1)
+        pool.saturating_sub(limits.headroom_for(pool).min(pool / 4))
+            .max(1)
     });
     let hard = soft.saturating_add(limits.headroom_for(soft));
-    let threads = u16::try_from(hard).unwrap_or(u16::MAX).max(asked);
+    let threads = if blocking {
+        u16::try_from(hard).unwrap_or(u16::MAX).max(asked)
+    } else {
+        workers.reactor_workers()
+    };
     (soft, hard, threads)
 }
 

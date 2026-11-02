@@ -10,17 +10,28 @@ Each item says which version it describes, because several change when net-io's 
 | | Linux | macOS | Windows |
 |---|---|---|---|
 | Blocking pool | yes | yes | yes |
-| Reactor | net-io 0.5 | net-io 0.5 | net-io 0.5 |
-| `Workers::auto()` today | blocking | blocking | blocking |
+| Reactor | epoll | kqueue | I/O completion ports |
+| `Workers::auto()` | reactor | reactor | reactor |
 
-Every serve-net release up to this one runs on the blocking pool: one thread per connection, 256
-threads by default. Until the reactor arrives, a connection open and idle costs a thread and its stack.
-Size `Workers::blocking(n)` for connections, not for CPUs.
+The reactor runs one worker per logical CPU, and a connection open and idle holds no read buffer. A
+service that blocks delays every connection of its worker: declare its `WorkClass` and use `Offload`,
+or choose `Workers::blocking`.
 
-With no `max_connections`, the soft cap is the pool less its headroom: 224 of 256 threads, 6 of 8.
-Connections above it get the busy refusal. Keep-alive is shortened and then closed as the pool fills.
+The blocking pool runs one thread per connection, 256 by default, so a connection open and idle costs a
+thread and its stack. Size `Workers::blocking(n)` for connections, not for CPUs.
+
+With no `max_connections`, the soft cap is 8,750 on the reactor and the pool less its headroom on the
+blocking driver: 224 of 256 threads, 6 of 8. Connections above it get the busy refusal. On the blocking
+driver keep-alive is shortened and then closed as the pool fills; on the reactor it is not, because an
+idle connection there costs about 9 KB of heap and no thread.
+
+On the reactor the hard cap is 10,000 or what the process's descriptors allow, whichever is lower. Raise
+`RLIMIT_NOFILE` for a server that should reach it: a stock macOS allows 256, and above a low hard cap
+clients are reset rather than refused with a 503.
 
 ## Reading and waking
+
+On the blocking driver:
 
 - **Linux.** A blocking read waits under `SO_RCVTIMEO`, so a wake cannot interrupt it. Timers that need
   a read to end run on real time, which is why a `ManualClock` moved forward does not reach a blocked
@@ -37,10 +48,9 @@ A restart hands the listening socket to the new process, and neither drops a con
 | | Linux | macOS | Windows |
 |---|---|---|---|
 | `ListenerSpec::inherited` (systemd sockets) | yes | no | no |
-| `ListenerSpec::handed_off` | yes | yes | yes, without the zero-loss promise |
+| `ListenerSpec::handed_off` | yes | yes | yes |
 
-- The promise that a restart refuses and resets nothing is tested on Linux and macOS.
-  Windows gets it with net-io 0.5.
+- The promise that a restart refuses and resets nothing is tested on Linux, macOS, and Windows.
 - `Running::drain` waits about 3 ms before draining so that connections accepted as the door closes are
   served and not reset. With every accept thread dead it waits at most 150 ms.
 - `Running::reload` removing a listener closes that socket at once. Connections accepted in that
@@ -49,8 +59,8 @@ A restart hands the listening socket to the new process, and neither drops a con
 
 ## Unix sockets
 
-Linux and macOS only. `UnixPeerTrust` reads the peer's credentials from the kernel, and `UnixMode` sets
-the socket file's mode. Windows has no `ListenerSpec::unix` listener in serve-net.
+Linux and macOS. `UnixPeerTrust` reads the peer's credentials from the kernel, and `UnixMode` sets the
+socket file's mode. net-io 0.5 has AF_UNIX and named pipes on Windows; serve-net does not offer them yet.
 
 ## Service managers
 

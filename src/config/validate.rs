@@ -568,12 +568,12 @@ fn short_idle_behind_proxy(d: &Draft<'_>, f: &mut Findings) {
 
 fn workers(w: &Workers, f: &mut Findings) {
     match w.kind {
-        DriverKind::Blocking | DriverKind::Auto => {}
+        DriverKind::Blocking | DriverKind::Reactor | DriverKind::Auto => {}
         _ => f.error(
             RuleId::DriverUnavailable,
             Subject::Server,
-            "this build has only the blocking driver",
-            "use Workers::blocking or Workers::auto",
+            "this build has no such driver",
+            "use Workers::auto, Workers::reactor, or Workers::blocking",
         ),
     }
     if w.count == Some(0) || w.count.is_some_and(|n| n > 4096) {

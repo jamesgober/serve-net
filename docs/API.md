@@ -1700,7 +1700,7 @@ serve-net's budgets: the request-level ones it enforces itself and the transport
 | `linger` | net-io's graceful linger | a reset destroying the last reply |
 | `engine_limits` | http-net (start line, header bytes and count, field line, trailers) | oversized heads |
 
-**Connection caps.** Three soft caps are checked in order when a connection opens: global (`Limits::max_connections`, default: the blocking worker count, or 10,000 on the reactor), per listener (`ListenerSpec::max_connections`), and per profile (`Budget::max_connections`). The first that is full answers with the busy refusal (503, `Retry-After` with jitter, close) without reading the request. net-io's hard cap is set `hard_cap_headroom` above the global soft cap; beyond it net-io resets connections without involving serve-net, so a flood large enough to pass the headroom costs one reset per connection. Cost: two atomics per connection [est. 5-20 ns].
+**Connection caps.** Three soft caps are checked in order when a connection opens: global (`Limits::max_connections`, default: the blocking pool less its headroom, or 8,750 on the reactor, under a hard cap of 10,000 or what the process's descriptors allow), per listener (`ListenerSpec::max_connections`), and per profile (`Budget::max_connections`). The first that is full answers with the busy refusal (503, `Retry-After` with jitter, close) without reading the request. net-io's hard cap is set `hard_cap_headroom` above the global soft cap; beyond it net-io resets connections without involving serve-net, so a flood large enough to pass the headroom costs one reset per connection. Cost: two atomics per connection [est. 5-20 ns].
 
 P0, Tier 2, `0.3.0`.
 
@@ -1737,7 +1737,7 @@ How long a connection stays open between requests.
 
 - **Idle timeout.** Between requests a connection closes without a response after `idle`. The default depends on the listener's ingress: 20 s on direct listeners (browsers hold many idle connections; a blocking worker is held while idle) and 60 s behind a proxy or FastCGI front end, because the backend must outlive the front end's reuse window or the front end reuses a connection the backend is closing and answers 502 (behind Apache, keep `ProxyPass ... ttl=` below it).
 - **Requests per connection** and **age**: the response that reaches `max_requests`, and the first response after `max_age`, carry the close signal; an idle connection past its age is closed.
-- **Under pressure** (blocking driver, where every connection holds a thread): above 75% of threads busy the idle timeout of a connection returning to idle is `under_pressure`; above 90% every response carries the close signal. The shortened idle is net-io's per-connection idle override, set at each response.
+- **Under pressure** (blocking driver only, where every connection holds a thread; an idle reactor connection holds next to nothing, so the reactor keeps it): above 75% of threads busy the idle timeout of a connection returning to idle is `under_pressure`; above 90% every response carries the close signal. The shortened idle is net-io's per-connection idle override, set at each response.
 
 P0, Tier 2, `0.3.0`.
 
@@ -1757,9 +1757,9 @@ let api = KeepAlive::new().max_requests(10_000).max_age(Duration::from_secs(600)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Workers { /* driver kind, count */ }
 impl Workers {
-    pub fn auto() -> Self;                         // net-io's Auto: the reactor where available, else blocking
+    pub fn auto() -> Self;                         // the reactor, one worker per logical CPU
     pub fn blocking(threads: u16) -> Self;         // default 256 threads
-    pub fn reactor(workers: u16) -> Self;          // P0, 0.5.0; default: logical CPUs
+    pub fn reactor(workers: u16) -> Self;          // P0, 0.5.0; 0: one per logical CPU
     pub fn uring(workers: u16) -> Self;            // P3, after 1.0.0 (Linux)
     pub fn kind(&self) -> net_io::DriverKind;
     pub fn count(&self) -> Option<u16>;            // None: the driver's default
@@ -1788,7 +1788,7 @@ assert_eq!(small.count(), Some(32));
 | write stall | 30 s plus 256 B/s over 10 s | 10 s | none | none | 60 s (`send_timeout`, between writes) |
 | header bytes, count | 16 KiB, 100 (http-net) | same | about 400 KB, 100 | 32 fields | 8 KiB per line, 4 buffers |
 | body | 1 MiB | 1 MiB | none | per extractor | 1 MiB |
-| connections | blocking: 256 threads; reactor: 10,000 | 64 | none | 25,000 per worker | `worker_connections` |
+| connections | blocking: 224 of 256 threads; reactor: 8,750 of 10,000 | 64 | none | 25,000 per worker | `worker_connections` |
 | drain deadline | 30 s | none (waits) | the caller's | 30 s | `worker_shutdown_timeout`, unset |
 | lingering close | 2 s, 64 KiB | 1 s, 256 KiB | none | 1 s | 30 s total, 5 s per read |
 | accept backlog | 1,024 | OS default | the caller's | 1,024 | 511 on Linux |

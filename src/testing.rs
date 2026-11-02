@@ -465,6 +465,7 @@ where
         })),
         counters: Arc::new(crate::stats::Counters::new(1)),
         catch_panics: false,
+        adaptive_keep_alive: true,
     };
     (Arc::new(shared), copy)
 }

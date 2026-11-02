@@ -96,7 +96,6 @@ fn test_panic_caught_500_and_done_called() {
     assert_eq!(ends[1], RequestEnd::Replied);
 }
 
-#[cfg(unix)]
 mod restart {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
