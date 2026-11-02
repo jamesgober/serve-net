@@ -95,14 +95,16 @@ net-io answered every request (2026-10-23, net-io D-081): `TrustedProxies` and `
 - [x] Loopback tests on Windows, Linux, and macOS in CI: Tier 1 behind a proxy, stats, health and listener state, a malformed request refused and counted, a gate denial on the second reply of a keep-alive connection, net-io's events and end reasons, a drain with a slow request in flight, and the leak test (rounds at the soft cap: every round fully served, the one over the cap answered 503, no connection left open).
 - [x] `InFlightCap` benchmarks through the request path: per-worker shares about 4 ns over no cap, the shared counter about 14 ns (keep-alive GET about 330 ns on a shared machine; numbers for comparing builds only).
 
-## v0.4.0 - Extended (CURRENT)
-Exit: the ingress equivalence matrix (PLAN section 11) passes for direct, PROXY v1 and v2, forwarded headers, Unix socket, and FastCGI (`mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0); a WebSocket upgrade to ws-net works end to end; the restart test passes with a test supervisor (zero refused or reset); a systemd `Type=notify-reload` unit reloads under load with zero dropped connections in a container; the interop CI job (Apache, nginx, HAProxy containers) is green.
-- API: `http_behind_proxy` with the PROXY option, `fastcgi`, `FastCgiListen`, `ServerConfig`, `ServerBuilder::config`, `reload`, `ReloadSummary`, `ListenerSpec::{unix, inherited, fastcgi_descriptor_zero, handed_off}`, `fallback_bind`, `unix_mode`, `UnixMode`, `Ingress::{DirectTls, Unix, FastCgi}`, `ProxySource::proxy_protocol`, `UnixPeerTrust`, `FastCgiIngress`, `ServerBuilder::tls`, `EngineChoice::{FastCgi, Http1OrH2ByAlpn}`, `UpgradeTarget`, `UpgradedConn`, `HttpService::upgraded`, `engine::FastCgi`, `engine::WebSocket`, `Notify`, `NoNotify`, `SystemdNotify`, `ServerBuilder::notify`, `Finished::head_reads`, `ClientInfo::peer_credentials`, `ServeError::{Inherited, HandOff, Reload, ReloadBind}`.
-- Threat tests T-10, T-18 to T-21, T-30, T-31, T-38, T-39; fuzz target `fastcgi_mapping`.
-- `docs/DEPLOYMENT.md`: Apache, nginx, HAProxy, systemd, the restart model.
+## v0.4.0 - Extended (DONE, 2026-11-02)
+Exit: the ingress cases run for direct, PROXY v1 and v2, forwarded headers, and Unix sockets; the restart test passes with a shared socket (zero refused or reset); the interop CI job (nginx, Apache, HAProxy containers) is green.
+- API: `ServerConfig`, `ServerBuilder::config`, `reload`, `ReloadSummary`, `ListenerSpec::{unix, inherited, handed_off}`, `fallback_bind`, `unix_mode`, `UnixMode`, `Ingress::{DirectTls, Unix}`, `ProxySource::proxy_protocol`, `UnixPeerTrust`, `ServerBuilder::{tls, notify}`, `Notify`, `NoNotify`, `SystemdNotify`, `Finished::head_reads`, `ClientInfo::peer_credentials`, `ServeError::{Inherited, HandOff, Reload, ReloadBind}`; and what 0.3.0 missed: `transport_limits`, `clock`, `listen_options`, `detach_head`, `DetachedHead`, the observer's lifecycle events (D-061, D-065).
+- Threat tests T-10, T-18, T-20, T-30, T-31, T-38, T-39.
+- `docs/DEPLOYMENT.md`: Apache, nginx, HAProxy, Unix sockets, systemd, reload, the restart model.
+- Moved to 0.5.0 (D-066, a hard reason: the crates do not exist yet): FastCGI, WebSocket upgrades, `Http1OrH2ByAlpn`, threat tests T-19 and T-21, the `fastcgi_mapping` fuzz target, a TLS test with a real engine, a `Type=notify-reload` run under real systemd.
 
 ## v0.5.0 - Feature complete
 Exit: on net-io's reactor, 10,000 idle keep-alive connections with bounded memory on Linux, macOS, and Windows; deferred replies through an `Offload` pool; every P0, P1, and P2 item of `docs/API.md` implemented and documented; `docs/PLATFORM-NOTES.md` written.
+- Waiting on crates that are scaffolds today (D-066): over fcgi-net, `fastcgi`, `FastCgiListen`, `FastCgiIngress`, `Ingress::FastCgi`, `engine::FastCgi`, `ListenerSpec::fastcgi_descriptor_zero`, T-19, the `fastcgi_mapping` fuzz target (`mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0); over ws-net, `HeadAction::Upgrade`, `UpgradeTarget`, `UpgradedConn`, `HttpService::upgraded`, `engine::WebSocket`, T-21; over tls-net, an end-to-end TLS test and `EngineChoice::Http1OrH2ByAlpn`. A `Type=notify-reload` unit reloading under load under real systemd.
 - API: `Budget::dedicated_workers`, `BodyPolicy::Stream`, `HttpBody::Chunk`, `HttpReply::stream`, `Workers::reactor`, `catch_service_panics`, `InFlightCap::reserve`, `Offload`, `OffloadPool`, `OffloadJob`, `WatchdogPinger`.
 - Threat tests T-25, T-27, T-37.
 
@@ -119,11 +121,49 @@ Exit: zero open findings; the 24 h soak clean (NFR-18); `docs/SECURITY.md` writt
 Exit: a production site served for two weeks without a serve-net defect; `docs/ARCHITECTURE.md` draft; no API change needed by the first real wrapper that is not already made.
 - A real application wrapper built on serve-net's hooks; a custom-family prototype for a database wire protocol.
 
-## v0.9.0 - Beta and release candidates
-Exit: no API change across two release candidates; every document complete.
-- API freeze candidate; one non-HTTP service end to end; the Windows service status adapter (outside serve-net) exercised; `-rc` tags.
+## v0.9.0 - Beta
+Exit: no API change across two beta releases; every document complete.
+- API freeze candidate; one non-HTTP service end to end; the Windows service status adapter (outside serve-net) exercised.
+
+## v0.9.x - Pre-1.0 polish (before any 1.0 release candidate)
+James's standing rule (2026-10-29): "make sure to go back and fix any issues / perf tune / etc before we get close to release." Nothing accepted during the 0.x series becomes final silently: each item below is fixed, measured, or written into the 1.0 readiness note for James with the reason it stays.
+
+Exit: every item in the register below is closed or carried into `docs/STABILITY-1.0.md` (the 1.0 readiness note) with a reason and a cost; the performance pass and the security and edge-case review are recorded; no `-rc` tag before this exit.
+
+**1. Revisit every accepted gap, deferred item, known issue, and missed target.** The register (kept current as versions land; add to it instead of accepting a gap quietly):
+
+| Item | From | What to decide or do |
+|---|---|---|
+| The forwarded walk measured about 165 ns for three entries against a 100 ns target [est.] | 0.3 progress, D-040 | meet the target or record why not, with numbers |
+| Every [est.] cost in `dev/PLAN.md` | PLAN section 9 and the threat table | each replaced by a benchmark (due at 0.6), or listed as unmeasured with the reason |
+| The engine keeps its buffer between keep-alive requests; idle memory returns only through the reactor's per-worker pools | D-041 | confirm the reactor pools bound idle memory (NFR-1), or shrink after an idle period |
+| With no soft cap configured, the blocking pool's soft cap is the pool minus its headroom (224 of 256) | D-044 | confirm the default with a measured overload run (NFR-6), or change it |
+| The per-source connection cap behind a front end | D-046, D-053 | applied per listener since 0.4 (net-io 0.4); confirm a mixed direct and proxied server keeps the cap on its direct listeners (a test exists from 0.4) |
+| The machine reads the live control line because net-io's `draining()` is fixed for one callback | D-047, hello-serve feedback 6 | if net-io makes `draining()` live, drop the extra load or keep it with a measured reason |
+| The timeout-to-close-reason table is copied from net-io (`CloseReason::for_timeout` is crate-private) | hello-serve feedback 7 | use net-io's when public, or keep a test that the tables agree |
+| `health`: stall = inside a service call without progress since the previous call; overload = more than 20% busy refusals since the previous call | D-049 | check against a real supervisor and a stalled-worker test under load; tune or document |
+| `DrainReport::deadline_hit` is derived from `killed > 0` | 0.3 | report net-io's own deadline state if it exposes one |
+| Gate denials: a status outside 400 to 599 becomes 403 | D-050 | confirm with bouncer-io's codes |
+| The crate-level `allow(dead_code)` without the `http1` feature | 0.3 | gate the forwarded walk and the HTTP head context on the feature instead |
+| `Running` keeps its server in an `Option` and reaches it through `unreachable!()` after `drain` or `wait` took it | 0.3 | a shape with no unreachable path |
+| Two `impl InFlightCap` blocks (the index-based internals for tests) | 0.3 | fold into one |
+| serve-net handles no signals; every first program writes a stop channel | OD-8, hello-serve API friction | decide with the examples and a real deployment, as OD-8 planned for 0.9 |
+| Showing transport counters by close reason needed hand-built `CloseReason` values | hello-serve API friction | net-io 0.4 added `Stats::closes` and `Stats::refusals`; check serve-net's `Stats` reads as easily |
+| http-net is pinned at 0.6 while later versions exist | 0.3 | take the current http-net, with the allocation and benchmark tests as the check |
+| `InFlightCap` budgets (`max_in_flight`) keep their start-up values across a reload, and http-net's engine limits apply to new connections only | D-063 | give admission a reload path that costs nothing on the hot path (atomics sized at start), or document it as final |
+| `DetachedHead` makes one plain copy per detach; the API describes pooled buffers | D-065 | pool per worker (with `Offload`, 0.5), or correct the API |
+| net-io's PROXY listeners and TLS cannot change on a live listener | D-063 | fine as `ReloadListener`, or ask net-io for it if a deployment needs it |
+| The test suite needs `RUST_TEST_THREADS=4`: 256 threads per default server exhaust descriptors | 0.4 | the reactor removes the cause; confirm and drop the setting |
+| The zero-loss restart test runs on Linux and macOS only; on Windows two servers sharing a socket lost requests in CI | 0.4 | net-io's 0.5 promises Windows hand-off with zero refused: turn the test on there |
+| A failed `bind` closes inherited and handed-off sockets instead of releasing them to the owner | 0.4, D-059 | needs net-io to hand adopted sockets back when `build` fails (asked in the shared notes); then release them |
+| Anything else listed as "not yet" or "deferred" in this file, `dev/PLAN.md`, or `CHANGELOG.md` | all versions | sweep the documents for open wording before the exit |
+
+**2. A fresh performance tuning pass.** Profile the request path, admission, the forwarded walk, the drain, and connection setup on the reactor and the blocking driver; compare against the 0.6 baselines and the NFR-5 competitor numbers; fix regressions, take the wins that cost no security, and record every change with its security impact (NFR, `docs/PERFORMANCE.md`).
+
+**3. Re-run the security and edge-case review.** Every threat T-1 to T-40 re-tested against the release candidate's code, every validation rule V-1 to V-26, the fuzz targets with a long run on an out-of-repository corpus, the loom models, the leak test at 100k connections (NFR-19), and an adversarial review of every hook seam; findings fixed test first.
 
 ## v1.0.0 - Stable
+- Release candidates (`1.0.0-rc.N`) only after the v0.9.x polish exit, with no API change across two of them.
 - API frozen until 2.0; the full audit (API, docs, tests, benchmarks, security) recorded in `docs/STABILITY-1.0.md`; `dev/DIRECTIVES.md` definition of done item 10 satisfied. James decides the release.
 
 ## After 1.0
@@ -134,11 +174,12 @@ Exit: no API change across two release candidates; every document complete.
 ## Release routine
 
 1. Finish the version: every item of its entry done; version bumped everywhere it appears (`Cargo.toml`, README install snippet, `docs/API.md`, rustdoc examples); `CHANGELOG.md` rolled; `docs/release/vX.Y.Z.md` written; README and `docs/API.md` checked against the build.
-2. Local gate on Windows and WSL, stable and 1.85: fmt, clippy (default, all, no default features), tests, `cargo doc` with default and all features under `-D warnings`, `cargo package` in a fresh target directory.
-3. Commit as James Gober and push a `feature/` branch; open a pull request.
-4. Wait for CI on every platform; fix in place if it fails (never a follow-up patch release for a red version).
-5. Squash-merge; tag `vX.Y.Z` (lightweight) and push it.
-6. `gh release create vX.Y.Z --title "vX.Y.Z - <Name>" --notes-file docs/release/vX.Y.Z.md --prerelease` (0.x).
-7. `cargo doc --no-deps` with default and all features: no warnings.
-8. `cargo publish --dry-run`, then `cargo publish`.
-9. Confirm the version on crates.io and the docs.rs build.
+2. `python dev/api-audit.py`: every item `docs/API.md` tags for this version or earlier exists in the source.
+3. Local gate on Windows and WSL, stable and 1.85: fmt, clippy (default, all, no default features), tests, `cargo doc` with default and all features under `-D warnings`, `cargo package` in a fresh target directory.
+4. Commit as James Gober and push a `feature/` branch; open a pull request.
+5. Wait for CI on every platform; fix in place if it fails (never a follow-up patch release for a red version).
+6. Squash-merge; tag `vX.Y.Z` (lightweight) and push it.
+7. `gh release create vX.Y.Z --title "vX.Y.Z - <Name>" --notes-file docs/release/vX.Y.Z.md --prerelease` (0.x).
+8. `cargo doc --no-deps` with default and all features: no warnings.
+9. `cargo publish --dry-run`, then `cargo publish`.
+10. Confirm the version on crates.io and the docs.rs build.

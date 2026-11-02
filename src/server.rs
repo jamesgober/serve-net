@@ -7,18 +7,22 @@ use crate::client::IngressKind;
 use crate::config::ProxyKind;
 use crate::config::validate::{self, Draft};
 use crate::config::{
-    KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId, ProfileTable, Workers,
+    Ingress, KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId, ProfileTable,
+    ProxySource, Workers,
 };
-use crate::conn::session::{Factory, Runtime};
-use crate::conn::{ListenerRuntime, Shared};
+use crate::conn::session::{Cap, Factory, Runtime};
+use crate::conn::{ListenerRuntime, Shared, Tables, UnixRuntime};
 use crate::engine::{Family, Service};
 use crate::error::{ConfigErrors, ConfigWarning, ServeError};
 use crate::health::{HealthState, Tap};
 use crate::hooks::{Admit, Checkpoint, DefaultHooks, Dispatch, HookSet, Hooks, Observer};
 use crate::net::{ControlLine, EventSink, Gate};
+use crate::notify::{Notifier, Notify, ServerEvents};
+use crate::reload::{Reloader, ServerConfig, transport_key};
 #[cfg(feature = "http1")]
 use crate::running::Running;
 use crate::running::{Bound, DrainSwitch, ListenerMeta, Merged, Parts};
+use crate::snapshot::Snapshot;
 use crate::stats::Counters;
 
 /// The entry point for Tier 2.
@@ -46,6 +50,10 @@ impl Server {
                 drain_deadline: Duration::from_secs(30),
                 accept_failure_window: Duration::from_secs(30),
                 has_control: false,
+                has_tls: false,
+                notify: Arc::new(crate::NoNotify),
+                transport: None,
+                clock: None,
             },
             hooks: DefaultHooks::default(),
         }
@@ -62,6 +70,10 @@ struct Config {
     drain_deadline: Duration,
     accept_failure_window: Duration,
     has_control: bool,
+    has_tls: bool,
+    notify: Arc<dyn Notify>,
+    transport: Option<net_io::Limits>,
+    clock: Option<Arc<dyn net_io::Clock>>,
 }
 
 /// Configuration and hooks; nothing is checked until [`build`](Self::build).
@@ -105,6 +117,38 @@ impl<H> ServerBuilder<H> {
     /// The deadline `wait` uses when a drain is requested without one (default 30 s).
     pub fn drain_deadline(mut self, deadline: Duration) -> Self {
         self.config.drain_deadline = deadline;
+        self
+    }
+
+    /// The base net-io limits for every listener; what serve-net maps from
+    /// its own limits is set on top.
+    pub fn transport_limits(mut self, limits: net_io::Limits) -> Self {
+        self.config.transport = Some(limits);
+        self
+    }
+
+    /// The clock net-io's deadlines run on; serve-net reads time from net-io,
+    /// so a `net_io::ManualClock` makes every deadline deterministic in tests.
+    pub fn clock<K: net_io::Clock>(mut self, clock: Arc<K>) -> Self {
+        self.config.clock = Some(clock);
+        self
+    }
+
+    /// Everything [`ServerConfig`] holds, replacing what was set so far: the
+    /// same value serves at start-up and at `Running::reload`.
+    pub fn config(mut self, config: ServerConfig) -> Self {
+        self.config.listeners = config.listeners;
+        self.config.profiles = config.profiles;
+        self.config.limits = config.limits;
+        self.config.keep_alive = config.keep_alive;
+        self.config.workers = config.workers;
+        self.config.drain_deadline = config.drain_deadline;
+        self
+    }
+
+    /// Readiness for a service manager or a supervisor (default `NoNotify`).
+    pub fn notify<N: Notify>(mut self, notify: N) -> Self {
+        self.config.notify = Arc::new(notify);
         self
     }
 
@@ -296,6 +340,38 @@ impl<A, D, K, O, G, E, C, T> ServerBuilder<HookSet<A, D, K, O, G, E, C, T>> {
         }
     }
 
+    /// The TLS acceptor for `Ingress::DirectTls` listeners (tls-net, or any
+    /// `net_io::TlsAcceptor`).
+    pub fn tls<T2: net_io::TlsAcceptor>(
+        mut self,
+        acceptor: T2,
+    ) -> ServerBuilder<HookSet<A, D, K, O, G, E, C, T2>> {
+        self.config.has_tls = true;
+        let HookSet {
+            admit,
+            dispatch,
+            checkpoint,
+            observer,
+            gate,
+            events,
+            control,
+            ..
+        } = self.hooks;
+        ServerBuilder {
+            config: self.config,
+            hooks: HookSet {
+                admit,
+                dispatch,
+                checkpoint,
+                observer,
+                gate,
+                events,
+                control,
+                tls: acceptor,
+            },
+        }
+    }
+
     /// The process-wide control line, shared with net-io.
     pub fn control<C2: ControlLine>(
         mut self,
@@ -345,6 +421,7 @@ impl<H: Hooks> ServerBuilder<H> {
             workers: &c.workers,
             drain_deadline: c.drain_deadline,
             has_control: c.has_control,
+            has_tls: c.has_tls,
         });
         if let Some(errors) = ConfigErrors::from_vec(findings.errors) {
             return Err(errors);
@@ -362,6 +439,11 @@ impl<H: Hooks> ServerBuilder<H> {
             workers: c.workers,
             drain_deadline: c.drain_deadline,
             accept_failure_window: c.accept_failure_window,
+            notify: c.notify,
+            transport: c.transport,
+            clock: c.clock,
+            has_control: c.has_control,
+            has_tls: c.has_tls,
             warnings: findings.warnings,
             hooks: self.hooks,
         })
@@ -411,6 +493,11 @@ pub struct Built<H: Hooks = DefaultHooks> {
     pub(crate) workers: Workers,
     pub(crate) drain_deadline: Duration,
     pub(crate) accept_failure_window: Duration,
+    pub(crate) notify: Arc<dyn Notify>,
+    pub(crate) transport: Option<net_io::Limits>,
+    pub(crate) clock: Option<Arc<dyn net_io::Clock>>,
+    pub(crate) has_control: bool,
+    pub(crate) has_tls: bool,
     pub(crate) warnings: Vec<ConfigWarning>,
     pub(crate) hooks: H,
 }
@@ -462,95 +549,122 @@ where
         service: S,
     ) -> Result<Bound, ServeError> {
         let Built {
-            listeners,
+            mut listeners,
             profiles,
             limits,
             workers,
             drain_deadline,
             accept_failure_window,
+            notify,
+            transport,
+            clock,
+            has_control,
+            has_tls,
             hooks,
             ..
         } = self;
-        // On the blocking driver every open connection holds a thread, and
-        // net-io refuses at accept once every thread is busy, so the busy
-        // refusal can only be written when the pool covers the soft cap plus
-        // its headroom (D-043, D-044).
-        let asked = workers.blocking_threads();
-        let soft = limits.max_connections.unwrap_or_else(|| {
-            let t = u32::from(asked);
-            t.saturating_sub(limits.headroom_for(t)).max(1)
-        });
-        let hard = soft.saturating_add(limits.headroom_for(soft));
-        let threads = u16::try_from(hard).unwrap_or(u16::MAX).max(asked);
+        let (soft, hard, threads) = connection_caps(&limits, &workers);
 
         let mut admit = hooks.admit;
         admit.prepare(threads, &profiles);
         let counters = Arc::new(Counters::new(threads));
         let runtime_listeners = listeners
             .iter()
-            .map(|l| ListenerRuntime {
-                name: l.name.clone(),
-                profile: l.profile,
-                proxy: l.ingress.proxy().cloned(),
-                declared_scheme: l.scheme,
-            })
+            .map(|l| listener_runtime(l, Cap::new(l.max_connections)))
+            .collect::<Vec<_>>();
+        // Filled after bind, once the socket files exist.
+        let same_users: Vec<_> = runtime_listeners
+            .iter()
+            .map(|l| l.unix.as_ref().map(|u| Arc::clone(&u.same_user)))
             .collect();
-        let listener_caps: Vec<Option<u32>> = listeners.iter().map(|l| l.max_connections).collect();
-        let profile_caps: Vec<Option<u32>> =
-            profiles.iter().map(|p| p.budget.max_connections).collect();
-        let rt = Arc::new(Runtime::new(
-            Some(soft),
-            &listener_caps,
-            &profile_caps,
-            threads,
-        ));
+        let profile_caps = profiles
+            .iter()
+            .map(|p| Cap::new(p.budget.max_connections))
+            .collect();
+        let rt = Arc::new(Runtime::new(Some(soft), threads));
 
-        let mut global = net_io::Limits::builder()
+        let global = transport
+            .as_ref()
+            .map_or_else(net_io::Limits::builder, net_io::Limits::to_builder)
             .max_connections(hard)
-            .drain_timeout(drain_deadline);
-        if listeners.iter().any(|l| l.ingress.proxy().is_some()) {
-            // Behind a front end every connection comes from the front end,
-            // so net-io's per-source cap would cap the whole site. net-io 0.3
-            // applies the cap server-wide only, so it is lifted for the
-            // server (D-046).
-            global = global.max_per_source(hard, net_io::PrefixPolicy::DEFAULT);
-        }
-        let global = global.build().map_err(ServeError::Start)?;
+            .drain_timeout(drain_deadline)
+            .build()
+            .map_err(ServeError::Start)?;
         let merged = Arc::new(Merged::new(Arc::clone(&hooks.control)));
         let mut net = net_io::ServerBuilder::new()
             .driver(workers.kind())
             .workers(threads)
             .limits(global)
             .control(Arc::clone(&merged));
-        for spec in &listeners {
-            let ListenerSource::Tcp(addr) = spec.source else {
-                return Err(ServeError::Bind {
-                    listener: spec.name.clone(),
-                    source: net_io::NetError::NoAddresses,
-                });
-            };
-            let compiled = profiles.compiled(spec.profile);
-            let behind = spec.ingress.proxy().is_some();
-            let idle = compiled.map_or_else(
-                || KeepAlive::new().idle_for(behind),
-                |c| c.keep_alive.idle_for(behind),
-            );
-            let stall = compiled.map_or(limits.write_stall, |c| c.limits.write_stall);
-            let mut own = net_io::Limits::builder()
-                .idle_timeout(idle)
-                .write_timeout(stall);
-            if let Some(n) = spec.backlog {
-                own = own.backlog(n);
-            }
-            let listener_hard = spec
-                .max_connections
-                .map_or(hard, |n| n.saturating_add(limits.headroom_for(n)).min(hard));
-            if spec.max_connections.is_some() {
-                own = own.max_per_listener(listener_hard);
-            }
-            let own = own.build().map_err(ServeError::Start)?;
-            net = net.listener(net_io::ListenerSpec::tcp(addr).name(&spec.name).limits(own));
+        if let Some(clock) = clock {
+            net = net.clock(Arc::new(SharedClock(clock)));
         }
+        // systemd's sockets, matched to inherited listeners by name or position.
+        let mut inherited = if listeners
+            .iter()
+            .any(|l| matches!(l.source, ListenerSource::Inherited { .. }))
+        {
+            let passed = net_io::systemd().map_err(|_| ServeError::Inherited {
+                listener: first_inherited(&listeners),
+                reason: "the systemd environment (LISTEN_FDS, LISTEN_FDNAMES) is malformed, or a passed descriptor is not a listening socket",
+            })?;
+            match_inherited(&listeners, passed)
+        } else {
+            Vec::new()
+        };
+        for (index, spec) in listeners.iter_mut().enumerate() {
+            let adopted = match &spec.source {
+                ListenerSource::Inherited { fallback, .. } => {
+                    match inherited.get_mut(index).and_then(Option::take) {
+                        Some(handle) => Some(handle),
+                        None if fallback.is_some() => None,
+                        None => {
+                            return Err(ServeError::Inherited {
+                                listener: spec.name.clone(),
+                                reason: "no socket was passed for this listener and no fallback_bind is set; check the unit's FileDescriptorName=",
+                            });
+                        }
+                    }
+                }
+                ListenerSource::HandedOff => spec.handle.take(),
+                _ => None,
+            };
+            if let Some(handle) = &adopted {
+                let unix = handle.kind() == net_io::Transport::Unix;
+                if unix != spec.ingress.is_unix() {
+                    let reason = if unix {
+                        "the socket is a Unix socket; use Ingress::Unix"
+                    } else {
+                        "the socket is a TCP socket; Ingress::Unix needs a Unix socket"
+                    };
+                    return Err(match spec.source {
+                        ListenerSource::HandedOff => ServeError::HandOff {
+                            listener: spec.name.clone(),
+                            reason,
+                        },
+                        _ => ServeError::Inherited {
+                            listener: spec.name.clone(),
+                            reason,
+                        },
+                    });
+                }
+            }
+            let net_spec = net_listener(
+                spec,
+                adopted,
+                &profiles,
+                &limits,
+                transport.as_ref(),
+                hard,
+                true,
+            )?;
+            net = net.listener(net_spec);
+        }
+        let tables = Arc::new(Snapshot::new(Tables {
+            profiles,
+            listeners: runtime_listeners.into_iter().map(Some).collect(),
+            profile_caps,
+        }));
         let shared = Arc::new(Shared::<F, S, HookSet<A, D, K, O, G, E, C, T>> {
             family,
             service,
@@ -559,10 +673,18 @@ where
             checkpoint: hooks.checkpoint,
             observer: hooks.observer,
             control: Arc::clone(&merged),
-            profiles,
-            listeners: runtime_listeners,
+            tables: Arc::clone(&tables),
             counters: Arc::clone(&counters),
         });
+        for l in &listeners {
+            if let Some(reason) = l.public_bind {
+                shared.observer.public_bind(&l.name, reason);
+            }
+        }
+        let notifier = Arc::new(Notifier::new(
+            notify,
+            Arc::clone(&shared) as Arc<dyn ServerEvents>,
+        ));
         let factory = Factory {
             shared,
             rt: Arc::clone(&rt),
@@ -571,35 +693,295 @@ where
         let events = Tap {
             inner: hooks.events,
             state: Arc::clone(&health),
+            notifier: Arc::clone(&notifier),
         };
         let server = net
             .sessions(factory)
             .gate(hooks.gate)
             .events(events)
+            .tls(hooks.tls)
             .build()
             .map_err(|e| bind_error(&listeners, e))?;
-        let listeners = listeners
-            .into_iter()
-            .map(|l| ListenerMeta {
-                ingress: match l.ingress.proxy().map(|p| p.kind) {
-                    None => IngressKind::Direct,
-                    Some(ProxyKind::Headers(_)) => IngressKind::Forwarded,
-                    Some(ProxyKind::ProxyProtocol(_)) => IngressKind::ProxyProtocol,
-                },
-                profile: l.profile,
-                public_bind: l.public_bind,
-                name: l.name,
-            })
-            .collect();
+        // SameUser: the uid this process runs as is the owner of the socket
+        // file it created (or was given; an inherited file is the service's).
+        for info in server.listeners() {
+            let cell = same_users
+                .get(usize::from(info.id.get()))
+                .and_then(Option::as_ref);
+            if let (net_io::Endpoint::Unix(path), Some(cell)) = (&info.local, cell) {
+                if let Some(uid) = file_owner(path) {
+                    let _ = cell.set(uid);
+                }
+            }
+        }
+        let listeners = listeners.iter().map(listener_meta).collect();
+        let reloader = Reloader {
+            transport,
+            tables,
+            rt: Arc::clone(&rt),
+            notifier: Arc::clone(&notifier),
+            has_control,
+            has_tls,
+            workers,
+            threads,
+        };
         Ok(Bound::new(Parts {
             server,
             listeners,
             switch: merged as Arc<dyn DrainSwitch>,
-            rt,
             counters,
             health,
+            notifier,
+            reloader,
         }))
     }
+}
+
+/// How far net-io's read timeout sits behind serve-net's request deadlines,
+/// so the deadline with an answer fires first.
+const READ_MARGIN: Duration = Duration::from_secs(1);
+
+/// The owner's clock, type-erased in the builder.
+struct SharedClock(Arc<dyn net_io::Clock>);
+
+impl net_io::Clock for SharedClock {
+    fn now(&self) -> std::time::Instant {
+        self.0.now()
+    }
+}
+
+/// The soft connection cap, net-io's hard cap, and the pool size.
+///
+/// On the blocking driver every open connection holds a thread, and net-io
+/// refuses at accept once every thread is busy, so the busy refusal can only
+/// be written when the pool covers the soft cap plus its headroom (D-043,
+/// D-044).
+pub(crate) fn connection_caps(limits: &Limits, workers: &Workers) -> (u32, u32, u16) {
+    let asked = workers.blocking_threads();
+    let soft = limits.max_connections.unwrap_or_else(|| {
+        let t = u32::from(asked);
+        t.saturating_sub(limits.headroom_for(t)).max(1)
+    });
+    let hard = soft.saturating_add(limits.headroom_for(soft));
+    let threads = u16::try_from(hard).unwrap_or(u16::MAX).max(asked);
+    (soft, hard, threads)
+}
+
+/// A listener's entry in the tables.
+pub(crate) fn listener_runtime(l: &ListenerSpec, cap: Arc<Cap>) -> ListenerRuntime {
+    ListenerRuntime {
+        name: l.name.clone(),
+        profile: l.profile,
+        proxy: l.ingress.proxy().cloned(),
+        declared_scheme: l.scheme,
+        unix: match &l.ingress {
+            Ingress::Unix(trust, _) => Some(UnixRuntime {
+                trust: trust.clone(),
+                same_user: Arc::default(),
+            }),
+            _ => None,
+        },
+        cap,
+    }
+}
+
+/// What `listeners()` and a reload need to know about a listener.
+pub(crate) fn listener_meta(l: &ListenerSpec) -> ListenerMeta {
+    ListenerMeta {
+        ingress: match l.ingress.proxy().map(|p| p.kind) {
+            None if l.ingress.is_unix() => IngressKind::Unix,
+            None if matches!(l.ingress, Ingress::DirectTls) => IngressKind::DirectTls,
+            None => IngressKind::Direct,
+            Some(ProxyKind::Headers(_)) => IngressKind::Forwarded,
+            Some(ProxyKind::ProxyProtocol(_)) => IngressKind::ProxyProtocol,
+        },
+        profile: l.profile,
+        public_bind: l.public_bind,
+        name: l.name.clone(),
+        source: l.source.clone(),
+        transport: transport_key(&l.ingress),
+        settings: format!("{:?} {:?} {:?}", l.ingress, l.scheme, l.max_connections),
+    }
+}
+
+/// net-io's listener for a spec.
+pub(crate) fn net_listener(
+    spec: &ListenerSpec,
+    adopted: Option<net_io::ListenerHandle>,
+    profiles: &ProfileTable,
+    limits: &Limits,
+    base: Option<&net_io::Limits>,
+    hard: u32,
+    named: bool,
+) -> Result<net_io::ListenerSpec, ServeError> {
+    let net_spec = match (&spec.source, adopted) {
+        (_, Some(handle)) => net_io::ListenerSpec::adopt(handle),
+        (
+            ListenerSource::Inherited {
+                fallback: Some(addr),
+                ..
+            },
+            None,
+        ) => net_io::ListenerSpec::tcp(*addr),
+        (ListenerSource::HandedOff | ListenerSource::Inherited { .. }, None) => {
+            return Err(ServeError::HandOff {
+                listener: spec.name.clone(),
+                reason: "the listener has no socket",
+            });
+        }
+        (ListenerSource::Tcp(addr), None) => match &spec.listen_options {
+            Some(options) => net_io::ListenerSpec::tcp_with(*addr, *options),
+            None => net_io::ListenerSpec::tcp(*addr),
+        },
+        (ListenerSource::Unix(path), None) => {
+            let m = spec.unix_mode;
+            let mut options = net_io::LocalOptions::new().mode(m.mode);
+            if let Some(uid) = m.owner {
+                options = options.owner(uid);
+            }
+            if let Some(gid) = m.group {
+                options = options.group(gid);
+            }
+            net_io::ListenerSpec::unix(path.clone(), options)
+        }
+        (ListenerSource::Unresolved, None) => {
+            return Err(ServeError::Bind {
+                listener: spec.name.clone(),
+                source: net_io::NetError::NoAddresses,
+            });
+        }
+    };
+    let compiled = profiles.compiled(spec.profile);
+    let behind = spec.ingress.proxy().is_some();
+    let idle = compiled.map_or_else(
+        || KeepAlive::new().idle_for(behind),
+        |c| c.keep_alive.idle_for(behind),
+    );
+    let effective = compiled.map_or(limits, |c| &c.limits);
+    let stall = effective.write_stall;
+    // serve-net's own deadlines decide how long a head and a body may take,
+    // and they answer 408; net-io's read timeout only backs them up.
+    let read = effective.head_timeout.max(effective.request_timeout) + READ_MARGIN;
+    let mut own = spec
+        .transport
+        .as_ref()
+        .map_or_else(net_io::Limits::builder, net_io::Limits::to_builder)
+        .idle_timeout(idle)
+        .write_timeout(stall)
+        .output_budget(effective.max_pending_output)
+        .min_rate(if effective.min_rate_bytes == 0 {
+            net_io::MinRate::off()
+        } else {
+            net_io::MinRate::new(effective.min_rate_bytes, effective.min_rate_window)
+        })
+        .graceful_linger(effective.linger_total, effective.linger_bytes);
+    let read_set = spec
+        .transport
+        .as_ref()
+        .or(base)
+        .is_some_and(|t| t.read_timeout().is_some());
+    if !read_set {
+        own = own.read_timeout(read);
+    }
+    if let Some(n) = spec.backlog {
+        own = own.backlog(n);
+    }
+    let listener_hard = spec
+        .max_connections
+        .map_or(hard, |n| n.saturating_add(limits.headroom_for(n)).min(hard));
+    if spec.max_connections.is_some() {
+        own = own.max_per_listener(listener_hard);
+    }
+    let proxy = spec.ingress.proxy();
+    if proxy.is_some_and(|p| matches!(p.kind, ProxyKind::Headers(_))) {
+        // Every connection comes from the front end, so a per-source cap
+        // would cap the whole listener; per-client limits behind a proxy
+        // belong to a gate that sees the forwarded client (D-046, per listener
+        // since net-io 0.4). Behind the PROXY protocol net-io moves the slot
+        // to the real client, so the cap stays.
+        own = own.max_per_source(listener_hard, net_io::PrefixPolicy::DEFAULT);
+    }
+    let own = own.build().map_err(ServeError::Start)?;
+    let mut net_spec = net_spec.limits(own);
+    if named {
+        // A reload that replaces a listener binds it before the old one goes,
+        // and net-io wants names unique.
+        net_spec = net_spec.name(&spec.name);
+    }
+    if matches!(spec.ingress, Ingress::DirectTls) {
+        net_spec = net_spec.tls(true);
+    }
+    if let Some(ProxySource {
+        kind: ProxyKind::ProxyProtocol(versions),
+        trusted,
+        ..
+    }) = proxy
+    {
+        net_spec = net_spec.proxy(net_io::ProxyMode::Required {
+            versions: *versions,
+        });
+        // Over a Unix socket every peer that passed its credential check is
+        // trusted; net-io ignores the list there.
+        if !spec.ingress.is_unix() {
+            net_spec = net_spec.trusted_proxies(trusted.clone());
+        }
+    }
+    Ok(net_spec)
+}
+
+/// The first inherited listener's name, for an error about the environment.
+fn first_inherited(listeners: &[ListenerSpec]) -> String {
+    listeners
+        .iter()
+        .find(|l| matches!(l.source, ListenerSource::Inherited { .. }))
+        .map_or_else(String::new, |l| l.name.clone())
+}
+
+/// Gives each inherited listener its socket: by name first, then the
+/// unnamed sockets in order to the listeners left. Sockets no listener takes
+/// are dropped (closed).
+fn match_inherited(
+    listeners: &[ListenerSpec],
+    passed: Vec<net_io::InheritedListener>,
+) -> Vec<Option<net_io::ListenerHandle>> {
+    let mut pool: Vec<Option<net_io::InheritedListener>> = passed.into_iter().map(Some).collect();
+    let mut out: Vec<Option<net_io::ListenerHandle>> = (0..listeners.len()).map(|_| None).collect();
+    for (i, l) in listeners.iter().enumerate() {
+        let ListenerSource::Inherited { name, .. } = &l.source else {
+            continue;
+        };
+        let found = pool.iter_mut().find(|p| {
+            p.as_ref()
+                .is_some_and(|p| p.name.as_deref() == Some(name.as_str()))
+        });
+        if let Some(slot) = found {
+            out[i] = slot.take().map(|p| p.handle);
+        }
+    }
+    for (i, l) in listeners.iter().enumerate() {
+        if !matches!(l.source, ListenerSource::Inherited { .. }) || out[i].is_some() {
+            continue;
+        }
+        let unnamed = pool
+            .iter_mut()
+            .find(|p| p.as_ref().is_some_and(|p| p.name.is_none()));
+        if let Some(slot) = unnamed {
+            out[i] = slot.take().map(|p| p.handle);
+        }
+    }
+    out
+}
+
+/// The owner of a file, where the platform has one.
+#[cfg(unix)]
+pub(crate) fn file_owner(path: &net_io::UnixPath) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path.as_path()).ok().map(|m| m.uid())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn file_owner(_path: &net_io::UnixPath) -> Option<u32> {
+    None
 }
 
 /// Names the listener a net-io bind error is about.
@@ -634,7 +1016,54 @@ impl<H: Hooks> core::fmt::Debug for Built<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Ingress, ProxySource, RuleId, TrustedProxies};
+    use crate::{ProxySource, RuleId, TrustedProxies};
+
+    /// Listening sockets, released by a throwaway net-io server.
+    fn handles(n: usize) -> Vec<net_io::ListenerHandle> {
+        let mut b = net_io::ServerBuilder::new();
+        for _ in 0..n {
+            b = b.listener(net_io::ListenerSpec::tcp("127.0.0.1:0"));
+        }
+        let s = b
+            .handler(|_c: &mut net_io::TcpConnection| Ok(()))
+            .gate(net_io::AllowAll)
+            .build()
+            .unwrap();
+        s.release_listeners().unwrap()
+    }
+
+    #[test]
+    fn test_match_inherited_by_name_then_by_position() {
+        let mut h = handles(3);
+        let passed = vec![
+            net_io::InheritedListener {
+                name: None,
+                handle: h.pop().unwrap(),
+            },
+            net_io::InheritedListener {
+                name: Some("api".into()),
+                handle: h.pop().unwrap(),
+            },
+            net_io::InheritedListener {
+                name: Some("unused".into()),
+                handle: h.pop().unwrap(),
+            },
+        ];
+        let api_addr = passed[1].handle.local().clone();
+        let listeners = vec![
+            ListenerSpec::inherited("web"),
+            ListenerSpec::tcp("plain", "127.0.0.1:0"),
+            ListenerSpec::inherited("api"),
+            ListenerSpec::inherited("extra"),
+        ];
+        let got = match_inherited(&listeners, passed);
+        // "api" by name; "web" takes the unnamed socket; "extra" gets none,
+        // and the socket named "unused" is dropped.
+        assert_eq!(got[2].as_ref().map(|h| h.local().clone()), Some(api_addr));
+        assert!(got[0].is_some());
+        assert!(got[1].is_none());
+        assert!(got[3].is_none());
+    }
 
     #[test]
     fn test_build_reports_every_error_at_once() {

@@ -24,6 +24,7 @@ pub(crate) struct Draft<'a> {
     pub(crate) drain_deadline: Duration,
     /// Whether the owner gave a control line (lockdown can happen).
     pub(crate) has_control: bool,
+    pub(crate) has_tls: bool,
 }
 
 /// Errors and warnings found.
@@ -56,7 +57,9 @@ pub(crate) fn check(d: &Draft<'_>) -> Findings {
     binds(d, &mut f);
     profiles(d, &mut f);
     for l in d.listeners {
+        tls(l, d, &mut f);
         public_bind(l, &mut f);
+        unix(l, &mut f);
         trust(l, &mut f);
         scheme_warning(l, &mut f);
         ingress_needs_http(l, d.profiles, &mut f);
@@ -144,6 +147,7 @@ fn names(d: &Draft<'_>, f: &mut Findings) {
 
 fn binds(d: &Draft<'_>, f: &mut Findings) {
     let mut seen: HashSet<SocketAddr> = HashSet::new();
+    let mut paths: HashSet<&std::path::Path> = HashSet::new();
     for l in d.listeners {
         let subject = Subject::Listener(l.name.clone());
         match l.source {
@@ -155,6 +159,17 @@ fn binds(d: &Draft<'_>, f: &mut Findings) {
                     "give an address such as 127.0.0.1:8080 or a host name that resolves",
                 );
             }
+            ListenerSource::Unix(ref path) => {
+                if !paths.insert(path.as_path()) {
+                    f.error(
+                        RuleId::DuplicateBind,
+                        subject,
+                        "another listener binds the same socket path",
+                        "remove one listener or change its path",
+                    );
+                }
+            }
+            ListenerSource::Inherited { .. } | ListenerSource::HandedOff => {}
             ListenerSource::Tcp(addr) => {
                 // Port 0 picks a free port each time, so two port-0 listeners never collide.
                 if addr.port() != 0 && !seen.insert(addr) {
@@ -254,10 +269,78 @@ fn public_bind(l: &ListenerSpec, f: &mut Findings) {
     }
 }
 
+/// TLS needs an acceptor, and ALPN ids need TLS.
+fn tls(l: &ListenerSpec, d: &Draft<'_>, f: &mut Findings) {
+    let on_tls = matches!(l.ingress, Ingress::DirectTls);
+    if on_tls && !d.has_tls {
+        f.error(
+            RuleId::TlsWithoutAcceptor,
+            Subject::Listener(l.name.clone()),
+            "a TLS listener has no acceptor",
+            "give the server one with ServerBuilder::tls",
+        );
+    }
+    let alpn = d.profiles.iter().find(|p| p.id == l.profile).is_some_and(
+        |p| matches!(p.engine, crate::config::EngineChoice::Custom { alpn } if !alpn.is_empty()),
+    );
+    if alpn && !on_tls {
+        f.error(
+            RuleId::AlpnWithoutTls,
+            Subject::Listener(l.name.clone()),
+            "the profile offers ALPN ids on a listener without TLS",
+            "use Ingress::DirectTls, or a profile without ALPN ids",
+        );
+    }
+}
+
+/// The rules of Unix listeners: the ingress fits the socket, the mode is not
+/// writable by others, and a uid or gid list has credentials to check.
+fn unix(l: &ListenerSpec, f: &mut Findings) {
+    let subject = || Subject::Listener(l.name.clone());
+    let on_unix = matches!(l.source, ListenerSource::Unix(_));
+    let kind_known = matches!(l.source, ListenerSource::Tcp(_) | ListenerSource::Unix(_));
+    if on_unix != l.ingress.is_unix() && kind_known {
+        f.error(
+            RuleId::IngressSource,
+            subject(),
+            if on_unix {
+                "a Unix socket listener has a TCP ingress"
+            } else {
+                "a TCP listener has Unix ingress"
+            },
+            "use Ingress::Unix on ListenerSpec::unix, and Direct or Proxy on TCP listeners",
+        );
+    }
+    if !on_unix {
+        return;
+    }
+    if l.unix_mode.mode & 0o002 != 0 && l.world_writable.is_none() {
+        f.error(
+            RuleId::WorldWritableSocket,
+            subject(),
+            "the socket file is writable by others, so any local user can connect",
+            "use a mode such as 0o660 with a group, or call allow_world_writable with the reason",
+        );
+    }
+    if let Ingress::Unix(trust, _) = &l.ingress {
+        let needs_credentials = !matches!(trust, crate::config::UnixPeerTrust::AnyLocalPeer);
+        if needs_credentials && !cfg!(unix) {
+            f.error(
+                RuleId::PeerCredentialsUnavailable,
+                subject(),
+                "this platform reports no peer credentials for Unix sockets",
+                "use UnixPeerTrust::AnyLocalPeer and rely on the socket file's permissions",
+            );
+        }
+    }
+}
+
 fn trust(l: &ListenerSpec, f: &mut Findings) {
     let Some(p) = l.ingress.proxy() else { return };
     let subject = || Subject::Listener(l.name.clone());
-    if p.trusted.is_empty() {
+    // Over a Unix socket the peer is trusted by its credentials; the list
+    // covers only further hops and may be empty.
+    if p.trusted.is_empty() && !l.ingress.is_unix() {
         f.error(
             RuleId::TrustEmpty,
             subject(),
@@ -536,6 +619,7 @@ mod tests {
             workers: &Workers::auto(),
             drain_deadline: Duration::from_secs(30),
             has_control: false,
+            has_tls: false,
         })
     }
 
@@ -639,6 +723,64 @@ mod tests {
     }
 
     #[test]
+    fn test_build_unix_rules() {
+        use crate::config::{Ingress, UnixMode, UnixPeerTrust};
+        // A Unix ingress on a TCP listener, and a TCP ingress on a socket.
+        let f = run(
+            &[
+                ListenerSpec::tcp("a", "127.0.0.1:9")
+                    .ingress(Ingress::Unix(UnixPeerTrust::AnyLocalPeer, None)),
+                ListenerSpec::unix("b", "/tmp/b.sock").ingress(Ingress::Direct),
+            ],
+            &[],
+        );
+        assert_eq!(
+            rules(&f)
+                .iter()
+                .filter(|r| **r == RuleId::IngressSource)
+                .count(),
+            2
+        );
+        // World-writable needs a reason; two listeners on one path collide.
+        let open = ListenerSpec::unix("c", "/tmp/c.sock")
+            .ingress(Ingress::Unix(UnixPeerTrust::AnyLocalPeer, None))
+            .unix_mode(UnixMode::new(0o666));
+        assert!(rules(&run(&[open], &[])).contains(&RuleId::WorldWritableSocket));
+        let allowed = ListenerSpec::unix("c", "/tmp/c.sock")
+            .ingress(Ingress::Unix(UnixPeerTrust::AnyLocalPeer, None))
+            .unix_mode(UnixMode::new(0o666))
+            .allow_world_writable("a shared test socket");
+        assert!(!rules(&run(&[allowed], &[])).contains(&RuleId::WorldWritableSocket));
+        let twice = run(
+            &[
+                ListenerSpec::unix("d", "/tmp/d.sock"),
+                ListenerSpec::unix("e", "/tmp/d.sock"),
+            ],
+            &[],
+        );
+        assert!(rules(&twice).contains(&RuleId::DuplicateBind));
+        // Credential rules need a platform that reports credentials.
+        let same = run(&[ListenerSpec::unix("f", "/tmp/f.sock")], &[]);
+        assert_eq!(
+            rules(&same).contains(&RuleId::PeerCredentialsUnavailable),
+            !cfg!(unix)
+        );
+        // Behind a proxy on the socket, the trust list may be empty.
+        let inner = run(
+            &[
+                ListenerSpec::unix("g", "/tmp/g.sock").ingress(Ingress::Unix(
+                    UnixPeerTrust::AnyLocalPeer,
+                    Some(crate::config::ProxySource::forwarded_for(
+                        crate::net::TrustedProxies::none(),
+                    )),
+                )),
+            ],
+            &[],
+        );
+        assert!(!rules(&inner).contains(&RuleId::TrustEmpty));
+    }
+
+    #[test]
     fn test_build_duplicate_bind_and_resolve() {
         let f = run(
             &[
@@ -700,6 +842,7 @@ mod tests {
                 workers: &Workers::auto(),
                 drain_deadline: Duration::from_secs(30),
                 has_control: false,
+                has_tls: false,
             })
         };
         let f = d(Limits::new()
@@ -728,6 +871,7 @@ mod tests {
             workers: &Workers::blocking(0),
             drain_deadline: Duration::ZERO,
             has_control: true,
+            has_tls: false,
         });
         let r = rules(&f);
         assert!(r.contains(&RuleId::DeadlineOrder));
@@ -758,6 +902,7 @@ mod tests {
             workers: &Workers::auto(),
             drain_deadline: Duration::from_secs(30),
             has_control: false,
+            has_tls: false,
         });
         assert!(
             f.warnings

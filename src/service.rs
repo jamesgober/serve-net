@@ -108,6 +108,9 @@ pub enum RequestEnd {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct Finished {
+    /// Reads it took to complete the head: a browser needs one or two, a
+    /// slowloris tool many.
+    pub head_reads: u16,
     /// The status written, if any.
     pub status: Option<u16>,
     /// How it ended.

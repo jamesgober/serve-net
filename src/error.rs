@@ -34,6 +34,9 @@ pub enum RuleId {
     WorldWritableSocket,
     /// A uid or gid allowlist where the platform has no peer credentials.
     PeerCredentialsUnavailable,
+    /// An ingress that does not fit the listener's socket: `Unix` ingress on
+    /// a TCP listener, or a TCP ingress on a Unix socket.
+    IngressSource,
     /// Two listeners with one name.
     DuplicateName,
     /// A listener name outside 1 to 64 bytes of `[a-z0-9._-]`.
@@ -56,6 +59,8 @@ pub enum RuleId {
     DriverUnavailable,
     /// A reload that changes the workers.
     ReloadWorkers,
+    /// A reload that changes what net-io fixed at bind: PROXY trust or TLS.
+    ReloadListener,
     /// A drain deadline of 0 or above 1 h.
     DrainRange,
     /// ALPN engine choice on a listener without TLS.
@@ -107,6 +112,7 @@ impl RuleId {
             RuleId::TrustParse => "trust_parse",
             RuleId::WorldWritableSocket => "world_writable_socket",
             RuleId::PeerCredentialsUnavailable => "peer_credentials_unavailable",
+            RuleId::IngressSource => "ingress_source",
             RuleId::DuplicateName => "duplicate_name",
             RuleId::BadName => "bad_name",
             RuleId::ProfileIdReserved => "profile_id_reserved",
@@ -118,6 +124,7 @@ impl RuleId {
             RuleId::DuplicateBind => "duplicate_bind",
             RuleId::DriverUnavailable => "driver_unavailable",
             RuleId::ReloadWorkers => "reload_workers",
+            RuleId::ReloadListener => "reload_listener",
             RuleId::DrainRange => "drain_range",
             RuleId::AlpnWithoutTls => "alpn_without_tls",
             RuleId::TlsOnFastCgi => "tls_on_fastcgi",
@@ -323,8 +330,31 @@ pub enum ServeError {
     },
     /// net-io could not start its workers or open the door.
     Start(net_io::NetError),
+    /// An inherited socket is missing or of the wrong kind.
+    Inherited {
+        /// The listener's name.
+        listener: String,
+        /// What is wrong.
+        reason: &'static str,
+    },
+    /// A handed-off socket is not of the kind the listener's ingress expects.
+    HandOff {
+        /// The listener's name.
+        listener: String,
+        /// What is wrong.
+        reason: &'static str,
+    },
     /// The operation needs a server that is not draining.
     Draining,
+    /// A reload's configuration is invalid; nothing changed.
+    Reload(ConfigErrors),
+    /// A listener added by a reload could not be bound; nothing changed.
+    ReloadBind {
+        /// The listener's name.
+        listener: String,
+        /// Why.
+        source: net_io::NetError,
+    },
 }
 
 impl fmt::Display for ServeError {
@@ -335,8 +365,23 @@ impl fmt::Display for ServeError {
                 write!(f, "listener `{listener}` could not be bound: {source}")
             }
             ServeError::Start(source) => write!(f, "the server could not start: {source}"),
+            ServeError::Inherited { listener, reason } => {
+                write!(f, "listener `{listener}`: {reason}")
+            }
+            ServeError::HandOff { listener, reason } => {
+                write!(f, "listener `{listener}`: {reason}")
+            }
             ServeError::Draining => {
                 f.write_str("the server is draining; start a new server instead")
+            }
+            ServeError::Reload(errors) => {
+                write!(f, "the reload changed nothing: {errors}")
+            }
+            ServeError::ReloadBind { listener, source } => {
+                write!(
+                    f,
+                    "the reload changed nothing: listener `{listener}` could not be bound: {source}"
+                )
             }
         }
     }
@@ -345,9 +390,13 @@ impl fmt::Display for ServeError {
 impl std::error::Error for ServeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ServeError::Config(errors) => Some(errors),
-            ServeError::Bind { source, .. } | ServeError::Start(source) => Some(source),
-            ServeError::Draining => None,
+            ServeError::Config(errors) | ServeError::Reload(errors) => Some(errors),
+            ServeError::Bind { source, .. }
+            | ServeError::Start(source)
+            | ServeError::ReloadBind { source, .. } => Some(source),
+            ServeError::Inherited { .. } | ServeError::HandOff { .. } | ServeError::Draining => {
+                None
+            }
         }
     }
 }

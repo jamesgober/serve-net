@@ -32,6 +32,7 @@ use crate::hooks::{
 use crate::net::{CloseReason, ConnectionId, ControlLine, ControlState, WorkerId};
 use crate::reply::{DeferSlot, Link, Reply, SlotState, WAKE_REPLY, Waker};
 use crate::service::{BodyPolicy, Finished, HeadAction, Outcome, RequestEnd};
+use crate::snapshot::Snapshot;
 use crate::stats::{Count, Counters};
 
 pub(crate) mod session;
@@ -101,11 +102,52 @@ pub(crate) trait Io {
 /// One listener's runtime facts.
 #[derive(Debug, Clone)]
 pub(crate) struct ListenerRuntime {
-    #[allow(dead_code)] // reported to the observer with listener events (0.4)
     pub(crate) name: String,
     pub(crate) profile: ProfileId,
     pub(crate) proxy: Option<ProxySource>,
     pub(crate) declared_scheme: Scheme,
+    /// On a Unix socket: who may connect.
+    pub(crate) unix: Option<UnixRuntime>,
+    /// The listener's soft connection cap.
+    pub(crate) cap: Arc<session::Cap>,
+}
+
+/// What a reload swaps: read through a snapshot, so a connection keeps a
+/// whole table and sees a new one at its next request head (D-062).
+#[derive(Debug)]
+pub(crate) struct Tables {
+    pub(crate) profiles: ProfileTable,
+    /// By net-io listener id; a removed listener leaves `None`.
+    pub(crate) listeners: Vec<Option<ListenerRuntime>>,
+    pub(crate) profile_caps: Vec<Arc<session::Cap>>,
+}
+
+/// A Unix listener's peer rule.
+#[derive(Debug, Clone)]
+pub(crate) struct UnixRuntime {
+    pub(crate) trust: crate::config::UnixPeerTrust,
+    /// The uid this process runs as (`SameUser`), read from the bound socket
+    /// file; unset means no peer passes (fail closed).
+    pub(crate) same_user: Arc<std::sync::OnceLock<u32>>,
+}
+
+impl UnixRuntime {
+    /// Whether a peer with these credentials may connect.
+    pub(crate) fn admits(&self, credentials: Option<net_io::PeerCredentials>) -> bool {
+        use crate::config::UnixPeerTrust;
+        match &self.trust {
+            UnixPeerTrust::AnyLocalPeer => true,
+            UnixPeerTrust::SameUser => credentials
+                .and_then(|c| c.uid)
+                .is_some_and(|uid| self.same_user.get() == Some(&uid)),
+            UnixPeerTrust::Users(uids) => credentials
+                .and_then(|c| c.uid)
+                .is_some_and(|uid| uids.contains(&uid)),
+            UnixPeerTrust::Groups(gids) => credentials
+                .and_then(|c| c.gid)
+                .is_some_and(|gid| gids.contains(&gid)),
+        }
+    }
 }
 
 /// What every connection of one server shares.
@@ -120,9 +162,26 @@ pub(crate) struct Shared<F: Family, S: Service<F>, H: Hooks> {
     /// live at each checkpoint: net-io's `draining()` is fixed for the length
     /// of one callback, and a drain may start while the service runs (D-047).
     pub(crate) control: Arc<crate::running::Merged<H::Control>>,
-    pub(crate) profiles: ProfileTable,
-    pub(crate) listeners: Vec<ListenerRuntime>,
+    pub(crate) tables: Arc<Snapshot<Tables>>,
     pub(crate) counters: Arc<Counters>,
+}
+
+impl<F: Family, S: Service<F>, H: Hooks> crate::notify::ServerEvents for Shared<F, S, H> {
+    fn drain_started(&self, open_connections: u32) {
+        self.observer.drain_started(open_connections);
+    }
+    fn drain_finished(&self, report: &crate::running::DrainReport) {
+        self.observer.drain_finished(report);
+    }
+    fn reloaded(&self, summary: &crate::reload::ReloadSummary) {
+        self.observer.reloaded(summary);
+    }
+    fn reload_refused(&self, errors: &crate::error::ConfigErrors) {
+        self.observer.reload_refused(errors);
+    }
+    fn notify_failed(&self, error: &std::io::Error) {
+        self.observer.notify_failed(error);
+    }
 }
 
 /// Where the machine is.
@@ -146,6 +205,7 @@ enum State {
 struct Request {
     admitted: Option<Admitted>,
     head_at: Instant,
+    head_reads: u16,
     admitted_at: Option<Instant>,
     bytes_in: u64,
     policy: BodyPolicy,
@@ -169,6 +229,10 @@ const BODY_RETAIN: usize = 64 * 1024;
 /// One connection.
 pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     shared: Arc<Shared<F, S, H>>,
+    tables: Arc<Tables>,
+    tables_version: u64,
+    /// A reload reached this connection.
+    tables_changed: bool,
     listener: usize,
     connection: ConnectionId,
     engine: F::Engine,
@@ -190,9 +254,13 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     end: Option<EndReason>,
     closing_after_write: bool,
     first_byte: Option<Instant>,
+    /// Reads that fed the current head so far.
+    head_reads: u16,
     wipe: bool,
     /// A drain was seen on this connection (for the drain report's counts).
     draining_seen: bool,
+    /// The connection's PROXY header facts, on a PROXY listener.
+    proxy_facts: Option<Arc<net_io::ProxyFacts>>,
 }
 
 impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
@@ -205,11 +273,14 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         now: Instant,
         worker: WorkerId,
     ) -> Self {
-        let profile_id = shared
+        let tables_version = shared.tables.version();
+        let tables = shared.tables.load();
+        let profile_id = tables
             .listeners
             .get(listener)
+            .and_then(Option::as_ref)
             .map_or(ProfileId(0), |l| l.profile);
-        let compiled = shared.profiles.compiled(profile_id);
+        let compiled = tables.profiles.compiled(profile_id);
         let (engine, wipe, lane, tag) = match compiled {
             Some(c) => (
                 shared.family.engine(&c.profile, &c.limits),
@@ -253,6 +324,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         };
         Conn {
             shared,
+            tables,
+            tables_version,
+            tables_changed: false,
             listener,
             connection,
             engine,
@@ -276,13 +350,20 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             end: None,
             closing_after_write: false,
             first_byte: None,
+            head_reads: 0,
             wipe,
             draining_seen: false,
+            proxy_facts: None,
         }
     }
 
+    /// The facts net-io read from the connection's PROXY header.
+    pub(crate) fn set_proxy_facts(&mut self, facts: Option<Arc<net_io::ProxyFacts>>) {
+        self.proxy_facts = facts;
+    }
+
     fn compiled(&self) -> Option<&Compiled> {
-        self.shared.profiles.compiled(self.env.profile)
+        self.tables.profiles.compiled(self.env.profile)
     }
 
     fn limits(&self) -> crate::config::Limits {
@@ -299,6 +380,28 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         self.clock_base
             .1
             .saturating_add(now.saturating_duration_since(self.clock_base.0).as_secs())
+    }
+
+    fn shared_listener_behind(&self) -> bool {
+        matches!(
+            self.tables.listeners.get(self.listener),
+            Some(Some(l)) if l.proxy.is_some()
+        )
+    }
+
+    /// Takes the newest tables, at a request head: one load when nothing
+    /// changed. A connection whose listener was removed keeps the tables it
+    /// has until it ends.
+    fn refresh_tables(&mut self) {
+        let version = self.shared.tables.version();
+        if version != self.tables_version {
+            let next = self.shared.tables.load();
+            self.tables_version = version;
+            if matches!(next.listeners.get(self.listener), Some(Some(_))) {
+                self.tables = next;
+                self.tables_changed = true;
+            }
+        }
     }
 
     #[inline]
@@ -610,6 +713,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     /// Back between requests.
     fn idle<I: Io>(&mut self, io: &mut I) -> Step {
         self.first_byte = None;
+        self.head_reads = 0;
         if self.body.capacity() > BODY_RETAIN {
             self.body.shrink_to(BODY_RETAIN);
         }
@@ -654,6 +758,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             if consumed < input.len() {
                 let fed = self.engine.feed(&input[consumed..]);
                 consumed += fed;
+                if fed > 0 && self.state == State::AwaitHead {
+                    self.head_reads = self.head_reads.saturating_add(1);
+                }
                 if fed > 0 && self.state == State::AwaitHead && self.first_byte.is_none() {
                     // The first byte of a head: its deadline starts now
                     // (the first request's started at accept).
@@ -778,16 +885,19 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         }
         let limits = self.limits();
         let shared = Arc::clone(&self.shared);
-        let compiled = shared.profiles.compiled(self.env.profile);
+        self.refresh_tables();
+        let tables = Arc::clone(&self.tables);
+        let compiled = tables.profiles.compiled(self.env.profile);
         // Everything that borrows the engine's head happens in this block, so
         // the borrow ends before any refusal is written.
         let viewed = {
-            let listener = shared.listeners.get(self.listener);
+            let listener = tables.listeners.get(self.listener).and_then(Option::as_ref);
             let cx = HeadContext {
                 client: &self.client,
                 proxy: listener.and_then(|l| l.proxy.as_ref()),
                 declared_scheme: listener.map_or(Scheme::Http, |l| l.declared_scheme),
                 resolved: None,
+                proxy_facts: self.proxy_facts.as_deref(),
             };
             match self.engine.head() {
                 None => None,
@@ -832,6 +942,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             |c| c.body,
         );
         self.request = Some(Request {
+            head_reads: self.head_reads,
             admitted: None,
             head_at: arrived,
             admitted_at: None,
@@ -983,12 +1094,14 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         self.reply.deferred = false;
         shared.family.clear_parts(&mut self.reply.parts, self.wipe);
         let outcome = {
-            let listener = shared.listeners.get(self.listener);
+            let tables = Arc::clone(&self.tables);
+            let listener = tables.listeners.get(self.listener).and_then(Option::as_ref);
             let cx = HeadContext {
                 client: &self.client,
                 proxy: listener.and_then(|l| l.proxy.as_ref()),
                 declared_scheme: listener.map_or(Scheme::Http, |l| l.declared_scheme),
                 resolved: Some(self.env.client),
+                proxy_facts: self.proxy_facts.as_deref(),
             };
             let discard = self
                 .request
@@ -1110,6 +1223,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let pressured = pressure >= PRESSURE_CLOSE;
         io.set_idle_timeout(if pressure >= PRESSURE_SHORTEN {
             Some(k.under_pressure)
+        } else if self.tables_changed {
+            // net-io keeps the listener's idle timeout from bind; a reload's
+            // value reaches it per connection.
+            let behind = self.shared_listener_behind();
+            Some(k.idle_for(behind))
         } else {
             None
         });
@@ -1267,6 +1385,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             counters.count(worker, Count::FinishedDraining);
         }
         let finished = Finished {
+            head_reads: r.head_reads,
             status: r.status,
             end,
             bytes_in: r.bytes_in,

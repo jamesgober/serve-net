@@ -7,11 +7,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::client::IngressKind;
-use crate::config::ProfileId;
-use crate::conn::session::Runtime;
+use crate::config::{ListenerSource, ProfileId};
 use crate::error::ServeError;
 use crate::health::{Health, HealthState, ListenerInfo, ListenerState};
 use crate::net::{ControlLine, ControlState};
+use crate::notify::Notifier;
+use crate::reload::{ReloadSummary, Reloader, ServerConfig};
 use crate::stats::{Counters, Stats};
 
 /// The control line net-io reads: the owner's line merged with serve-net's
@@ -130,12 +131,14 @@ impl DrainReport {
 pub struct DrainHandle {
     switch: Arc<dyn DrainSwitch>,
     handle: net_io::ServerHandle,
+    notifier: Arc<Notifier>,
 }
 
 impl DrainHandle {
     /// Starts a drain that ends at most `deadline` from now, and returns at
     /// once; [`Running::wait`] returns its report.
     pub fn drain(&self, deadline: Duration) {
+        self.notifier.drain_deadline(deadline);
         self.switch.request(Instant::now() + deadline);
         // net-io's accept thread runs the drain; wake every thread waiting in
         // the kernel so the line is read now (D-043).
@@ -158,11 +161,25 @@ impl fmt::Debug for DrainHandle {
 }
 
 /// One listener's facts for `listeners()`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ListenerMeta {
     pub(crate) name: String,
     pub(crate) ingress: IngressKind,
     pub(crate) profile: ProfileId,
     pub(crate) public_bind: Option<&'static str>,
+    pub(crate) source: ListenerSource,
+    /// What net-io fixed at bind (`reload::transport_key`).
+    pub(crate) transport: String,
+    /// The settings a reload can change in place, as text for comparison.
+    pub(crate) settings: String,
+}
+
+impl ListenerMeta {
+    pub(crate) fn same_settings(&self, other: &ListenerMeta) -> bool {
+        self.settings == other.settings
+            && self.profile == other.profile
+            && self.ingress == other.ingress
+    }
 }
 
 /// Everything `bind` hands to [`Bound`].
@@ -170,32 +187,47 @@ pub(crate) struct Parts {
     pub(crate) server: net_io::Server,
     pub(crate) listeners: Vec<ListenerMeta>,
     pub(crate) switch: Arc<dyn DrainSwitch>,
-    pub(crate) rt: Arc<Runtime>,
     pub(crate) counters: Arc<Counters>,
     pub(crate) health: Arc<HealthState>,
+    pub(crate) notifier: Arc<Notifier>,
+    pub(crate) reloader: Reloader,
 }
 
 /// What a bound and a running server hold.
 struct Inner {
-    server: net_io::Server,
-    listeners: Vec<ListenerMeta>,
-    names: Vec<String>,
+    /// Locked by `reload` and `listeners`; a request never takes it.
+    server: Mutex<net_io::Server>,
+    handle: net_io::ServerHandle,
+    /// By net-io listener id.
+    listeners: Mutex<Vec<Option<ListenerMeta>>>,
     switch: Arc<dyn DrainSwitch>,
-    /// The soft-cap seats; kept alive with the server.
-    _rt: Arc<Runtime>,
     counters: Arc<Counters>,
     health: Arc<HealthState>,
+    notifier: Arc<Notifier>,
+    reloader: Reloader,
 }
 
 impl Inner {
+    fn server(&self) -> std::sync::MutexGuard<'_, net_io::Server> {
+        self.server.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn metas(&self) -> std::sync::MutexGuard<'_, Vec<Option<ListenerMeta>>> {
+        self.listeners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn listener_infos(&self, opened: bool) -> Vec<ListenerInfo> {
-        let door = self.server.door();
-        self.server
+        let door = self.handle.door();
+        let metas = self.metas();
+        let server = self.server();
+        server
             .listeners()
             .iter()
             .filter_map(|l| {
                 let i = usize::from(l.id.get());
-                let meta = self.listeners.get(i)?;
+                let meta = metas.get(i)?.as_ref()?;
                 let state = if self.health.listener_failing(i) {
                     ListenerState::Failing
                 } else if !opened {
@@ -217,14 +249,27 @@ impl Inner {
             .collect()
     }
 
-    fn local_addrs(&self) -> impl Iterator<Item = (&str, SocketAddr)> + '_ {
-        self.server.listeners().iter().filter_map(|l| {
-            let name = self
-                .names
-                .get(usize::from(l.id.get()))
-                .map_or("", String::as_str);
-            l.local.socket_addr().map(|a| (name, a))
-        })
+    /// Each TCP listener's name and address.
+    fn local_addrs(&self) -> Vec<(String, SocketAddr)> {
+        let metas = self.metas();
+        let server = self.server();
+        server
+            .listeners()
+            .iter()
+            .filter_map(|l| {
+                let name = metas
+                    .get(usize::from(l.id.get()))?
+                    .as_ref()
+                    .map_or_else(String::new, |m| m.name.clone());
+                l.local.socket_addr().map(|a| (name, a))
+            })
+            .collect()
+    }
+
+    fn into_server(self) -> net_io::Server {
+        self.server
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -232,27 +277,29 @@ impl Inner {
 #[must_use = "a Bound server accepts nothing until open() is called"]
 pub struct Bound {
     inner: Inner,
+    addrs: Vec<(String, SocketAddr)>,
 }
 
 impl Bound {
     pub(crate) fn new(parts: Parts) -> Self {
-        let names = parts.listeners.iter().map(|l| l.name.clone()).collect();
-        Bound {
-            inner: Inner {
-                server: parts.server,
-                listeners: parts.listeners,
-                names,
-                switch: parts.switch,
-                _rt: parts.rt,
-                counters: parts.counters,
-                health: parts.health,
-            },
-        }
+        let handle = parts.server.handle();
+        let inner = Inner {
+            server: Mutex::new(parts.server),
+            handle,
+            listeners: Mutex::new(parts.listeners.into_iter().map(Some).collect()),
+            switch: parts.switch,
+            counters: parts.counters,
+            health: parts.health,
+            notifier: parts.notifier,
+            reloader: parts.reloader,
+        };
+        let addrs = inner.local_addrs();
+        Bound { inner, addrs }
     }
 
     /// Each TCP listener's name and bound address.
     pub fn local_addrs(&self) -> impl Iterator<Item = (&str, SocketAddr)> + '_ {
-        self.inner.local_addrs()
+        self.addrs.iter().map(|(name, addr)| (name.as_str(), *addr))
     }
 
     /// Name, address, ingress, profile, and state per listener.
@@ -267,7 +314,8 @@ impl Bound {
     ///
     /// [`ServeError::Start`] when net-io refuses to open the door.
     pub fn open(self) -> Result<Running, ServeError> {
-        self.inner.server.open_door().map_err(ServeError::Start)?;
+        self.inner.server().open_door().map_err(ServeError::Start)?;
+        self.inner.notifier.ready();
         Ok(Running {
             inner: Some(self.inner),
         })
@@ -297,7 +345,7 @@ impl Running {
     /// The first TCP listener's address (useful with port 0).
     #[must_use]
     pub fn local_addr(&self) -> Option<SocketAddr> {
-        self.inner().local_addrs().next().map(|(_, a)| a)
+        self.inner().local_addrs().first().map(|(_, a)| *a)
     }
 
     /// Name, address, ingress, profile, and state per listener (allocates;
@@ -309,7 +357,7 @@ impl Running {
 
     /// Stops accepting on every listener; idempotent.
     pub fn close_door(&self) {
-        self.inner().server.close_door();
+        self.inner().handle.close_door();
     }
 
     /// Request counters summed over the workers, with net-io's transport
@@ -318,7 +366,7 @@ impl Running {
     pub fn stats(&self) -> Stats {
         let inner = self.inner();
         let mut s = inner.counters.sum();
-        s.transport = inner.server.stats();
+        s.transport = inner.handle.stats();
         s
     }
 
@@ -327,19 +375,31 @@ impl Running {
     #[must_use]
     pub fn health(&self) -> Health {
         let inner = self.inner();
-        inner
-            .health
-            .compute(&inner.names, &inner.counters, inner.switch.is_draining())
+        let names: Vec<(usize, String)> = inner
+            .metas()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| m.as_ref().map(|m| (i, m.name.clone())))
+            .collect();
+        inner.health.compute(
+            &names,
+            &inner.counters,
+            inner.switch.is_draining(),
+            inner.notifier.is_failing(),
+        )
     }
 
     /// Drains with `deadline` and shuts the server down.
     pub fn drain(mut self, deadline: Duration) -> DrainReport {
         let inner = self.inner.take().unwrap_or_else(|| unreachable!());
+        inner.notifier.drain_deadline(deadline);
         let deadline = Instant::now() + deadline;
         // Replies in flight read the line live and carry the close signal.
         inner.switch.request(deadline);
-        let report = inner.server.shutdown(deadline);
-        DrainReport::from_net(report, &inner.counters)
+        let (counters, notifier) = (Arc::clone(&inner.counters), Arc::clone(&inner.notifier));
+        let report = DrainReport::from_net(inner.into_server().shutdown(deadline), &counters);
+        notifier.drain_finished(&report);
+        report
     }
 
     /// A handle that starts a drain from any thread.
@@ -348,21 +408,46 @@ impl Running {
         let inner = self.inner();
         DrainHandle {
             switch: Arc::clone(&inner.switch),
-            handle: inner.server.handle(),
+            handle: inner.handle.clone(),
+            notifier: Arc::clone(&inner.notifier),
         }
     }
 
     /// Parks until a drain is asked for, then drains and shuts down.
     pub fn wait(mut self) -> DrainReport {
         let inner = self.inner.take().unwrap_or_else(|| unreachable!());
-        let report = inner.server.wait_for_stop();
-        DrainReport::from_net(report, &inner.counters)
+        let (counters, notifier) = (Arc::clone(&inner.counters), Arc::clone(&inner.notifier));
+        let report = DrainReport::from_net(inner.into_server().wait_for_stop(), &counters);
+        notifier.drain_finished(&report);
+        report
     }
 
     /// net-io's handle.
     #[must_use]
     pub fn server_handle(&self) -> net_io::ServerHandle {
-        self.inner().server.handle()
+        self.inner().handle.clone()
+    }
+
+    /// Applies a new configuration without dropping a connection: validates
+    /// it (nothing changes on failure), binds added listeners, publishes the
+    /// new tables, opens the new doors, then closes and drains removed
+    /// listeners. Connections see the new tables at their next request head;
+    /// work in flight keeps the tables it started with. Reloads are
+    /// serialized.
+    ///
+    /// # Errors
+    ///
+    /// [`ServeError::Reload`] (nothing changed), [`ServeError::ReloadBind`]
+    /// (nothing changed; the new listeners were closed),
+    /// [`ServeError::Draining`].
+    pub fn reload(&self, next: ServerConfig) -> Result<ReloadSummary, ServeError> {
+        let inner = self.inner();
+        if inner.switch.is_draining() {
+            return Err(ServeError::Draining);
+        }
+        let mut server = inner.server();
+        let mut metas = inner.metas();
+        inner.reloader.run(&mut server, &mut metas, next)
     }
 }
 
@@ -370,7 +455,7 @@ impl Drop for Running {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
             // A drop must not block for seconds: close everything now.
-            let _ = inner.server.shutdown(Instant::now());
+            let _ = inner.into_server().shutdown(Instant::now());
         }
     }
 }
@@ -379,7 +464,7 @@ impl fmt::Debug for Running {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut d = f.debug_struct("Running");
         if let Some(inner) = &self.inner {
-            d.field("listeners", &inner.local_addrs().collect::<Vec<_>>());
+            d.field("listeners", &inner.local_addrs());
         }
         d.finish()
     }

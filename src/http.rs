@@ -93,7 +93,7 @@ impl<'a> HttpHead<'a> {
     #[must_use]
     pub fn headers(&self) -> Fields<'a> {
         Fields {
-            inner: self.raw.headers(),
+            inner: FieldSource::Head(self.raw.headers()),
         }
     }
 
@@ -141,16 +141,32 @@ impl fmt::Debug for HttpHead<'_> {
 /// Every field of a head in arrival order: `(name, value)`.
 #[derive(Clone)]
 pub struct Fields<'a> {
-    inner: Headers<'a>,
+    inner: FieldSource<'a>,
+}
+
+#[derive(Clone)]
+enum FieldSource<'a> {
+    Head(Headers<'a>),
+    Copy(&'a [u8], core::slice::Iter<'a, (Span, Span)>),
 }
 
 impl<'a> Iterator for Fields<'a> {
     type Item = (&'a str, &'a [u8]);
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        match &mut self.inner {
+            FieldSource::Head(h) => h.next(),
+            FieldSource::Copy(bytes, spans) => {
+                let (name, value) = spans.next()?;
+                let name = core::str::from_utf8(name.of(bytes)).unwrap_or("");
+                Some((name, value.of(bytes)))
+            }
+        }
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        match &self.inner {
+            FieldSource::Head(h) => h.size_hint(),
+            FieldSource::Copy(_, spans) => spans.size_hint(),
+        }
     }
 }
 
@@ -235,6 +251,173 @@ impl<'a> HttpRequest<'a> {
     #[must_use]
     pub fn body_bytes(&self) -> &'a [u8] {
         self.body
+    }
+
+    /// An owned, `Send` copy of the head, for work that outlives `call`.
+    #[must_use]
+    pub fn detach_head(&self) -> DetachedHead {
+        DetachedHead::of(&self.head)
+    }
+}
+
+/// Where a value sits in a [`DetachedHead`]'s bytes.
+#[derive(Clone, Copy, Debug)]
+struct Span {
+    start: u32,
+    len: u32,
+}
+
+impl Span {
+    fn of(self, bytes: &[u8]) -> &[u8] {
+        let start = self.start as usize;
+        bytes.get(start..start + self.len as usize).unwrap_or(&[])
+    }
+}
+
+/// An owned, `Send` copy of a request head with the same accessors as
+/// [`HttpHead`], for work that outlives `call`.
+///
+/// ```
+/// let site = serve_net::handler(|req, reply| {
+///     let head = req.detach_head();
+///     let worker = std::thread::spawn(move || head.path().to_owned());
+///     reply.text(200, &worker.join().unwrap());
+/// });
+/// let reply = serve_net::testing::respond(&site, b"GET /jobs HTTP/1.1\r\nHost: a\r\n\r\n");
+/// assert_eq!(reply.text(), "/jobs");
+/// ```
+pub struct DetachedHead {
+    bytes: Vec<u8>,
+    method: Method,
+    version: Version,
+    method_str: Span,
+    target: Span,
+    path: Span,
+    query: Option<Span>,
+    fields: Vec<(Span, Span)>,
+}
+
+/// Fields whose values `Debug` never prints.
+const CREDENTIALS: [&str; 4] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+];
+
+impl DetachedHead {
+    fn of(head: &HttpHead<'_>) -> Self {
+        let mut bytes = Vec::with_capacity(512);
+        let mut put = |value: &[u8]| {
+            let start = bytes.len() as u32;
+            bytes.extend_from_slice(value);
+            Span {
+                start,
+                len: value.len() as u32,
+            }
+        };
+        let method_str = put(head.method_str().as_bytes());
+        let target = put(head.target().as_bytes());
+        let path = put(head.path().as_bytes());
+        let query = head.query().map(|q| put(q.as_bytes()));
+        let fields = head
+            .headers()
+            .map(|(name, value)| (put(name.as_bytes()), put(value)))
+            .collect();
+        DetachedHead {
+            bytes,
+            method: head.method(),
+            version: head.version(),
+            method_str,
+            target,
+            path,
+            query,
+            fields,
+        }
+    }
+
+    fn text(&self, span: Span) -> &str {
+        core::str::from_utf8(span.of(&self.bytes)).unwrap_or("")
+    }
+
+    /// The method.
+    #[must_use]
+    pub fn method(&self) -> Method {
+        self.method
+    }
+
+    /// The method exactly as received.
+    #[must_use]
+    pub fn method_str(&self) -> &str {
+        self.text(self.method_str)
+    }
+
+    /// The target exactly as received.
+    #[must_use]
+    pub fn target(&self) -> &str {
+        self.text(self.target)
+    }
+
+    /// The path, percent-encoding kept.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        self.text(self.path)
+    }
+
+    /// The query, after the first `?`.
+    #[must_use]
+    pub fn query(&self) -> Option<&str> {
+        self.query.map(|q| self.text(q))
+    }
+
+    /// The protocol version.
+    #[must_use]
+    pub fn version(&self) -> Version {
+        self.version
+    }
+
+    /// The first field with this name (ASCII case-insensitive).
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&[u8]> {
+        self.headers()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value)
+    }
+
+    /// Every field with this name, in order.
+    pub fn header_all<'s>(&'s self, name: &'s str) -> impl Iterator<Item = &'s [u8]> + 's {
+        self.headers()
+            .filter(move |(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value)
+    }
+
+    /// Every field in arrival order.
+    #[must_use]
+    pub fn headers(&self) -> Fields<'_> {
+        Fields {
+            inner: FieldSource::Copy(&self.bytes, self.fields.iter()),
+        }
+    }
+}
+
+impl fmt::Debug for DetachedHead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut d = f.debug_struct("DetachedHead");
+        d.field("method", &self.method_str())
+            .field("target", &self.target());
+        let fields: Vec<(&str, &str)> = self
+            .headers()
+            .map(|(n, v)| {
+                let secret = CREDENTIALS.iter().any(|c| n.eq_ignore_ascii_case(c));
+                let value = if secret {
+                    "<redacted>"
+                } else {
+                    core::str::from_utf8(v).unwrap_or("<binary>")
+                };
+                (n, value)
+            })
+            .collect();
+        d.field("fields", &fields).finish()
     }
 }
 
@@ -397,11 +580,8 @@ impl Family for HttpFamily {
     fn head<'a>(
         &self,
         raw: RequestHead<'a>,
-        cx: &HeadContext<'_>,
-    ) -> Result<(HttpHead<'a>, ClientInfo), EngineError>
-    where
-        Self: 'a,
-    {
+        cx: &HeadContext<'a>,
+    ) -> Result<(HttpHead<'a>, ClientInfo), EngineError> {
         let base = *cx.client;
         let ingress_error = EngineError {
             kind: RefusalKind::Ingress,
@@ -436,7 +616,14 @@ impl Family for HttpFamily {
                         client,
                     ));
                 }
-                let peer = base.peer().ok_or(ingress_error)?;
+                // A Unix socket peer has no address; it passed its credential
+                // check, so the walk starts from a trusted hop.
+                let unix = base.ingress() == IngressKind::Unix;
+                let peer = match base.peer() {
+                    Some(p) => Some(p),
+                    None if unix => None,
+                    None => return Err(ingress_error),
+                };
                 let rules = forwarded::Rules {
                     source,
                     trusted: &proxy.trusted,
@@ -446,8 +633,13 @@ impl Family for HttpFamily {
                     trust_scheme: proxy.trust_scheme,
                     trust_host: proxy.trust_host,
                 };
-                let found = forwarded::resolve(peer.ip(), peer.port(), &rules, &raw)
-                    .map_err(|_| ingress_error)?;
+                let found = forwarded::resolve_from(
+                    peer.map(|p| p.ip()),
+                    peer.map_or(0, |p| p.port()),
+                    &rules,
+                    &raw,
+                )
+                .map_err(|_| ingress_error)?;
                 let client = if found.forwarded {
                     base.behind_proxy(found.client, found.port, found.hops, IngressKind::Forwarded)
                         .with_scheme(found.scheme.unwrap_or(cx.declared_scheme))
@@ -465,12 +657,20 @@ impl Family for HttpFamily {
                 ))
             }
             ProxyKind::ProxyProtocol(_) => {
-                let client = base.with_scheme(cx.declared_scheme);
+                // The session built the client from net-io's PROXY facts.
+                let client = base;
+                let tlv = if proxy.trust_host {
+                    cx.proxy_facts
+                        .and_then(|f| f.authority())
+                        .filter(|a| forwarded::valid_authority(a.as_bytes()))
+                } else {
+                    None
+                };
                 Ok((
                     HttpHead {
                         raw,
                         client,
-                        authority: raw.host(),
+                        authority: tlv.or_else(|| raw.host()),
                     },
                     client,
                 ))

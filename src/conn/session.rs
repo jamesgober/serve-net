@@ -15,10 +15,10 @@ use net_io::{
 };
 
 use super::{Conn, Io, Phase, Shared, Step, Timeout};
-use crate::client::ClientInfo;
-use crate::config::ProfileId;
+use crate::client::{ClientInfo, IngressKind, Scheme};
+use crate::config::ProxyKind;
 use crate::engine::{Family, Service};
-use crate::hooks::Hooks;
+use crate::hooks::{Hooks, Observer};
 use crate::net::{ConnectionId, WorkerId};
 use crate::reply::{PostFail, Waker};
 
@@ -35,22 +35,29 @@ impl Waker for CompleterWaker {
 }
 
 /// One soft cap: a limit and the connections holding a seat under it.
-struct Cap {
-    limit: u32,
+#[derive(Debug)]
+pub(crate) struct Cap {
+    limit: AtomicU32,
     open: AtomicU32,
 }
 
 impl Cap {
-    fn new(limit: Option<u32>) -> Cap {
-        Cap {
-            limit: limit.unwrap_or(u32::MAX),
+    pub(crate) fn new(limit: Option<u32>) -> Arc<Cap> {
+        Arc::new(Cap {
+            limit: AtomicU32::new(limit.unwrap_or(u32::MAX)),
             open: AtomicU32::new(0),
-        }
+        })
+    }
+
+    /// A new limit; connections over it stay, new ones are refused.
+    pub(crate) fn set_limit(&self, limit: Option<u32>) {
+        self.limit
+            .store(limit.unwrap_or(u32::MAX), Ordering::Release);
     }
 
     /// Takes a seat; `true` when the cap is now exceeded.
     fn take(&self) -> bool {
-        self.open.fetch_add(1, Ordering::AcqRel) >= self.limit
+        self.open.fetch_add(1, Ordering::AcqRel) >= self.limit.load(Ordering::Acquire)
     }
 
     fn give_back(&self) {
@@ -61,24 +68,15 @@ impl Cap {
 /// The runtime state every session of one server shares, independent of the
 /// service and hook types.
 pub(crate) struct Runtime {
-    global: Cap,
-    listeners: Box<[Cap]>,
-    profiles: Box<[Cap]>,
+    pub(crate) global: Arc<Cap>,
     /// One waker per worker, made on first use (no allocation per connection).
     wakers: Box<[OnceLock<Arc<dyn Waker>>]>,
 }
 
 impl Runtime {
-    pub(crate) fn new(
-        global: Option<u32>,
-        listeners: &[Option<u32>],
-        profiles: &[Option<u32>],
-        workers: u16,
-    ) -> Runtime {
+    pub(crate) fn new(global: Option<u32>, workers: u16) -> Runtime {
         Runtime {
             global: Cap::new(global),
-            listeners: listeners.iter().map(|l| Cap::new(*l)).collect(),
-            profiles: profiles.iter().map(|p| Cap::new(*p)).collect(),
             wakers: (0..workers.max(1)).map(|_| OnceLock::new()).collect(),
         }
     }
@@ -87,25 +85,22 @@ impl Runtime {
 /// A connection's seat under the global, listener, and profile caps; given
 /// back on drop, so a panicking session cannot leak it.
 struct Seat {
-    rt: Arc<Runtime>,
-    listener: usize,
-    profile: usize,
+    caps: [Option<Arc<Cap>>; 3],
 }
 
 impl Seat {
-    fn take(rt: &Arc<Runtime>, listener: usize, profile: ProfileId) -> (Seat, bool) {
-        let profile = usize::from(profile.0);
-        let mut over = rt.global.take();
-        if let Some(c) = rt.listeners.get(listener) {
-            over |= c.take();
-        }
-        if let Some(c) = rt.profiles.get(profile) {
+    fn take(global: &Arc<Cap>, listener: &Arc<Cap>, profile: Option<&Arc<Cap>>) -> (Seat, bool) {
+        let mut over = global.take();
+        over |= listener.take();
+        if let Some(c) = profile {
             over |= c.take();
         }
         let seat = Seat {
-            rt: Arc::clone(rt),
-            listener,
-            profile,
+            caps: [
+                Some(Arc::clone(global)),
+                Some(Arc::clone(listener)),
+                profile.cloned(),
+            ],
         };
         (seat, over)
     }
@@ -113,11 +108,7 @@ impl Seat {
 
 impl Drop for Seat {
     fn drop(&mut self) {
-        self.rt.global.give_back();
-        if let Some(c) = self.rt.listeners.get(self.listener) {
-            c.give_back();
-        }
-        if let Some(c) = self.rt.profiles.get(self.profile) {
+        for c in self.caps.iter().flatten() {
             c.give_back();
         }
     }
@@ -226,10 +217,10 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::Session for ServeSess
     }
 
     fn on_writable(&mut self, cx: &mut SessionContext<'_>) -> net_io::Step {
-        // A parked reply keeps waiting; any other interrupted step continues
-        // with what the machine does after a write (pipelined input already
-        // in the engine).
-        if let Some(s @ Step::Park { .. }) = self.resume.take() {
+        // A parked reply keeps waiting, a refusal closes; any other interrupted
+        // step continues with what the machine does after a write (pipelined
+        // input already in the engine).
+        if let Some(s @ (Step::Park { .. } | Step::Close)) = self.resume.take() {
             return step(s);
         }
         let mut io = NetIo {
@@ -264,6 +255,12 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::Session for ServeSess
             rt: &self.rt,
         };
         let s = self.conn.on_timeout(&mut io, which);
+        // net-io turns a `Close` from here into an immediate close, so a
+        // refusal the machine just wrote goes out first (D-064).
+        if s == Step::Close && !cx.output().is_empty() {
+            self.resume = Some(Step::Close);
+            return net_io::Step::Write;
+        }
         handed(s, cx, &mut self.resume)
     }
 
@@ -299,15 +296,55 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::SessionFactory for Fa
 
     fn open(&self, info: &ConnectionInfo) -> Result<Self::Session, RefusalCause> {
         let listener = info.listener.map_or(0, |l| usize::from(l.get()));
-        let Some(runtime) = self.shared.listeners.get(listener) else {
+        let tables = self.shared.tables.load();
+        let Some(runtime) = tables.listeners.get(listener).and_then(Option::as_ref) else {
             return Err(RefusalCause::Session);
         };
-        let Some(peer) = info.client_addr() else {
-            return Err(RefusalCause::Session);
+        let mut client = match &runtime.unix {
+            Some(unix) => {
+                // Checked before any byte is read; a peer that fails is closed.
+                if !unix.admits(info.peer_credentials) {
+                    return Err(RefusalCause::Credentials);
+                }
+                ClientInfo::unix(info.peer_credentials)
+            }
+            None => match info.client_addr() {
+                Some(peer) => ClientInfo::direct(peer, info.tls.is_some()),
+                None => return Err(RefusalCause::Session),
+            },
         };
-        let client = ClientInfo::direct(peer, info.tls.is_some());
-        let (seat, over_cap) = Seat::take(&self.rt, listener, runtime.profile);
-        let conn = Conn::new(
+        let proxy_protocol = runtime
+            .proxy
+            .as_ref()
+            .filter(|p| matches!(p.kind, ProxyKind::ProxyProtocol(_)));
+        if let Some(p) = proxy_protocol {
+            // net-io read the header from a trusted peer before calling this.
+            client = match info.real_peer {
+                Some(real) => {
+                    client.behind_proxy(Some(real.ip()), real.port(), 1, IngressKind::ProxyProtocol)
+                }
+                // LOCAL: the proxy itself, for example its health check.
+                None => client.with_proxy_local(true),
+            };
+            let tls = p.trust_scheme
+                && info
+                    .proxy
+                    .as_ref()
+                    .is_some_and(|f| f.ssl_client().is_some());
+            client = client.with_scheme(if tls {
+                Scheme::Https
+            } else {
+                runtime.declared_scheme
+            });
+        }
+        let profile_cap = tables.profile_caps.get(usize::from(runtime.profile.0));
+        let (seat, over_cap) = Seat::take(&self.rt.global, &runtime.cap, profile_cap);
+        if over_cap {
+            self.shared
+                .observer
+                .capacity_refused(&runtime.name, runtime.profile);
+        }
+        let mut conn = Conn::new(
             Arc::clone(&self.shared),
             listener,
             info.id,
@@ -315,6 +352,9 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::SessionFactory for Fa
             info.accepted_at,
             info.worker,
         );
+        if proxy_protocol.is_some() {
+            conn.set_proxy_facts(info.proxy.clone());
+        }
         Ok(ServeSession {
             conn,
             rt: Arc::clone(&self.rt),

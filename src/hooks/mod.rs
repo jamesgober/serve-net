@@ -112,6 +112,16 @@ pub trait Observer: Send + Sync + 'static {
     fn connection_ended(&self, connection: ConnectionId, end: EndReason, requests: u32) {}
     /// A soft connection cap refused a connection.
     fn capacity_refused(&self, listener: &str, profile: crate::config::ProfileId) {}
+    /// A drain started with this many connections open.
+    fn drain_started(&self, open_connections: u32) {}
+    /// A drain finished.
+    fn drain_finished(&self, report: &crate::running::DrainReport) {}
+    /// A reload applied.
+    fn reloaded(&self, summary: &crate::reload::ReloadSummary) {}
+    /// A reload was refused; nothing changed.
+    fn reload_refused(&self, errors: &crate::error::ConfigErrors) {}
+    /// The service manager could not be told about a state change.
+    fn notify_failed(&self, error: &std::io::Error) {}
     /// A listener runs with a public-bind exception.
     fn public_bind(&self, listener: &str, reason: &'static str) {}
     /// A `Quick` service took longer than 1 ms (debug builds).

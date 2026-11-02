@@ -284,6 +284,8 @@ pub struct HeadContext<'c> {
     /// The request's client as resolved at its head, when the view is built
     /// again for the service call: the walk is not repeated.
     pub(crate) resolved: Option<ClientInfo>,
+    /// The facts of the connection's PROXY header, on a PROXY listener.
+    pub(crate) proxy_facts: Option<&'c net_io::ProxyFacts>,
 }
 
 impl HeadContext<'_> {
@@ -317,7 +319,7 @@ pub trait Family: Send + Sync + 'static {
     fn head<'a>(
         &self,
         raw: <Self::Engine as Engine>::Head<'a>,
-        cx: &HeadContext<'_>,
+        cx: &HeadContext<'a>,
     ) -> Result<(Self::Head<'a>, ClientInfo), EngineError>;
     /// The request view, from the head view and the buffered body.
     fn request<'a>(&self, head: Self::Head<'a>, body: &'a [u8]) -> Self::Request<'a>;

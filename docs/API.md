@@ -1,7 +1,7 @@
 # serve-net - API Reference
 
 > Reference for every public item in `serve-net`, with signatures, behaviour, errors, costs, and examples.
-> **Current release: `0.2.0` (design lock; no functional code yet).** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
+> **Current release: `0.4.0`.** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -149,8 +149,8 @@ Every cost is a target on reference hardware. Numbers marked **[est.]** are esti
 |---|---|---|---|
 | (none) | always | the server, listeners, ingress, profiles, limits, hooks, snapshots, the engine and family traits | `0.3.0` |
 | `http1` | on | the HTTP family over http-net: `HttpService`, `HttpRequest`, `HttpReply`, `engine::Http1`, the Tier 1 functions `http` and `http_behind_proxy`, `testing` | `0.3.0` |
-| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.4.0` |
-| `ws` | off | WebSocket upgrades over ws-net: `engine::WebSocket`, `UpgradeTarget::WebSocket` (implies `http1`) | `0.4.0` |
+| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.5.0` |
+| `ws` | off | WebSocket upgrades over ws-net: `engine::WebSocket`, `UpgradeTarget::WebSocket` (implies `http1`) | `0.5.0` |
 | `h2` | off | HTTP/2 over h2-net: `engine::H2`, ALPN `h2` | after `1.0.0`, or earlier as a minor version when h2-net reaches its 0.3 |
 
 Features are additive. `--no-default-features` builds the server with custom families only and passes CI on its own. The crate has no third-party runtime dependency in any feature combination; its first-party dependencies are net-io (always), http-net, fcgi-net, ws-net, and h2-net (by feature), each at a published version.
@@ -308,7 +308,7 @@ A FastCGI responder for Apache (`mod_fcgid`, `mod_proxy_fcgi`) or nginx (`fastcg
 
 | Grade | Tier | Version | Feature |
 |---|---|---|---|
-| P1 | 1 | `0.4.0` | `fastcgi` |
+| P1 | 1 | `0.5.0` | `fastcgi` |
 
 Errors: `ServeError::Inherited` ("descriptor 0 is not a listening socket: the process was not started by a FastCGI process manager; use FastCgiListen::Tcp or Unix"), `ServeError::Bind`, `ServeError::Config` (`PublicBind`). `DescriptorZero` and `Unix` are Unix only (mod_fcgid on Windows uses named pipes, after `1.0.0`).
 
@@ -548,7 +548,7 @@ impl Bound {
 
 `bind` takes the service and builds net-io's server: every listener is bound, adopted, inherited, or received in declaration order, net-io's PROXY expectation and trusted list are set per listener, and the workers start with the **door closed**: nothing is accepted (the kernel backlog may queue connections). This is the moment to drop privileges, after binding a privileged port and before any untrusted byte is read. `bind_family` does the same for a [custom family](#family-httpfamily) on listeners whose profile engine is `EngineChoice::Custom`.
 
-If any listener fails, everything bound so far is closed (inherited and handed-off sockets are released, not closed, so the owner can retry or pass them on) and the error names the failing listener.
+If any listener fails, everything bound so far is closed and the error names the failing listener. Inherited and handed-off sockets are to be released to the owner instead of closed; net-io 0.4's `build` consumes them, so until net-io can return them on a failed build they are closed too (tracked in `dev/ROADMAP.md`, v0.9.x register). Inherited sockets are matched by name first, then unnamed sockets by position; a socket no listener takes is closed.
 
 | Item | Grade | Tier | Version |
 |---|---|---|---|
@@ -749,7 +749,7 @@ pub struct ReloadSummary { pub added: Vec<String>, pub removed: Vec<String>, pub
 
 `ServerConfig` is plain data, so a program can build it from its own configuration format and pass the same value at start-up (`ServerBuilder::config`) and at reload.
 
-`reload` validates `next` with every rule (nothing changes on failure); diffs listeners by name (a changed address or source is a removal plus an addition; changed ingress, trust, profile, or limits apply in place); binds every added listener with its door closed (on failure only the new listeners are closed and nothing changes); calls `Notify::reloading`; publishes the new profile table, per-listener ingress and trust, and limits through [snapshots](#snapshots); opens the door on added listeners; closes the door on removed listeners and drains their connections with the drain deadline; calls `Notify::ready()` and `Observer::reloaded`. Connection-level limits apply to connections accepted after the swap; request-level limits to requests whose head completes after it; work in flight keeps the table it started with. Reloads are serialized: a reload while another runs waits for it.
+`reload` validates `next` with every rule (nothing changes on failure); diffs listeners by name (a changed address or source is a removal plus an addition; changed ingress, trust, profile, or limits apply in place); binds every added listener with its door closed (on failure only the new listeners are closed and nothing changes); calls `Notify::reloading`; publishes the new profile table, per-listener ingress and trust, and limits through [snapshots](#snapshots); opens the door on added listeners; closes the door on removed listeners and drains their connections with the drain deadline; calls `Notify::ready()` and `Observer::reloaded`. Connection-level limits apply to connections accepted after the swap; request-level limits to requests whose head completes after it; work in flight keeps the table it started with. What net-io fixes at bind (PROXY trust, TLS) cannot change in place and is refused with `ReloadListener`: add the listener under a new name and remove the old one. `InFlightCap` budgets keep their start-up values until a restart. Reloads are serialized: a reload while another runs waits for it.
 
 | Grade | Tier | Version | Cost |
 |---|---|---|---|
@@ -785,7 +785,7 @@ impl ListenerSpec {
     pub fn tcp<A: ToSocketAddrs>(name: &str, addr: A) -> Self;
     pub fn unix(name: &str, path: impl Into<PathBuf>) -> Self;                     // P1, 0.4.0
     pub fn inherited(name: &str) -> Self;                                           // P1, 0.4.0
-    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.4.0, Unix
+    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.5.0, Unix
     pub fn handed_off(name: &str, listener: net_io::ListenerHandle) -> Self;        // P0, 0.4.0
 }
 ```
@@ -911,7 +911,7 @@ pub enum Ingress {
     DirectTls,                                  // P0, 0.4.0: the same over TLS (net-io's TLS seam)
     Proxy(ProxySource),                         // behind a reverse proxy or load balancer
     Unix(UnixPeerTrust, Option<ProxySource>),   // P1, 0.4.0: None means the local peer is the client
-    FastCgi(FastCgiIngress),                    // P1, 0.4.0, feature fastcgi
+    FastCgi(FastCgiIngress),                    // P1, 0.5.0, feature fastcgi
 }
 impl Default for Ingress;   // Direct
 ```
@@ -928,7 +928,7 @@ How clients reach a listener, and therefore where the real client comes from. Ex
 
 | Grade | Tier | Version |
 |---|---|---|
-| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`, `FastCgi`) |
+| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`); `0.5.0` (`FastCgi`) |
 
 Errors (at `build`): `ForwardedOnDirect`, `TwoClientSources`, `PublicBind`, `TrustEmpty`, `TrustWildcard`, `TrustTooBroad`, `FastCgiTrust`, `TlsOnFastCgi`, `TlsWithoutAcceptor`, `PeerCredentialsUnavailable`.
 
@@ -957,7 +957,7 @@ Where the real client comes from behind a front end, and whom to believe.
 
 With `trust_scheme`, the scheme comes from `X-Forwarded-Proto` (or `Forwarded` `proto=`) and must be `http` or `https` (ASCII case-insensitive). With `trust_host`, the authority comes from `X-Forwarded-Host` (or `host=`) and must be a valid RFC 3986 authority of at most 255 bytes. Only the value the nearest trusted hop wrote (the rightmost) is used; anything invalid is a 400 refusal.
 
-**PROXY protocol** (`proxy_protocol`, `0.4.0`). net-io requires a complete, valid header before any byte reaches the engine, from trusted peers only, and closes every other connection before reading (fail closed; the PROXY specification requires both). A v2 `LOCAL` command (the proxy's own health check) keeps the socket peer and sets `ClientInfo::is_proxy_local()`. With `trust_scheme`, `PP2_TYPE_SSL` marks the connection `https`; with `trust_host`, `PP2_TYPE_AUTHORITY` gives the authority. net-io keeps one trusted list per server, so serve-net gives it the union of every PROXY listener's list and checks each connection against its own listener's list when it opens, before any byte reaches the engine.
+**PROXY protocol** (`proxy_protocol`, `0.4.0`). net-io requires a complete, valid header before any byte reaches the engine, from trusted peers only, and closes every other connection before reading (fail closed; the PROXY specification requires both). A v2 `LOCAL` command (the proxy's own health check) keeps the socket peer and sets `ClientInfo::is_proxy_local()`. With `trust_scheme`, `PP2_TYPE_SSL` marks the connection `https`; with `trust_host`, `PP2_TYPE_AUTHORITY` gives the authority. Each PROXY listener gives net-io its own trusted list (net-io 0.4 keeps one per listener), and net-io moves the connection's per-source slot to the real client, so the per-source cap applies to clients, not to the proxy.
 
 | Item | Grade | Tier | Version | Cost |
 |---|---|---|---|---|
@@ -1018,7 +1018,7 @@ pub enum UnknownClient { #[default] Allow, Refuse }
 pub enum UnixPeerTrust { SameUser, Users(Vec<u32>), Groups(Vec<u32>), AnyLocalPeer }
 ```
 
-Who may connect to a Unix listener, checked against net-io's peer credentials when the connection opens; a peer that fails is closed before any byte is read. On a platform without peer credentials only `AnyLocalPeer` validates (`RuleId::PeerCredentialsUnavailable`). P1, Tier 2, `0.4.0`.
+Who may connect to a Unix listener, checked against net-io's peer credentials when the connection opens; a peer that fails is closed before any byte is read. `SameUser` is the owner of the socket file this process created (read after bind, so no system call beyond `stat`); until it is known no peer passes. On a platform without peer credentials only `AnyLocalPeer` validates (`RuleId::PeerCredentialsUnavailable`). P1, Tier 2, `0.4.0`.
 
 ### `FastCgiIngress`
 
@@ -1242,8 +1242,8 @@ The compiled, immutable table, published through a [`Snapshot`](#snapshot) so a 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EngineChoice {
     #[default] Http1,
-    FastCgi,                                       // P1, 0.4.0
-    Http1OrH2ByAlpn,                               // P1, 0.4.0 (h2 with feature h2)
+    FastCgi,                                       // P1, 0.5.0
+    Http1OrH2ByAlpn,                               // P1, 0.5.0 (h2 with feature h2)
     Custom { alpn: &'static [&'static str] },      // a family given to bind_family; ALPN ids it serves
 }
 ```
@@ -1269,7 +1269,7 @@ pub trait HttpService: Send + Sync {
 
     fn call(&self, request: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome;
 
-    fn upgraded(&self, env: &Envelope, conn: UpgradedConn) {           // P1, 0.4.0
+    fn upgraded(&self, env: &Envelope, conn: UpgradedConn) {           // P1, 0.5.0
         let _ = (env, conn);
     }
 
@@ -1378,7 +1378,7 @@ pub enum HeadAction {
     Proceed,                                          // the profile's body policy
     ProceedWith(BodyPolicy),
     Refuse { status: u16, retry_after: Option<Duration> },
-    Upgrade(UpgradeTarget),                           // P1, 0.4.0
+    Upgrade(UpgradeTarget),                           // P1, 0.5.0
 }
 impl HeadAction {
     pub const fn refuse(status: u16) -> Self;         // Refuse { status, retry_after: None }
@@ -1789,7 +1789,7 @@ assert_eq!(small.count(), Some(32));
 
 The head deadline is short because a legitimate client sends a head in one or two packets, and a long head deadline is exactly the budget slowloris needs. The idle timeout behind a front end is long because the front end decides when to reuse a connection.
 
-The transport values serve-net sets on net-io for each listener: `idle_timeout` (keep-alive idle), `write_timeout` (`write_stall`), `min_rate`, `output_budget` (`max_pending_output`), `completion_queue` (`max_deferred_per_worker`), `graceful_linger` (`linger`), `max_connections` and `max_per_listener` (soft caps plus headroom), `backlog`. Everything else (`handshake_timeout`, `read_timeout`, `park_timeout`, `max_per_source`, `read_class`, `buffer_budget`, `tick`, ...) keeps net-io's defaults unless `transport_limits` sets it.
+The transport values serve-net sets on net-io for each listener: `idle_timeout` (keep-alive idle), `read_timeout` (the larger of `head_timeout` and `request_timeout` plus 1 s, so the deadline that answers 408 fires first), `write_timeout` (`write_stall`), `min_rate`, `output_budget` (`max_pending_output`), `graceful_linger` (`linger`), `max_connections` and `max_per_listener` (soft caps plus headroom), `backlog`, and from the reactor driver on `completion_queue` (`max_deferred_per_worker`; a blocking worker holds one connection). `transport_limits` wins over the mapped `read_timeout`. Everything else (`handshake_timeout`, `park_timeout`, `max_per_source`, `read_class`, `buffer_budget`, `tick`, ...) keeps net-io's defaults unless `transport_limits` sets it.
 
 ---
 
@@ -2030,6 +2030,7 @@ pub trait Notify: Send + Sync + 'static {
     fn status(&self, line: &str) {}
     fn watchdog(&self) {}
     fn extend_timeout(&self, by: Duration) {}
+    fn take_error(&self) -> Option<io::Error> { None }   // the last failure, taken
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2287,12 +2288,14 @@ impl RuleId { pub const fn as_str(self) -> &'static str; }   // stable snake_cas
 | `TrustParse` | a trust entry in text (Tier 1) that is not an address or CIDR, or has host bits set | none |
 | `WorldWritableSocket` | a Unix socket mode writable by others | `allow_world_writable(reason)` |
 | `PeerCredentialsUnavailable` | a uid or gid allowlist where the platform has no peer credentials | `UnixPeerTrust::AnyLocalPeer` |
+| `IngressSource` | `Ingress::Unix` on a TCP listener, or `Direct` or `Proxy` on a Unix socket listener (`0.4.0`) | none |
 | `DuplicateName`, `BadName` | two listeners with one name; a name outside 1 to 64 bytes of `[a-z0-9._-]` | none |
 | `ProfileIdReserved`, `ProfileGap`, `UnknownProfile` | `ProfileId(255)`; ids not dense from 0 or repeated; a listener naming a missing profile | none |
 | `DeadlineOrder`, `DeadlineRange` | `request_timeout` below `head_timeout`; keep-alive idle 0 with keep-alive on; a value outside its range | none |
 | `ZeroCap` | a connection or in-flight cap of 0 | none |
 | `DuplicateBind` | two listeners on one address or path | none |
 | `DriverUnavailable`, `ReloadWorkers` | a driver this build or platform lacks; a reload that changes `Workers` | restart instead |
+| `ReloadListener` | a reload that changes PROXY trust or TLS on a listener that keeps its socket (`0.4.0`) | a new listener name, or restart |
 | `DrainRange` | a drain deadline of 0 or above 1 h | none |
 | `AlpnWithoutTls`, `TlsOnFastCgi`, `TlsWithoutAcceptor` | ALPN without TLS; TLS on FastCGI; TLS with no acceptor | none |
 | `SchemeTrustWithoutSource` | `trust_scheme` or `trust_host` where no source can carry them | none |
@@ -2436,7 +2439,7 @@ pub trait Family: Send + Sync + 'static {
     type Parts: Default + Send + 'static;   // the reply data a service fills
 
     fn engine(&self, profile: &Profile, limits: &Limits) -> Self::Engine;
-    fn head<'a>(&self, raw: <Self::Engine as Engine>::Head<'a>, cx: &HeadContext<'_>)
+    fn head<'a>(&self, raw: <Self::Engine as Engine>::Head<'a>, cx: &HeadContext<'a>)
         -> Result<(Self::Head<'a>, ClientInfo), EngineError>;           // the view and the request's client
     fn request<'a>(&self, head: Self::Head<'a>, body: &'a [u8]) -> Self::Request<'a>;
     fn new_parts(&self) -> Self::Parts;

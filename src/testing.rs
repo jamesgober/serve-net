@@ -446,6 +446,8 @@ where
         profile: ProfileId(0),
         proxy,
         declared_scheme: scheme,
+        unix: None,
+        cap: crate::conn::session::Cap::new(None),
     };
     let shared = Shared {
         family: HttpFamily,
@@ -455,8 +457,11 @@ where
         checkpoint: hooks.checkpoint,
         observer: hooks.observer,
         control: Arc::new(crate::running::Merged::new(hooks.control)),
-        profiles,
-        listeners: vec![listener],
+        tables: Arc::new(crate::snapshot::Snapshot::new(crate::conn::Tables {
+            profile_caps: vec![crate::conn::session::Cap::new(None)],
+            profiles,
+            listeners: vec![Some(listener)],
+        })),
         counters: Arc::new(crate::stats::Counters::new(1)),
     };
     (Arc::new(shared), copy)
