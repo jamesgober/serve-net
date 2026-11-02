@@ -91,6 +91,16 @@ jobs:
             cargo fuzz run --target x86_64-unknown-linux-gnu "$t" "$RUNNER_TEMP/corpus/$t" -- -max_total_time=30 -rss_limit_mb=2048
           done
 
+  interop:
+    name: Interop (nginx, Apache, HAProxy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Real front ends against the interop example
+        run: bash .github/interop/run.sh
+
   loom:
     name: Loom models
     runs-on: ubuntu-latest

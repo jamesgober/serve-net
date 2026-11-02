@@ -90,6 +90,10 @@ required-features = ["http1"]
 name = "behind_proxy"
 required-features = ["http1"]
 
+[[example]]
+name = "interop"
+required-features = ["http1"]
+
 [[bench]]
 name = "core"
 harness = false

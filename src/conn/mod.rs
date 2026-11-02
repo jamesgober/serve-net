@@ -205,6 +205,7 @@ enum State {
 struct Request {
     admitted: Option<Admitted>,
     head_at: Instant,
+    head_reads: u16,
     admitted_at: Option<Instant>,
     bytes_in: u64,
     policy: BodyPolicy,
@@ -253,6 +254,8 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     end: Option<EndReason>,
     closing_after_write: bool,
     first_byte: Option<Instant>,
+    /// Reads that fed the current head so far.
+    head_reads: u16,
     wipe: bool,
     /// A drain was seen on this connection (for the drain report's counts).
     draining_seen: bool,
@@ -347,6 +350,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             end: None,
             closing_after_write: false,
             first_byte: None,
+            head_reads: 0,
             wipe,
             draining_seen: false,
             proxy_facts: None,
@@ -709,6 +713,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     /// Back between requests.
     fn idle<I: Io>(&mut self, io: &mut I) -> Step {
         self.first_byte = None;
+        self.head_reads = 0;
         if self.body.capacity() > BODY_RETAIN {
             self.body.shrink_to(BODY_RETAIN);
         }
@@ -753,6 +758,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             if consumed < input.len() {
                 let fed = self.engine.feed(&input[consumed..]);
                 consumed += fed;
+                if fed > 0 && self.state == State::AwaitHead {
+                    self.head_reads = self.head_reads.saturating_add(1);
+                }
                 if fed > 0 && self.state == State::AwaitHead && self.first_byte.is_none() {
                     // The first byte of a head: its deadline starts now
                     // (the first request's started at accept).
@@ -934,6 +942,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             |c| c.body,
         );
         self.request = Some(Request {
+            head_reads: self.head_reads,
             admitted: None,
             head_at: arrived,
             admitted_at: None,
@@ -1376,6 +1385,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             counters.count(worker, Count::FinishedDraining);
         }
         let finished = Finished {
+            head_reads: r.head_reads,
             status: r.status,
             end,
             bytes_in: r.bytes_in,
