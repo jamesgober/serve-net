@@ -21,12 +21,18 @@
 - `Offload`, `OffloadPool`, `OffloadJob`: `Io` and `Cpu` services run on a
   bounded pool the owner provides; a full pool answers the busy refusal.
   `Family::detach` and `DetachedRequest` for custom families.
+- Streaming: `BodyPolicy::Stream` with `HttpBody::Chunk`, `HttpReply::stream`
+  and `ReplyStream`, and `Outcome::More`. A slow reader holds back the service,
+  not memory. Provided `Family` methods for custom families.
+- `Budget::dedicated_workers`: workers kept for one profile, out of reach of
+  a flood on other listeners.
 - `WatchdogPinger`: pings a service manager only while every worker is
   healthy, so a stuck worker gets the process restarted.
 
 ### Changed
 
 - http-net 0.9.
+- `Outcome` and `BodyPolicy` gain a variant each; both are `#[non_exhaustive]`.
 
 ### Fixed
 

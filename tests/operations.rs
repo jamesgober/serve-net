@@ -170,6 +170,59 @@ fn test_bulk_flood_critical_lane_still_admitted() {
     let _ = server.drain(Duration::from_secs(1));
 }
 
+/// T-25 again, for connections: a flood fills every seat it may take; the
+/// dedicated listener still gets a worker.
+#[test]
+fn test_bulk_flood_dedicated_workers_stay_free() {
+    use serve_net::{Budget, Limits, Profile, ProfileId};
+
+    let (entered_tx, entered) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let (entered_tx, released) = (Mutex::new(entered_tx), Mutex::new(released));
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("bulk", "127.0.0.1:0").profile(ProfileId(0)))
+        .listener(ListenerSpec::tcp("admin", "127.0.0.1:0").profile(ProfileId(1)))
+        .profile(Profile::new(ProfileId(0)))
+        .profile(Profile::new(ProfileId(1)).budget(Budget::new().dedicated_workers(1)))
+        .limits(Limits::new().max_connections(3))
+        .serve(serve_net::handler(move |req, reply| {
+            if req.path() == "/slow" {
+                entered_tx.lock().unwrap().send(()).unwrap();
+                let _ = released.lock().unwrap().recv();
+            }
+            reply.text(200, "ok");
+        }))
+        .unwrap();
+    let addrs: Vec<SocketAddr> = server
+        .listeners()
+        .iter()
+        .map(|l| l.local.socket_addr().unwrap())
+        .collect();
+    let (bulk, admin) = (addrs[0], addrs[1]);
+
+    const SLOW: &[u8] = b"GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    let held: Vec<_> = (0..2)
+        .map(|_| std::thread::spawn(move || ask(bulk, SLOW)))
+        .collect();
+    for _ in 0..2 {
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    // Two seats of three are the bulk listener's; the third waits for admin.
+    assert!(
+        ask(bulk, GET).starts_with("HTTP/1.1 503"),
+        "the flood stops"
+    );
+    assert!(ask(admin, GET).starts_with("HTTP/1.1 200"), "admin answers");
+
+    for _ in 0..2 {
+        release.send(()).unwrap();
+    }
+    for h in held {
+        assert!(h.join().unwrap().starts_with("HTTP/1.1 200"));
+    }
+    let _ = server.drain(Duration::from_secs(1));
+}
+
 /// A pool with `threads` threads and room for `queue` waiting jobs.
 struct Pool(mpsc::SyncSender<OffloadJob>);
 

@@ -1214,11 +1214,11 @@ impl Budget {
     pub const fn new() -> Self;
     pub const fn max_connections(self, n: u32) -> Self;     // soft cap for the profile
     pub const fn max_in_flight(self, n: u32) -> Self;       // split across workers by InFlightCap
-    pub const fn dedicated_workers(self, n: u16) -> Self;   // P2, 0.5.0: an isolated worker set (admin listener)
+    pub const fn dedicated_workers(self, n: u16) -> Self;   // P2, 0.5.0: workers kept for this profile (admin listener)
 }
 ```
 
-A profile's share of the server. Unset values are unlimited within the server's own caps. Zero is refused (`RuleId::ZeroCap`). P0, Tier 2, `0.3.0` (`dedicated_workers` `0.5.0`).
+A profile's share of the server. Unset values are unlimited within the server's own caps. Zero is refused (`RuleId::ZeroCap`). `dedicated_workers(n)` keeps `n` workers for the profile alone: they come out of the server's soft connection cap, other profiles get the cap less every dedication, and this profile uses the rest of the cap once its own are taken. On the blocking driver a worker is a connection's thread, so a dedication is a seat that stays free; dedications that leave nothing for other profiles are refused (`ReserveOverflow`). A reload applies new dedications to connections that open after it. P0, Tier 2, `0.3.0` (`dedicated_workers` `0.5.0`); one atomic per connection on the profile, and the capacity other profiles give up.
 
 ### `ProfileTable`
 
@@ -1394,7 +1394,7 @@ What `head` decided. `Refuse` answers with the engine's refusal bytes for that s
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyPolicy {
     Buffer { max: u64 },      // read the whole body before call (the default, max = Limits::max_body)
-    Stream,                   // P2, 0.5.0: call at the head, body chunks as they arrive
+    Stream,                   // P2, 0.5.0: one call per piece of the body as it arrives
     Discard { max: u64 },     // read and drop up to max, then the reply; beyond max, close without reading
 }
 ```
@@ -1402,7 +1402,7 @@ pub enum BodyPolicy {
 | Policy | Behaviour | Grade | Version |
 |---|---|---|---|
 | `Buffer` | the body is read into a pooled buffer, bounded by `max` and the engine's own `max_body` (the smaller wins), under the request deadline and the minimum rate; a declared length over the bound is refused (413) before any body byte is read | P0 | `0.3.0` |
-| `Stream` | `call` runs at the head. Reactor: repeated `call`s with `HttpBody::Chunk`, reads paused while the service holds a chunk (push). Blocking: a reader that parks for more (pull) | P2 | `0.5.0` |
+| `Stream` | repeated `call`s with `HttpBody::Chunk`, one per piece of the body as it arrives, reads paused during each call; the same on every driver. A request with no body gets one call with empty bytes and `last: true`. Each call returns `Outcome::More` until the last piece; answering earlier drops the rest of the body and closes the connection. The engine's `max_body`, the request deadline, and the minimum rate apply; `head` is where to refuse before any body byte. `BeforeDispatch` runs for each piece. Streams stay on the worker, even under `Offload` | P2 | `0.5.0` |
 | `Discard` | for answering without the body (a redirect after a large upload attempt): the body is read and dropped up to `max` so the connection stays usable; beyond `max` the connection closes after the reply | P0 | `0.3.0` |
 
 ### `HttpRequest`, `HttpBody`
@@ -1461,10 +1461,16 @@ impl Reply<HttpFamily> {
     pub fn stream(&mut self) -> ReplyStream<'_>;                                 // P2, 0.5.0
 }
 impl fmt::Debug for Reply<HttpFamily>;                                           // set-cookie and credential values redacted
+
+pub struct ReplyStream<'a> { /* the reply */ }
+impl ReplyStream<'_> {
+    pub fn send(&mut self, bytes: &[u8]) -> &mut Self;   // copied; leaves when call returns
+    pub fn sent(&self) -> u64;                           // bytes in earlier parts
+}
 // From the generic Reply<F> (all families): defer(&mut self) -> ReplyToken<F>, see ReplyToken.
 ```
 
-The reply a service writes. `HttpReply` is the HTTP family's form of the generic [`Reply`](#family-httpfamily), so deferral works the same for every family. Buffered: nothing reaches the network until `call` returns, so the connection gate's egress check and a `Checkpoint` denial see the whole reply before any byte leaves. A reply the service did not touch is `200` with an empty body. Invalid field names or values (a CR or LF in a value, a non-token name, a framing field such as `content-length`) are recorded and turn the reply into the 500 refusal when it is written, never into a malformed response. `Date` is added unless set; no `Server` field is added. The buffer is reused across requests (no allocation in steady state) and wiped on return when the profile wipes.
+The reply a service writes. `HttpReply` is the HTTP family's form of the generic [`Reply`](#family-httpfamily), so deferral works the same for every family. Buffered: nothing reaches the network until `call` returns, so the connection gate's egress check and a `Checkpoint` denial see the whole reply before any byte leaves. `stream` is the exception, for bodies too large to hold or not yet known: the service calls it in every `call` of the reply and adds a part; `Outcome::More` asks to be called again once the client has taken that part, so a slow reader holds back the service and not memory, and `Outcome::Done` or `Close` ends the reply with the last part. The body is chunked (close-delimited to an HTTP/1.0 client); a `HEAD` request gets the head alone and one call. Status and fields go with the first part; each part passes `BeforeDispatch`, `BeforeReply`, and the connection gate. After the head no refusal can follow, so a panic, a denial, or an encoding error closes the connection abortively and the client sees a truncated body. A streamed reply cannot be deferred once its head has left. It stays on the worker: a service that streams its reply does not run under `Offload`, and `Outcome::More` from a job is answered with the 500 refusal. A reply the service did not touch is `200` with an empty body. Invalid field names or values (a CR or LF in a value, a non-token name, a framing field such as `content-length`) are recorded and turn the reply into the 500 refusal when it is written, never into a malformed response. `Date` is added unless set; no `Server` field is added. The buffer is reused across requests (no allocation in steady state) and wiped on return when the profile wipes.
 
 | Grade | Tier | Version | Cost |
 |---|---|---|---|
@@ -1501,10 +1507,10 @@ assert_eq!(reply.status, 500);
 #[non_exhaustive]
 #[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Outcome { Done, Deferred, Close }
+pub enum Outcome { Done, Deferred, Close, More }
 ```
 
-What `call` returns. `Done`: the reply is complete. `Deferred`: the service called `reply.defer()` and completes the reply later through the token. `Close`: send what the reply holds (nothing if it is untouched) and close the connection. After `defer()` the reply belongs to the token, so any outcome other than `Deferred` is treated as `Deferred` (and reported through the observer in debug builds); `Deferred` without a `defer()` answers the 500 refusal and is reported. P0, Tier 2, `0.3.0`.
+What `call` returns. `Done`: the reply is complete. `Deferred`: the service called `reply.defer()` and completes the reply later through the token. `Close`: send what the reply holds (nothing if it is untouched) and close the connection. `More` (`0.5.0`): call again, with the next piece of a `BodyPolicy::Stream` body or, with a streamed reply open, when the client has taken what was sent; anywhere else it is a service bug, answered with the 500 refusal. After `defer()` the reply belongs to the token, so any outcome other than `Deferred` is treated as `Deferred` (and reported through the observer in debug builds); `Deferred` without a `defer()` answers the 500 refusal and is reported. P0, Tier 2, `0.3.0`.
 
 ### `ReplyToken`, `CompleteError`
 
@@ -2304,7 +2310,7 @@ impl RuleId { pub const fn as_str(self) -> &'static str; }   // stable snake_cas
 | `AddressResolve` | an address that resolved to nothing | none |
 | `BadHeaderName` | a `SingleAddress` field name that is not a token | none |
 | `IngressNeedsHttp` | forwarded headers or FastCGI on a listener whose profile serves a custom family | none |
-| `ReserveOverflow` | lane reserves summing above 100% | none |
+| `ReserveOverflow` | lane reserves summing above 100%, or dedicated workers leaving no connection for the other profiles | none |
 | `TooMany` | more than 64 listeners or 255 profiles | none |
 
 The last group are warnings, kept in `Built::warnings()`: a proxy listener left at `Scheme::Http` with `trust_scheme` off; `min_rate` 0; `catch_service_panics` in an abort build; `Offload` on the blocking driver; keep-alive idle under 5 s behind a proxy (front-end reuse races); `Lockdown`-relevant configuration with no critical profile; a configuration with no listener. P0, Tier 2, `0.3.0`.

@@ -865,10 +865,18 @@ fn test_loopback_a_slow_body_is_answered_by_the_request_deadline() {
     );
     // Past the deadline, short of the read timeout behind it.
     clock.advance(Duration::from_millis(60_500));
-    server.server_handle().wake_all();
-    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let mut got = String::new();
-    let _ = c.read_to_string(&mut got);
+    // A wake can land before the worker waits; a manual clock will not tick.
+    c.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut n = 0;
+    for _ in 0..50 {
+        server.server_handle().wake_all();
+        if let Ok(read @ 1..) = c.read(&mut buf) {
+            n = read;
+            break;
+        }
+    }
+    let got = String::from_utf8_lossy(&buf[..n]);
     assert!(got.starts_with("HTTP/1.1 408"), "{got}");
     let _ = server.drain(Duration::from_secs(1));
 }

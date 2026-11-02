@@ -603,7 +603,11 @@ where
             .iter()
             .map(|p| Cap::new(p.budget.max_connections))
             .collect();
-        let rt = Arc::new(Runtime::new(Some(soft), threads));
+        let dedicated = profiles
+            .iter()
+            .map(|p| p.budget.dedicated.map(|n| Cap::new(Some(u32::from(n)))))
+            .collect();
+        let rt = Arc::new(Runtime::new(Some(shared_seats(soft, &profiles)), threads));
 
         let global = transport
             .as_ref()
@@ -686,6 +690,7 @@ where
             profiles,
             listeners: runtime_listeners.into_iter().map(Some).collect(),
             profile_caps,
+            dedicated,
         }));
         let shared = Arc::new(Shared::<F, S, HookSet<A, D, K, O, G, E, C, T>> {
             family,
@@ -789,6 +794,16 @@ pub(crate) fn connection_caps(limits: &Limits, workers: &Workers) -> (u32, u32, 
     let hard = soft.saturating_add(limits.headroom_for(soft));
     let threads = u16::try_from(hard).unwrap_or(u16::MAX).max(asked);
     (soft, hard, threads)
+}
+
+/// The soft cap left for connections without a dedicated seat.
+pub(crate) fn shared_seats(soft: u32, profiles: &ProfileTable) -> u32 {
+    let kept: u32 = profiles
+        .iter()
+        .filter_map(|p| p.budget.dedicated)
+        .map(u32::from)
+        .sum();
+    soft.saturating_sub(kept)
 }
 
 /// A listener's entry in the tables.

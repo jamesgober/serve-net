@@ -105,8 +105,10 @@ Exit: the ingress cases run for direct, PROXY v1 and v2, forwarded headers, and 
 ## v0.5.0 - Feature complete
 Exit: on net-io's reactor, 10,000 idle keep-alive connections with bounded memory on Linux, macOS, and Windows; deferred replies through an `Offload` pool; every P0, P1, and P2 item of `docs/API.md` implemented and documented; `docs/PLATFORM-NOTES.md` written.
 - Waiting on crates that are scaffolds today (D-066): over fcgi-net, `fastcgi`, `FastCgiListen`, `FastCgiIngress`, `Ingress::FastCgi`, `engine::FastCgi`, `ListenerSpec::fastcgi_descriptor_zero`, T-19, the `fastcgi_mapping` fuzz target (`mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0); over ws-net, `HeadAction::Upgrade`, `UpgradeTarget`, `UpgradedConn`, `HttpService::upgraded`, `engine::WebSocket`, T-21; over tls-net, an end-to-end TLS test and `EngineChoice::Http1OrH2ByAlpn`. A `Type=notify-reload` unit reloading under load under real systemd.
-- API: `Budget::dedicated_workers`, `BodyPolicy::Stream`, `HttpBody::Chunk`, `HttpReply::stream`, `Workers::reactor`, `catch_service_panics`, `InFlightCap::reserve`, `Offload`, `OffloadPool`, `OffloadJob`, `WatchdogPinger`.
-- Threat tests T-25, T-27, T-37.
+- [x] API done: `Budget::dedicated_workers` (blocking driver, D-074), `BodyPolicy::Stream`, `HttpBody::Chunk`, `HttpReply::stream`, `ReplyStream`, `Outcome::More` (D-073), `catch_service_panics`, `InFlightCap::reserve` (D-069), `Offload`, `OffloadPool`, `OffloadJob` (D-071), `WatchdogPinger` (D-068).
+- [x] Threat tests T-25, T-27, T-37.
+- [x] `docs/PLATFORM-NOTES.md`.
+- Waiting on net-io 0.5 (not published; a hard reason): `Workers::reactor`, the `completion_queue` mapping, `dedicated_workers` as a worker set of its own, the 10,000 idle connections exit, the Windows restart test, and dropping the drain workaround of D-072 once net-io fixes the accept race.
 
 ## v0.6.0 - Optimisation
 Exit: NFR-1, NFR-2, NFR-3, NFR-5 met, or each gap recorded in `docs/PERFORMANCE.md` with its cause and the plan to close it before 1.0 (a missed 20% target blocks 1.0); `docs/PERFORMANCE.md` published.
@@ -146,6 +148,11 @@ Exit: every item in the register below is closed or carried into `docs/STABILITY
 | Gate denials: a status outside 400 to 599 becomes 403 | D-050 | confirm with bouncer-io's codes |
 | The crate-level `allow(dead_code)` without the `http1` feature | 0.3 | gate the forwarded walk and the HTTP head context on the feature instead |
 | `Running` keeps its server in an `Option` and reaches it through `unreachable!()` after `drain` or `wait` took it | 0.3 | a shape with no unreachable path |
+| A drain settles accepts by watching counters (at most 150 ms), and a listener removed by reload can reset connections in the accept window | D-072 | drop the workaround when net-io fixes the race; reported to net-io |
+| An offload job copies the head and the body, and the copy outlives the worker's wipe | D-071 | measure the copy; hand the body over without one, and wipe the copy under a wiping profile |
+| A service that streams stays on the worker, and a slow generator on the reactor stalls that worker; a streamed reply cannot be deferred once its head has left | D-073 | decide with real use whether parts should go through a pool or a token |
+| `DetachedHead` keeps its own copy format while http-net now has `OwnedRequestHead` | D-071 | build one on the other if the public shape allows it |
+| `tests/loopback.rs` exhausts loopback ports next to a restart loop, and `Outcome::More` or a reserve under a real flood has no soak yet | 0.5 | cover in the 0.7 soak |
 | Two `impl InFlightCap` blocks (the index-based internals for tests) | 0.3 | fold into one |
 | serve-net handles no signals; every first program writes a stop channel | OD-8, hello-serve API friction | decide with the examples and a real deployment, as OD-8 planned for 0.9 |
 | Showing transport counters by close reason needed hand-built `CloseReason` values | hello-serve API friction | net-io 0.4 added `Stats::closes` and `Stats::refusals`; check serve-net's `Stats` reads as easily |

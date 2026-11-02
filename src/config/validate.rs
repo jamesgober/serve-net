@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use crate::config::Budget;
 use crate::config::{
     ForwardedSource, Ingress, KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId,
     ProxyKind, Workers, range,
@@ -71,12 +72,7 @@ pub(crate) fn check(d: &Draft<'_>) -> Findings {
         if let Some(l) = &p.limits {
             limits(Subject::Profile(p.id), l, &mut f);
         }
-        caps(
-            Subject::Profile(p.id),
-            p.budget.max_connections,
-            p.budget.max_in_flight,
-            &mut f,
-        );
+        caps(Subject::Profile(p.id), &p.budget, &mut f);
         if let Some(k) = &p.keep_alive {
             keep_alive(Subject::Profile(p.id), k, &mut f);
         }
@@ -424,8 +420,11 @@ fn ingress_needs_http(l: &ListenerSpec, profiles: &[Profile], f: &mut Findings) 
     }
 }
 
-fn caps(subject: Subject, connections: Option<u32>, in_flight: Option<u32>, f: &mut Findings) {
-    if connections == Some(0) || in_flight == Some(0) {
+fn caps(subject: Subject, budget: &Budget, f: &mut Findings) {
+    let zero = budget.max_connections == Some(0)
+        || budget.max_in_flight == Some(0)
+        || budget.dedicated == Some(0);
+    if zero {
         f.error(
             RuleId::ZeroCap,
             subject,
@@ -607,6 +606,22 @@ fn reserves(d: &Draft<'_>, f: &mut Findings) {
             "lower the reserves until they sum to 100 or less",
         );
     }
+    let kept: u32 = d
+        .profiles
+        .iter()
+        .filter_map(|p| p.budget.dedicated)
+        .map(u32::from)
+        .sum();
+    let (soft, _, _) = crate::server::connection_caps(d.limits, d.workers);
+    let others = d.profiles.iter().any(|p| p.budget.dedicated.is_none());
+    if kept > soft || (kept == soft && others) {
+        f.error(
+            RuleId::ReserveOverflow,
+            Subject::Server,
+            "the dedicated workers leave no connection for the other profiles",
+            "lower dedicated_workers or raise max_connections",
+        );
+    }
 }
 
 fn catch_panics(d: &Draft<'_>, f: &mut Findings) {
@@ -658,6 +673,34 @@ mod tests {
         ListenerSpec::tcp(name, addr).ingress(Ingress::Proxy(ProxySource::forwarded_for(
             TrustedProxies::parse(trusted).unwrap(),
         )))
+    }
+
+    #[test]
+    fn test_dedicated_workers_leave_room_for_the_rest() {
+        let listener = [ListenerSpec::tcp("web", "127.0.0.1:0")];
+        let check_with = |dedicated| {
+            let limits = Limits::new().max_connections(4);
+            let profiles = [
+                Profile::new(ProfileId(0)),
+                Profile::new(ProfileId(1)).budget(Budget::new().dedicated_workers(dedicated)),
+            ];
+            let f = check(&Draft {
+                listeners: &listener,
+                profiles: &profiles,
+                limits: &limits,
+                keep_alive: &KeepAlive::new(),
+                workers: &Workers::auto(),
+                drain_deadline: Duration::from_secs(30),
+                has_control: false,
+                has_tls: false,
+                catch_panics: false,
+                reserved_percent: 0,
+            });
+            rules(&f)
+        };
+        assert!(check_with(3).is_empty());
+        assert_eq!(check_with(4), vec![RuleId::ReserveOverflow]);
+        assert_eq!(check_with(0), vec![RuleId::ZeroCap]);
     }
 
     #[test]

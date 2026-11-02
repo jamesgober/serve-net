@@ -185,6 +185,13 @@ pub enum HttpBody<'a> {
     Empty,
     /// The whole buffered body.
     Full(&'a [u8]),
+    /// One piece of a body read under `BodyPolicy::Stream`.
+    Chunk {
+        /// The bytes of this piece, possibly none.
+        bytes: &'a [u8],
+        /// Whether the body ends here.
+        last: bool,
+    },
 }
 
 impl<'a> HttpBody<'a> {
@@ -193,7 +200,7 @@ impl<'a> HttpBody<'a> {
     pub fn bytes(&self) -> &'a [u8] {
         match self {
             HttpBody::Empty => &[],
-            HttpBody::Full(b) => b,
+            HttpBody::Full(b) | HttpBody::Chunk { bytes: b, .. } => b,
         }
     }
 }
@@ -203,6 +210,8 @@ impl<'a> HttpBody<'a> {
 pub struct HttpRequest<'a> {
     head: HttpHead<'a>,
     body: &'a [u8],
+    /// For one piece of a streamed body: whether it is the last.
+    chunk: Option<bool>,
 }
 
 impl<'a> HttpRequest<'a> {
@@ -245,10 +254,13 @@ impl<'a> HttpRequest<'a> {
     /// The body.
     #[must_use]
     pub fn body(&self) -> HttpBody<'a> {
-        if self.body.is_empty() {
-            HttpBody::Empty
-        } else {
-            HttpBody::Full(self.body)
+        match self.chunk {
+            Some(last) => HttpBody::Chunk {
+                bytes: self.body,
+                last,
+            },
+            None if self.body.is_empty() => HttpBody::Empty,
+            None => HttpBody::Full(self.body),
         }
     }
 
@@ -282,6 +294,7 @@ impl DetachedRequest<HttpFamily> for OwnedRequest {
                 authority: self.authority.as_deref(),
             },
             body: &self.body,
+            chunk: None,
         });
     }
 }
@@ -471,9 +484,27 @@ pub struct HttpParts {
     close: bool,
     retry_after: Option<u64>,
     invalid: bool,
+    /// The service opened a streamed reply.
+    streaming: bool,
+    /// Bytes of a streamed reply in earlier parts.
+    sent: u64,
 }
 
 impl HttpParts {
+    /// Keeps the stream open and drops the part already encoded.
+    fn next_part(&mut self, wipe: bool) {
+        self.sent += self.body.len() as u64;
+        if wipe {
+            crate::engine::wipe_bytes(&mut self.values);
+            crate::engine::wipe_bytes(&mut self.body);
+        }
+        // The head left with the first part: fields set again go nowhere.
+        self.names.clear();
+        self.values.clear();
+        self.spans.clear();
+        self.body.clear();
+    }
+
     fn clear(&mut self, wipe: bool) {
         if wipe {
             crate::engine::wipe_bytes(&mut self.values);
@@ -488,6 +519,8 @@ impl HttpParts {
         self.close = false;
         self.retry_after = None;
         self.invalid = false;
+        self.streaming = false;
+        self.sent = 0;
     }
 }
 
@@ -512,7 +545,73 @@ impl fmt::Debug for HttpParts {
     }
 }
 
+/// A reply sent in parts; see [`HttpReply::stream`].
+#[derive(Debug)]
+pub struct ReplyStream<'a> {
+    parts: &'a mut HttpParts,
+}
+
+impl ReplyStream<'_> {
+    /// Adds bytes to this part. They are copied, and leave when `call` returns.
+    pub fn send(&mut self, bytes: &[u8]) -> &mut Self {
+        self.parts.body.extend_from_slice(bytes);
+        self
+    }
+
+    /// The bytes sent in earlier parts: where a service that keeps no state
+    /// of its own picks up.
+    #[must_use]
+    pub fn sent(&self) -> u64 {
+        self.parts.sent
+    }
+}
+
 impl Reply<HttpFamily> {
+    /// Sends the reply in parts with chunked encoding (close-delimited to an
+    /// HTTP/1.0 client), for bodies too large to hold or not yet known.
+    ///
+    /// Call it in every `call` of the reply and add the next part. Return
+    /// [`Outcome::More`] to be called again once the client has taken this
+    /// part, so a slow reader holds back the service and not memory; return
+    /// [`Outcome::Done`] with the last part. The status and fields go with
+    /// the first part, and each part passes `CheckpointAt::BeforeReply`.
+    ///
+    /// Once the head has left no refusal can follow it, so a panic, a denial,
+    /// a timeout, or a service error closes the connection abortively and
+    /// the client sees a truncated body. A streamed reply cannot be deferred
+    /// and stays on the worker: it does not run through `Offload`.
+    ///
+    /// Cost: one call and one copy per part, nothing per byte held back.
+    ///
+    /// ```
+    /// use serve_net::Outcome;
+    /// const BLOCK: &[u8] = &[b'x'; 4096];
+    ///
+    /// struct Download;
+    ///
+    /// impl serve_net::HttpService for Download {
+    ///     fn call(
+    ///         &self,
+    ///         _req: &serve_net::HttpRequest<'_>,
+    ///         _env: &serve_net::Envelope,
+    ///         reply: &mut serve_net::HttpReply,
+    ///     ) -> Outcome {
+    ///         reply.header("content-type", "application/octet-stream");
+    ///         let mut stream = reply.stream();
+    ///         stream.send(BLOCK);
+    ///         if stream.sent() + 4096 < 1 << 20 { Outcome::More } else { Outcome::Done }
+    ///     }
+    /// }
+    /// # let _ = Download;
+    /// ```
+    pub fn stream(&mut self) -> ReplyStream<'_> {
+        self.parts.streaming = true;
+        self.parts.body_static = None;
+        ReplyStream {
+            parts: &mut self.parts,
+        }
+    }
+
     /// Sets the status (default 200).
     pub fn status(&mut self, status: u16) -> &mut Self {
         self.parts.status = status;
@@ -705,7 +804,58 @@ impl Family for HttpFamily {
     }
 
     fn request<'a>(&self, head: HttpHead<'a>, body: &'a [u8]) -> HttpRequest<'a> {
-        HttpRequest { head, body }
+        HttpRequest {
+            head,
+            body,
+            chunk: None,
+        }
+    }
+
+    fn request_chunk<'a>(&self, head: HttpHead<'a>, body: &'a [u8], last: bool) -> HttpRequest<'a> {
+        HttpRequest {
+            head,
+            body,
+            chunk: Some(last),
+        }
+    }
+
+    fn reply_stream(&self, parts: &HttpParts) -> bool {
+        parts.streaming
+    }
+
+    fn respond_stream(
+        &self,
+        engine: &mut Http1,
+        parts: &mut HttpParts,
+        first: bool,
+        last: bool,
+        unix_secs: u64,
+        out: &mut OutBuf,
+    ) -> Result<u16, EngineError> {
+        let mut status = 0;
+        if first {
+            let (written, plan) = encode(engine, parts, true, unix_secs, out)?;
+            status = written;
+            if !matches!(plan, BodyPlan::Stream) {
+                // `HEAD`, or a status without a body: the head was the reply.
+                parts.streaming = false;
+                return Ok(status);
+            }
+        }
+        if !parts.body.is_empty() {
+            engine
+                .conn
+                .send_body(&parts.body, &mut out.bytes)
+                .map_err(engine_error)?;
+        }
+        if last {
+            engine.conn.end_body(&mut out.bytes).map_err(engine_error)?;
+        }
+        Ok(status)
+    }
+
+    fn next_stream_part(&self, parts: &mut HttpParts, wipe: bool) {
+        parts.next_part(wipe);
     }
 
     fn detach(&self, request: &HttpRequest<'_>) -> Option<Box<dyn DetachedRequest<Self>>> {
@@ -732,59 +882,70 @@ impl Family for HttpFamily {
         unix_secs: u64,
         out: &mut OutBuf,
     ) -> Result<u16, EngineError> {
-        if parts.invalid {
+        encode(engine, parts, false, unix_secs, out).map(|(status, _)| status)
+    }
+}
+
+/// Writes the reply's head, and its body unless `chunked`.
+fn encode(
+    engine: &mut Http1,
+    parts: &HttpParts,
+    chunked: bool,
+    unix_secs: u64,
+    out: &mut OutBuf,
+) -> Result<(u16, BodyPlan), EngineError> {
+    if parts.invalid {
+        return Err(EngineError {
+            kind: RefusalKind::Internal,
+            status: 500,
+        });
+    }
+    let status = if parts.status == 0 { 200 } else { parts.status };
+    let mut fields: [(&str, &[u8]); MAX_FIELDS + 1] = [("", &[]); MAX_FIELDS + 1];
+    let mut n = 0;
+    for &(ns, ne, vs, ve) in &parts.spans {
+        let Ok(name) = core::str::from_utf8(&parts.names[ns as usize..ne as usize]) else {
             return Err(EngineError {
                 kind: RefusalKind::Internal,
                 status: 500,
             });
-        }
-        let status = if parts.status == 0 { 200 } else { parts.status };
-        let mut fields: [(&str, &[u8]); MAX_FIELDS + 1] = [("", &[]); MAX_FIELDS + 1];
-        let mut n = 0;
-        for &(ns, ne, vs, ve) in &parts.spans {
-            let Ok(name) = core::str::from_utf8(&parts.names[ns as usize..ne as usize]) else {
-                return Err(EngineError {
-                    kind: RefusalKind::Internal,
-                    status: 500,
-                });
-            };
-            fields[n] = (name, &parts.values[vs as usize..ve as usize]);
-            n += 1;
-        }
-        let mut digits = [0u8; 20];
-        if let Some(secs) = parts.retry_after {
-            fields[n] = ("retry-after", format_secs(secs, &mut digits));
-            n += 1;
-        }
-        let body: &[u8] = match parts.body_static {
-            Some(b) => b,
-            None => &parts.body,
         };
-        let mut head = ResponseHeadRef::new(
-            status,
-            &fields[..n],
-            if body.is_empty() {
-                OutgoingBody::Empty
-            } else {
-                OutgoingBody::Full(body.len() as u64)
-            },
-        );
-        head.close = parts.close;
-        let date = engine.dates.update(unix_secs);
-        let start = out.len();
-        match engine.conn.write_head(&head, Some(date), out) {
-            Ok(BodyPlan::Raw) => {
+        fields[n] = (name, &parts.values[vs as usize..ve as usize]);
+        n += 1;
+    }
+    let mut digits = [0u8; 20];
+    if let Some(secs) = parts.retry_after {
+        fields[n] = ("retry-after", format_secs(secs, &mut digits));
+        n += 1;
+    }
+    let body: &[u8] = match parts.body_static {
+        Some(b) => b,
+        None => &parts.body,
+    };
+    let outgoing = if chunked {
+        OutgoingBody::Chunked
+    } else if body.is_empty() {
+        OutgoingBody::Empty
+    } else {
+        OutgoingBody::Full(body.len() as u64)
+    };
+    let mut head = ResponseHeadRef::new(status, &fields[..n], outgoing);
+    head.close = parts.close;
+    let date = engine.dates.update(unix_secs);
+    let start = out.len();
+    match engine.conn.write_head(&head, Some(date), out) {
+        Ok(plan) => {
+            if matches!(plan, BodyPlan::Raw) {
                 out.push(body);
-                Ok(status)
             }
-            Ok(_) => Ok(status),
-            Err(e) => {
-                out.bytes.truncate(start);
-                let mut err = engine_error(e);
-                err.kind = RefusalKind::Internal;
-                err.status = 500;
-                Err(err)
-            }
+            Ok((status, plan))
+        }
+        Err(e) => {
+            out.bytes.truncate(start);
+            let mut err = engine_error(e);
+            err.kind = RefusalKind::Internal;
+            err.status = 500;
+            Err(err)
         }
     }
 }

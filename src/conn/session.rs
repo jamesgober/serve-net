@@ -61,6 +61,16 @@ impl Cap {
         self.open.fetch_add(1, Ordering::AcqRel) >= self.limit.load(Ordering::Acquire)
     }
 
+    /// Takes a seat only if one is free.
+    fn try_take(&self) -> bool {
+        let limit = self.limit.load(Ordering::Acquire);
+        self.open
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
+                (open < limit).then_some(open + 1)
+            })
+            .is_ok()
+    }
+
     fn give_back(&self) {
         self.open.fetch_sub(1, Ordering::AcqRel);
     }
@@ -90,15 +100,28 @@ struct Seat {
 }
 
 impl Seat {
-    fn take(global: &Arc<Cap>, listener: &Arc<Cap>, profile: Option<&Arc<Cap>>) -> (Seat, bool) {
-        let mut over = global.take();
+    fn take(
+        global: &Arc<Cap>,
+        dedicated: Option<&Arc<Cap>>,
+        listener: &Arc<Cap>,
+        profile: Option<&Arc<Cap>>,
+    ) -> (Seat, bool) {
+        // A profile's own seats first; they do not count against the others.
+        let mut over = false;
+        let pool = match dedicated {
+            Some(own) if own.try_take() => own,
+            _ => {
+                over = global.take();
+                global
+            }
+        };
         over |= listener.take();
         if let Some(c) = profile {
             over |= c.take();
         }
         let seat = Seat {
             caps: [
-                Some(Arc::clone(global)),
+                Some(Arc::clone(pool)),
                 Some(Arc::clone(listener)),
                 profile.cloned(),
             ],
@@ -350,8 +373,10 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> Factory<F, S, H> {
                 runtime.declared_scheme
             });
         }
-        let profile_cap = tables.profile_caps.get(usize::from(runtime.profile.0));
-        let (seat, over_cap) = Seat::take(&self.rt.global, &runtime.cap, profile_cap);
+        let profile = usize::from(runtime.profile.0);
+        let profile_cap = tables.profile_caps.get(profile);
+        let dedicated = tables.dedicated.get(profile).and_then(Option::as_ref);
+        let (seat, over_cap) = Seat::take(&self.rt.global, dedicated, &runtime.cap, profile_cap);
         if over_cap {
             self.shared
                 .observer

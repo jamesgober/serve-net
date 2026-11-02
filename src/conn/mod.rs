@@ -122,6 +122,8 @@ pub(crate) struct Tables {
     /// By net-io listener id; a removed listener leaves `None`.
     pub(crate) listeners: Vec<Option<ListenerRuntime>>,
     pub(crate) profile_caps: Vec<Arc<session::Cap>>,
+    /// Seats kept for a profile (`Budget::dedicated_workers`).
+    pub(crate) dedicated: Vec<Option<Arc<session::Cap>>>,
 }
 
 /// A Unix listener's peer rule.
@@ -209,6 +211,8 @@ enum State {
     AwaitHead,
     /// Admitted; reading the body under its policy.
     ReadBody,
+    /// The head of a streamed reply left; the service is called for each part.
+    Streaming,
     /// Waiting for a deferred reply.
     Parked { generation: u64, until: Instant },
     /// The reply is being handed to the transport; then the next request.
@@ -271,6 +275,13 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     generation: u64,
     end: Option<EndReason>,
     closing_after_write: bool,
+    /// The piece of a streamed body this dispatch hands over: whether it is
+    /// the last.
+    chunk: Option<bool>,
+    /// A streamed body has more to come.
+    body_open: bool,
+    /// A streamed reply's head has left.
+    reply_stream: bool,
     first_byte: Option<Instant>,
     /// Reads that fed the current head so far.
     head_reads: u16,
@@ -367,6 +378,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             generation: 0,
             end: None,
             closing_after_write: false,
+            chunk: None,
+            body_open: false,
+            reply_stream: false,
             first_byte: None,
             head_reads: 0,
             wipe,
@@ -486,7 +500,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             State::Parked { until, .. } => return (0, Step::Park { until }),
             State::Closed => return (input.len(), Step::Close),
             State::Closing => return (input.len(), self.flush(io)),
-            State::Writing => {
+            State::Writing | State::Streaming => {
                 let step = self.flush(io);
                 if step != Step::Read {
                     return (0, step);
@@ -510,7 +524,10 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             return Step::Close;
         }
         self.engine.feed_eof();
-        if matches!(self.state, State::Closing | State::Writing) {
+        if matches!(
+            self.state,
+            State::Closing | State::Writing | State::Streaming
+        ) {
             self.closing_after_write = true;
             return self.flush(io);
         }
@@ -519,6 +536,10 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
 
     /// All pending output was flushed.
     pub(crate) fn on_writable<I: Io>(&mut self, io: &mut I) -> Step {
+        if self.state == State::Streaming && self.out_sent >= self.out.len() && !self.body_open {
+            // The client took the last part: the service makes the next.
+            return self.dispatch(io);
+        }
         let step = self.flush(io);
         if step == Step::Read && matches!(self.state, State::AwaitHead | State::ReadBody) {
             // Pipelined input may already sit inside the engine; input still
@@ -703,6 +724,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             State::Closed => Step::Close,
             State::Closing | State::Writing if self.out_sent < self.out.len() => Step::Write,
             State::Closing => Step::Close,
+            State::Streaming => Step::Write,
             _ => Step::Read,
         }
     }
@@ -726,6 +748,14 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 self.state = State::Closed;
                 Step::Close
             }
+            State::Streaming if self.body_open => {
+                self.state = State::ReadBody;
+                io.set_phase(Phase::Receiving);
+                io.set_exchange_deadline(Some(self.env.deadline));
+                Step::Read
+            }
+            // A step of its own, so a long reply never recurses.
+            State::Streaming => Step::Write,
             State::Writing => {
                 // The whole reply is with the transport: the request is done.
                 self.finish_request(RequestEnd::Replied);
@@ -858,6 +888,15 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                                         None
                                     }
                                 }
+                                BodyPolicy::Stream if self.state == State::ReadBody => {
+                                    if self.wipe {
+                                        crate::engine::wipe_bytes(&mut self.body);
+                                    }
+                                    self.body.clear();
+                                    self.body.extend_from_slice(bytes);
+                                    Some(self.stream_piece(io, false))
+                                }
+                                BodyPolicy::Stream => None,
                             }
                         }
                         None => None,
@@ -865,7 +904,13 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 }
                 EngineEvent::BodyEnd => {
                     if self.request.is_some() && self.state == State::ReadBody {
-                        Some(self.dispatch(io))
+                        if self.body_open {
+                            self.body_open = false;
+                            self.clear_body();
+                            Some(self.stream_piece(io, true))
+                        } else {
+                            Some(self.dispatch(io))
+                        }
                     } else {
                         None
                     }
@@ -1070,6 +1115,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             let _ = self.flush_partial(io);
         }
         self.body.clear();
+        self.body_open = policy == BodyPolicy::Stream;
         self.state = State::ReadBody;
         io.set_phase(Phase::Receiving);
         io.set_exchange_deadline(Some(self.env.deadline));
@@ -1123,7 +1169,19 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             generation: self.generation,
         });
         self.reply.deferred = false;
-        shared.family.clear_parts(&mut self.reply.parts, self.wipe);
+        if self.reply_stream {
+            shared
+                .family
+                .next_stream_part(&mut self.reply.parts, self.wipe);
+        } else {
+            shared.family.clear_parts(&mut self.reply.parts, self.wipe);
+        }
+        // Streaming stays on the worker: its calls share the connection's state.
+        let job = if self.chunk.is_some() || self.reply_stream {
+            self.reply.job.take()
+        } else {
+            None
+        };
         let mut panicked = false;
         let outcome = {
             let tables = Arc::clone(&self.tables);
@@ -1146,7 +1204,10 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                     Err(_) => None,
                     Ok((head, _)) => {
                         let body: &[u8] = if discard { &[] } else { &self.body };
-                        let request = shared.family.request(head, body);
+                        let request = match self.chunk {
+                            Some(last) => shared.family.request_chunk(head, body, last),
+                            None => shared.family.request(head, body),
+                        };
                         let started = Instant::now();
                         let worker = self.env.worker.get();
                         shared.counters.in_call(worker, true);
@@ -1175,6 +1236,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 },
             }
         };
+        if job.is_some() {
+            self.reply.job = job;
+        }
         if panicked {
             self.reply.link = None;
             shared
@@ -1222,7 +1286,26 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 .observer
                 .service_error(&self.env, "lane set after head");
         }
+        let mid_body = self.chunk == Some(false);
         if self.reply.deferred {
+            if self.reply_stream {
+                // A reply already on the wire cannot wait for a token.
+                shared
+                    .observer
+                    .service_error(&self.env, "a streamed reply was deferred");
+                self.cancel_deferred();
+                self.end = Some(EndReason::ServiceClosed);
+                return self.refuse(
+                    io,
+                    RefusalKind::Internal,
+                    500,
+                    None,
+                    RequestEnd::Refused(RefusalKind::Internal),
+                );
+            }
+            if mid_body {
+                self.drop_rest_of_body();
+            }
             if outcome != Outcome::Deferred {
                 shared
                     .observer
@@ -1241,6 +1324,28 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             }
             return Step::Park { until };
         }
+        if outcome == Outcome::More {
+            if shared.family.reply_stream(&self.reply.parts) {
+                return self.send_part(io, outcome);
+            }
+            if mid_body {
+                return Step::Read;
+            }
+            shared
+                .observer
+                .service_error(&self.env, "More returned with nothing left to wait for");
+            self.end = Some(EndReason::ServiceClosed);
+            return self.refuse(
+                io,
+                RefusalKind::Internal,
+                500,
+                None,
+                RequestEnd::Refused(RefusalKind::Internal),
+            );
+        }
+        if mid_body {
+            self.drop_rest_of_body();
+        }
         if outcome == Outcome::Deferred {
             shared
                 .observer
@@ -1254,8 +1359,82 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 RequestEnd::Refused(RefusalKind::Internal),
             );
         }
-        self.state = State::Writing;
-        self.respond(io, outcome)
+        self.send_part(io, outcome)
+    }
+
+    /// One piece of a streamed body for the service.
+    fn stream_piece<I: Io>(&mut self, io: &mut I, last: bool) -> Step {
+        self.chunk = Some(last);
+        let step = self.dispatch(io);
+        self.chunk = None;
+        step
+    }
+
+    /// The service answered before the body ended: what is left is not read,
+    /// so the connection closes after the reply.
+    fn drop_rest_of_body(&mut self) {
+        self.body_open = false;
+        if let Some(r) = self.request.as_mut() {
+            r.discard_over = true;
+        }
+    }
+
+    fn clear_body(&mut self) {
+        if self.wipe {
+            crate::engine::wipe_bytes(&mut self.body);
+        }
+        self.body.clear();
+    }
+
+    /// Encodes what the service answered: a whole reply or the head of a
+    /// stream through `respond`, a later part of a stream here.
+    fn send_part<I: Io>(&mut self, io: &mut I, outcome: Outcome) -> Step {
+        if !self.reply_stream {
+            self.state = State::Writing;
+            return self.respond(io, outcome);
+        }
+        let shared = Arc::clone(&self.shared);
+        match shared
+            .checkpoint
+            .check(&self.env, CheckpointAt::BeforeReply)
+        {
+            Verdict::Pass => {}
+            Verdict::Deny { status } => {
+                self.end = Some(EndReason::Denied);
+                return self.refuse(io, RefusalKind::Denied, status, None, RequestEnd::Denied);
+            }
+            Verdict::Kill => return self.kill(),
+        }
+        let last = outcome != Outcome::More;
+        let before = self.out.len();
+        if let Err(e) = shared.family.respond_stream(
+            &mut self.engine,
+            &mut self.reply.parts,
+            false,
+            last,
+            0,
+            &mut self.out,
+        ) {
+            shared
+                .observer
+                .service_error(&self.env, "a reply part could not be encoded");
+            self.end = Some(EndReason::ServiceClosed);
+            return self.refuse(io, e.kind, e.status, None, RequestEnd::Refused(e.kind));
+        }
+        let written = (self.out.len() - before) as u64;
+        if let Some(r) = self.request.as_mut() {
+            r.bytes_out = r.bytes_out.saturating_add(written);
+        }
+        if last {
+            self.reply_stream = false;
+            self.state = State::Writing;
+            if outcome == Outcome::Close {
+                self.engine.close_after_reply();
+                self.closing_after_write = true;
+                self.end.get_or_insert(EndReason::ServiceClosed);
+            }
+        }
+        self.flush(io)
     }
 
     fn slot_has_result(&self) -> bool {
@@ -1322,10 +1501,23 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             });
         }
         let unix = self.unix_secs(now);
-        match shared
-            .family
-            .respond(&mut self.engine, &mut self.reply.parts, unix, &mut self.out)
-        {
+        let streamed = shared.family.reply_stream(&self.reply.parts);
+        let last = outcome != Outcome::More;
+        let encoded = if streamed {
+            shared.family.respond_stream(
+                &mut self.engine,
+                &mut self.reply.parts,
+                true,
+                last,
+                unix,
+                &mut self.out,
+            )
+        } else {
+            shared
+                .family
+                .respond(&mut self.engine, &mut self.reply.parts, unix, &mut self.out)
+        };
+        match encoded {
             Ok(status) => {
                 let n = self.out.len() as u64;
                 if let Some(r) = self.request.as_mut() {
@@ -1343,7 +1535,12 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         }
         close |= !self.engine.keep_alive();
         self.closing_after_write = close;
-        self.state = State::Writing;
+        self.reply_stream = !last && shared.family.reply_stream(&self.reply.parts);
+        self.state = if self.reply_stream {
+            State::Streaming
+        } else {
+            State::Writing
+        };
         io.set_exchange_deadline(None);
         io.begin_reply();
         self.flush(io)
@@ -1358,6 +1555,14 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         retry_after: Option<Duration>,
         end: RequestEnd,
     ) -> Step {
+        if self.reply_stream {
+            // The head is on the wire: no refusal can follow it. An abortive
+            // close tells the client the body is cut short.
+            self.reply_stream = false;
+            self.finish_request(end);
+            self.state = State::Closed;
+            return Step::Abort;
+        }
         if let Some(r) = self.request.as_mut() {
             r.status = Some(if (400..=599).contains(&status) {
                 status

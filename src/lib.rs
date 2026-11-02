@@ -77,7 +77,7 @@ pub use hooks::{
 #[cfg(feature = "http1")]
 pub use http::{
     DetachedHead, Fields, Handler, HttpBody, HttpFamily, HttpHead, HttpParts, HttpReply,
-    HttpRequest, HttpService, handler, http, http_behind_proxy,
+    HttpRequest, HttpService, ReplyStream, handler, http, http_behind_proxy,
 };
 #[cfg(feature = "http1")]
 pub use http_net::{Method, Version};

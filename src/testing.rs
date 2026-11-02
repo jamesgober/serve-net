@@ -459,6 +459,7 @@ where
         control: Arc::new(crate::running::Merged::new(hooks.control)),
         tables: Arc::new(crate::snapshot::Snapshot::new(crate::conn::Tables {
             profile_caps: vec![crate::conn::session::Cap::new(None)],
+            dedicated: vec![None],
             profiles,
             listeners: vec![Some(listener)],
         })),
