@@ -749,7 +749,7 @@ pub struct ReloadSummary { pub added: Vec<String>, pub removed: Vec<String>, pub
 
 `ServerConfig` is plain data, so a program can build it from its own configuration format and pass the same value at start-up (`ServerBuilder::config`) and at reload.
 
-`reload` validates `next` with every rule (nothing changes on failure); diffs listeners by name (a changed address or source is a removal plus an addition; changed ingress, trust, profile, or limits apply in place); binds every added listener with its door closed (on failure only the new listeners are closed and nothing changes); calls `Notify::reloading`; publishes the new profile table, per-listener ingress and trust, and limits through [snapshots](#snapshots); opens the door on added listeners; closes the door on removed listeners and drains their connections with the drain deadline; calls `Notify::ready()` and `Observer::reloaded`. Connection-level limits apply to connections accepted after the swap; request-level limits to requests whose head completes after it; work in flight keeps the table it started with. Reloads are serialized: a reload while another runs waits for it.
+`reload` validates `next` with every rule (nothing changes on failure); diffs listeners by name (a changed address or source is a removal plus an addition; changed ingress, trust, profile, or limits apply in place); binds every added listener with its door closed (on failure only the new listeners are closed and nothing changes); calls `Notify::reloading`; publishes the new profile table, per-listener ingress and trust, and limits through [snapshots](#snapshots); opens the door on added listeners; closes the door on removed listeners and drains their connections with the drain deadline; calls `Notify::ready()` and `Observer::reloaded`. Connection-level limits apply to connections accepted after the swap; request-level limits to requests whose head completes after it; work in flight keeps the table it started with. What net-io fixes at bind (PROXY trust, TLS) cannot change in place and is refused with `ReloadListener`: add the listener under a new name and remove the old one. `InFlightCap` budgets keep their start-up values until a restart. Reloads are serialized: a reload while another runs waits for it.
 
 | Grade | Tier | Version | Cost |
 |---|---|---|---|
@@ -2295,6 +2295,7 @@ impl RuleId { pub const fn as_str(self) -> &'static str; }   // stable snake_cas
 | `ZeroCap` | a connection or in-flight cap of 0 | none |
 | `DuplicateBind` | two listeners on one address or path | none |
 | `DriverUnavailable`, `ReloadWorkers` | a driver this build or platform lacks; a reload that changes `Workers` | restart instead |
+| `ReloadListener` | a reload that changes PROXY trust or TLS on a listener that keeps its socket (`0.4.0`) | a new listener name, or restart |
 | `DrainRange` | a drain deadline of 0 or above 1 h | none |
 | `AlpnWithoutTls`, `TlsOnFastCgi`, `TlsWithoutAcceptor` | ALPN without TLS; TLS on FastCGI; TLS with no acceptor | none |
 | `SchemeTrustWithoutSource` | `trust_scheme` or `trust_host` where no source can carry them | none |

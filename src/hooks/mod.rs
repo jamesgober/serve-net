@@ -116,6 +116,10 @@ pub trait Observer: Send + Sync + 'static {
     fn drain_started(&self, open_connections: u32) {}
     /// A drain finished.
     fn drain_finished(&self, report: &crate::running::DrainReport) {}
+    /// A reload applied.
+    fn reloaded(&self, summary: &crate::reload::ReloadSummary) {}
+    /// A reload was refused; nothing changed.
+    fn reload_refused(&self, errors: &crate::error::ConfigErrors) {}
     /// The service manager could not be told about a state change.
     fn notify_failed(&self, error: &std::io::Error) {}
     /// A listener runs with a public-bind exception.

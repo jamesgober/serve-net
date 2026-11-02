@@ -49,6 +49,7 @@ mod http;
 mod loom_tests;
 mod net;
 mod notify;
+mod reload;
 mod reply;
 mod running;
 mod server;
@@ -85,6 +86,7 @@ pub use net::{
     WorkerId,
 };
 pub use notify::{NoNotify, Notify, SystemdNotify};
+pub use reload::{ReloadSummary, ServerConfig};
 pub use reply::{CompleteError, Reply, ReplyToken};
 pub use running::{Bound, DrainHandle, DrainReport, Running};
 pub use server::{Built, Server, ServerBuilder};

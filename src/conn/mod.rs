@@ -173,6 +173,12 @@ impl<F: Family, S: Service<F>, H: Hooks> crate::notify::ServerEvents for Shared<
     fn drain_finished(&self, report: &crate::running::DrainReport) {
         self.observer.drain_finished(report);
     }
+    fn reloaded(&self, summary: &crate::reload::ReloadSummary) {
+        self.observer.reloaded(summary);
+    }
+    fn reload_refused(&self, errors: &crate::error::ConfigErrors) {
+        self.observer.reload_refused(errors);
+    }
     fn notify_failed(&self, error: &std::io::Error) {
         self.observer.notify_failed(error);
     }
@@ -224,6 +230,8 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     shared: Arc<Shared<F, S, H>>,
     tables: Arc<Tables>,
     tables_version: u64,
+    /// A reload reached this connection.
+    tables_changed: bool,
     listener: usize,
     connection: ConnectionId,
     engine: F::Engine,
@@ -315,6 +323,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             shared,
             tables,
             tables_version,
+            tables_changed: false,
             listener,
             connection,
             engine,
@@ -369,6 +378,13 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             .saturating_add(now.saturating_duration_since(self.clock_base.0).as_secs())
     }
 
+    fn shared_listener_behind(&self) -> bool {
+        matches!(
+            self.tables.listeners.get(self.listener),
+            Some(Some(l)) if l.proxy.is_some()
+        )
+    }
+
     /// Takes the newest tables, at a request head: one load when nothing
     /// changed. A connection whose listener was removed keeps the tables it
     /// has until it ends.
@@ -379,6 +395,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             self.tables_version = version;
             if matches!(next.listeners.get(self.listener), Some(Some(_))) {
                 self.tables = next;
+                self.tables_changed = true;
             }
         }
     }
@@ -1197,6 +1214,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let pressured = pressure >= PRESSURE_CLOSE;
         io.set_idle_timeout(if pressure >= PRESSURE_SHORTEN {
             Some(k.under_pressure)
+        } else if self.tables_changed {
+            // net-io keeps the listener's idle timeout from bind; a reload's
+            // value reaches it per connection.
+            let behind = self.shared_listener_behind();
+            Some(k.idle_for(behind))
         } else {
             None
         });

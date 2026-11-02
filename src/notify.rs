@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::error::ConfigErrors;
+use crate::reload::ReloadSummary;
 use crate::running::DrainReport;
 
 /// Readiness for a service manager or a supervisor. Every method has an
@@ -45,6 +47,8 @@ impl Notify for NoNotify {}
 pub(crate) trait ServerEvents: Send + Sync {
     fn drain_started(&self, open_connections: u32);
     fn drain_finished(&self, report: &DrainReport);
+    fn reloaded(&self, summary: &ReloadSummary);
+    fn reload_refused(&self, errors: &ConfigErrors);
     fn notify_failed(&self, error: &io::Error);
 }
 
@@ -94,6 +98,21 @@ impl Notifier {
         if deadline > Duration::from_secs(5) {
             self.call(|n| n.extend_timeout(deadline));
         }
+    }
+
+    /// A reload is about to swap the tables.
+    pub(crate) fn reloading(&self, monotonic_usec: u64) {
+        self.call(|n| n.reloading(monotonic_usec));
+    }
+
+    /// A reload applied: the service is ready again.
+    pub(crate) fn reloaded(&self, summary: &ReloadSummary) {
+        self.events.reloaded(summary);
+        self.call(|n| n.ready());
+    }
+
+    pub(crate) fn reload_refused(&self, errors: &ConfigErrors) {
+        self.events.reload_refused(errors);
     }
 
     pub(crate) fn is_failing(&self) -> bool {

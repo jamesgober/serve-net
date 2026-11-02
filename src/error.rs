@@ -59,6 +59,8 @@ pub enum RuleId {
     DriverUnavailable,
     /// A reload that changes the workers.
     ReloadWorkers,
+    /// A reload that changes what net-io fixed at bind: PROXY trust or TLS.
+    ReloadListener,
     /// A drain deadline of 0 or above 1 h.
     DrainRange,
     /// ALPN engine choice on a listener without TLS.
@@ -122,6 +124,7 @@ impl RuleId {
             RuleId::DuplicateBind => "duplicate_bind",
             RuleId::DriverUnavailable => "driver_unavailable",
             RuleId::ReloadWorkers => "reload_workers",
+            RuleId::ReloadListener => "reload_listener",
             RuleId::DrainRange => "drain_range",
             RuleId::AlpnWithoutTls => "alpn_without_tls",
             RuleId::TlsOnFastCgi => "tls_on_fastcgi",
@@ -343,6 +346,15 @@ pub enum ServeError {
     },
     /// The operation needs a server that is not draining.
     Draining,
+    /// A reload's configuration is invalid; nothing changed.
+    Reload(ConfigErrors),
+    /// A listener added by a reload could not be bound; nothing changed.
+    ReloadBind {
+        /// The listener's name.
+        listener: String,
+        /// Why.
+        source: net_io::NetError,
+    },
 }
 
 impl fmt::Display for ServeError {
@@ -362,6 +374,15 @@ impl fmt::Display for ServeError {
             ServeError::Draining => {
                 f.write_str("the server is draining; start a new server instead")
             }
+            ServeError::Reload(errors) => {
+                write!(f, "the reload changed nothing: {errors}")
+            }
+            ServeError::ReloadBind { listener, source } => {
+                write!(
+                    f,
+                    "the reload changed nothing: listener `{listener}` could not be bound: {source}"
+                )
+            }
         }
     }
 }
@@ -369,8 +390,10 @@ impl fmt::Display for ServeError {
 impl std::error::Error for ServeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ServeError::Config(errors) => Some(errors),
-            ServeError::Bind { source, .. } | ServeError::Start(source) => Some(source),
+            ServeError::Config(errors) | ServeError::Reload(errors) => Some(errors),
+            ServeError::Bind { source, .. }
+            | ServeError::Start(source)
+            | ServeError::ReloadBind { source, .. } => Some(source),
             ServeError::Inherited { .. } | ServeError::HandOff { .. } | ServeError::Draining => {
                 None
             }
