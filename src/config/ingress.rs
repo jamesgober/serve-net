@@ -17,6 +17,9 @@ pub enum Ingress {
     /// Clients connect to this listener themselves.
     #[default]
     Direct,
+    /// The same over TLS, through the acceptor given to
+    /// `ServerBuilder::tls`; the scheme is `https`.
+    DirectTls,
     /// Behind a reverse proxy or a load balancer.
     Proxy(ProxySource),
     /// Over a Unix socket: peers must pass `UnixPeerTrust`; with `None` the
@@ -30,7 +33,7 @@ impl Ingress {
     pub(crate) fn proxy(&self) -> Option<&ProxySource> {
         match self {
             Ingress::Proxy(p) | Ingress::Unix(_, Some(p)) => Some(p),
-            Ingress::Direct | Ingress::Unix(_, None) => None,
+            Ingress::Direct | Ingress::DirectTls | Ingress::Unix(_, None) => None,
         }
     }
 

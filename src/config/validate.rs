@@ -24,6 +24,7 @@ pub(crate) struct Draft<'a> {
     pub(crate) drain_deadline: Duration,
     /// Whether the owner gave a control line (lockdown can happen).
     pub(crate) has_control: bool,
+    pub(crate) has_tls: bool,
 }
 
 /// Errors and warnings found.
@@ -56,6 +57,7 @@ pub(crate) fn check(d: &Draft<'_>) -> Findings {
     binds(d, &mut f);
     profiles(d, &mut f);
     for l in d.listeners {
+        tls(l, d, &mut f);
         public_bind(l, &mut f);
         unix(l, &mut f);
         trust(l, &mut f);
@@ -264,6 +266,30 @@ fn public_bind(l: &ListenerSpec, f: &mut Findings) {
                 "bind 127.0.0.1, a private address, or a Unix socket, or call allow_public_bind with the reason",
             );
         }
+    }
+}
+
+/// TLS needs an acceptor, and ALPN ids need TLS.
+fn tls(l: &ListenerSpec, d: &Draft<'_>, f: &mut Findings) {
+    let on_tls = matches!(l.ingress, Ingress::DirectTls);
+    if on_tls && !d.has_tls {
+        f.error(
+            RuleId::TlsWithoutAcceptor,
+            Subject::Listener(l.name.clone()),
+            "a TLS listener has no acceptor",
+            "give the server one with ServerBuilder::tls",
+        );
+    }
+    let alpn = d.profiles.iter().find(|p| p.id == l.profile).is_some_and(
+        |p| matches!(p.engine, crate::config::EngineChoice::Custom { alpn } if !alpn.is_empty()),
+    );
+    if alpn && !on_tls {
+        f.error(
+            RuleId::AlpnWithoutTls,
+            Subject::Listener(l.name.clone()),
+            "the profile offers ALPN ids on a listener without TLS",
+            "use Ingress::DirectTls, or a profile without ALPN ids",
+        );
     }
 }
 
@@ -593,6 +619,7 @@ mod tests {
             workers: &Workers::auto(),
             drain_deadline: Duration::from_secs(30),
             has_control: false,
+            has_tls: false,
         })
     }
 
@@ -815,6 +842,7 @@ mod tests {
                 workers: &Workers::auto(),
                 drain_deadline: Duration::from_secs(30),
                 has_control: false,
+                has_tls: false,
             })
         };
         let f = d(Limits::new()
@@ -843,6 +871,7 @@ mod tests {
             workers: &Workers::blocking(0),
             drain_deadline: Duration::ZERO,
             has_control: true,
+            has_tls: false,
         });
         let r = rules(&f);
         assert!(r.contains(&RuleId::DeadlineOrder));
@@ -873,6 +902,7 @@ mod tests {
             workers: &Workers::auto(),
             drain_deadline: Duration::from_secs(30),
             has_control: false,
+            has_tls: false,
         });
         assert!(
             f.warnings

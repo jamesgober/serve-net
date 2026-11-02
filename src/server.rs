@@ -7,8 +7,8 @@ use crate::client::IngressKind;
 use crate::config::ProxyKind;
 use crate::config::validate::{self, Draft};
 use crate::config::{
-    KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId, ProfileTable, ProxySource,
-    Workers,
+    Ingress, KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId, ProfileTable,
+    ProxySource, Workers,
 };
 use crate::conn::session::{Factory, Runtime};
 use crate::conn::{ListenerRuntime, Shared, UnixRuntime};
@@ -47,6 +47,7 @@ impl Server {
                 drain_deadline: Duration::from_secs(30),
                 accept_failure_window: Duration::from_secs(30),
                 has_control: false,
+                has_tls: false,
             },
             hooks: DefaultHooks::default(),
         }
@@ -63,6 +64,7 @@ struct Config {
     drain_deadline: Duration,
     accept_failure_window: Duration,
     has_control: bool,
+    has_tls: bool,
 }
 
 /// Configuration and hooks; nothing is checked until [`build`](Self::build).
@@ -297,6 +299,38 @@ impl<A, D, K, O, G, E, C, T> ServerBuilder<HookSet<A, D, K, O, G, E, C, T>> {
         }
     }
 
+    /// The TLS acceptor for `Ingress::DirectTls` listeners (tls-net, or any
+    /// `net_io::TlsAcceptor`).
+    pub fn tls<T2: net_io::TlsAcceptor>(
+        mut self,
+        acceptor: T2,
+    ) -> ServerBuilder<HookSet<A, D, K, O, G, E, C, T2>> {
+        self.config.has_tls = true;
+        let HookSet {
+            admit,
+            dispatch,
+            checkpoint,
+            observer,
+            gate,
+            events,
+            control,
+            ..
+        } = self.hooks;
+        ServerBuilder {
+            config: self.config,
+            hooks: HookSet {
+                admit,
+                dispatch,
+                checkpoint,
+                observer,
+                gate,
+                events,
+                control,
+                tls: acceptor,
+            },
+        }
+    }
+
     /// The process-wide control line, shared with net-io.
     pub fn control<C2: ControlLine>(
         mut self,
@@ -346,6 +380,7 @@ impl<H: Hooks> ServerBuilder<H> {
             workers: &c.workers,
             drain_deadline: c.drain_deadline,
             has_control: c.has_control,
+            has_tls: c.has_tls,
         });
         if let Some(errors) = ConfigErrors::from_vec(findings.errors) {
             return Err(errors);
@@ -644,6 +679,9 @@ where
             }
             let own = own.build().map_err(ServeError::Start)?;
             let mut net_spec = net_spec.name(&spec.name).limits(own);
+            if matches!(spec.ingress, Ingress::DirectTls) {
+                net_spec = net_spec.tls(true);
+            }
             if let Some(ProxySource {
                 kind: ProxyKind::ProxyProtocol(versions),
                 trusted,
@@ -686,6 +724,7 @@ where
             .sessions(factory)
             .gate(hooks.gate)
             .events(events)
+            .tls(hooks.tls)
             .build()
             .map_err(|e| bind_error(&listeners, e))?;
         // SameUser: the uid this process runs as is the owner of the socket
@@ -705,6 +744,7 @@ where
             .map(|l| ListenerMeta {
                 ingress: match l.ingress.proxy().map(|p| p.kind) {
                     None if l.ingress.is_unix() => IngressKind::Unix,
+                    None if matches!(l.ingress, Ingress::DirectTls) => IngressKind::DirectTls,
                     None => IngressKind::Direct,
                     Some(ProxyKind::Headers(_)) => IngressKind::Forwarded,
                     Some(ProxyKind::ProxyProtocol(_)) => IngressKind::ProxyProtocol,
@@ -812,7 +852,7 @@ impl<H: Hooks> core::fmt::Debug for Built<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Ingress, ProxySource, RuleId, TrustedProxies};
+    use crate::{ProxySource, RuleId, TrustedProxies};
 
     /// Listening sockets, released by a throwaway net-io server.
     fn handles(n: usize) -> Vec<net_io::ListenerHandle> {
