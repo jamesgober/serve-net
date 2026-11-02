@@ -463,6 +463,7 @@ where
             listeners: vec![Some(listener)],
         })),
         counters: Arc::new(crate::stats::Counters::new(1)),
+        catch_panics: false,
     };
     (Arc::new(shared), copy)
 }

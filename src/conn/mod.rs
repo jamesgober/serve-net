@@ -16,6 +16,7 @@
 //! 5. A reply is handed to the transport whole before the next request is
 //!    processed.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -164,6 +165,8 @@ pub(crate) struct Shared<F: Family, S: Service<F>, H: Hooks> {
     pub(crate) control: Arc<crate::running::Merged<H::Control>>,
     pub(crate) tables: Arc<Snapshot<Tables>>,
     pub(crate) counters: Arc<Counters>,
+    /// Catch a panicking service (`catch_service_panics`).
+    pub(crate) catch_panics: bool,
 }
 
 impl<F: Family, S: Service<F>, H: Hooks> crate::notify::ServerEvents for Shared<F, S, H> {
@@ -1093,6 +1096,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         });
         self.reply.deferred = false;
         shared.family.clear_parts(&mut self.reply.parts, self.wipe);
+        let mut panicked = false;
         let outcome = {
             let tables = Arc::clone(&self.tables);
             let listener = tables.listeners.get(self.listener).and_then(Option::as_ref);
@@ -1118,12 +1122,17 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                         let started = Instant::now();
                         let worker = self.env.worker.get();
                         shared.counters.in_call(worker, true);
-                        let outcome = shared.dispatch.run(
-                            &shared.service,
-                            &request,
-                            &self.env,
-                            &mut self.reply,
-                        );
+                        let (env, reply) = (&self.env, &mut self.reply);
+                        let mut run = || shared.dispatch.run(&shared.service, &request, env, reply);
+                        let outcome = if shared.catch_panics {
+                            // The reply is cleared before the refusal is
+                            // written, so a half-built one never leaves.
+                            let caught = catch_unwind(AssertUnwindSafe(&mut run));
+                            panicked = caught.is_err();
+                            caught.unwrap_or(Outcome::Close)
+                        } else {
+                            run()
+                        };
                         shared.counters.in_call(worker, false);
                         if cfg!(debug_assertions)
                             && <S as Service<F>>::WORK == crate::service::WorkClass::Quick
@@ -1138,6 +1147,20 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 },
             }
         };
+        if panicked {
+            self.reply.link = None;
+            shared
+                .observer
+                .service_error(&self.env, "the service panicked");
+            self.end = Some(EndReason::ServicePanic);
+            return self.refuse(
+                io,
+                RefusalKind::Internal,
+                500,
+                None,
+                RequestEnd::ServicePanic,
+            );
+        }
         let Some(outcome) = outcome else {
             self.reply.link = None;
             return self.refuse(

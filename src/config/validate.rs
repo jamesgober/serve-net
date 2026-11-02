@@ -25,6 +25,7 @@ pub(crate) struct Draft<'a> {
     /// Whether the owner gave a control line (lockdown can happen).
     pub(crate) has_control: bool,
     pub(crate) has_tls: bool,
+    pub(crate) catch_panics: bool,
 }
 
 /// Errors and warnings found.
@@ -84,6 +85,7 @@ pub(crate) fn check(d: &Draft<'_>) -> Findings {
     workers(d.workers, &mut f);
     drain(d.drain_deadline, &mut f);
     lockdown(d, &mut f);
+    catch_panics(d, &mut f);
     f
 }
 
@@ -594,6 +596,16 @@ fn drain(deadline: Duration, f: &mut Findings) {
     }
 }
 
+fn catch_panics(d: &Draft<'_>, f: &mut Findings) {
+    if d.catch_panics && cfg!(panic = "abort") {
+        f.warn(
+            RuleId::CatchPanicsInAbortBuild,
+            Subject::Server,
+            "this build aborts on panic, so catch_service_panics catches nothing",
+        );
+    }
+}
+
 fn lockdown(d: &Draft<'_>, f: &mut Findings) {
     if d.has_control && !d.profiles.iter().any(|p| p.critical) {
         f.warn(
@@ -620,6 +632,7 @@ mod tests {
             drain_deadline: Duration::from_secs(30),
             has_control: false,
             has_tls: false,
+            catch_panics: false,
         })
     }
 
@@ -843,6 +856,7 @@ mod tests {
                 drain_deadline: Duration::from_secs(30),
                 has_control: false,
                 has_tls: false,
+                catch_panics: false,
             })
         };
         let f = d(Limits::new()
@@ -872,6 +886,7 @@ mod tests {
             drain_deadline: Duration::ZERO,
             has_control: true,
             has_tls: false,
+            catch_panics: false,
         });
         let r = rules(&f);
         assert!(r.contains(&RuleId::DeadlineOrder));
@@ -903,6 +918,7 @@ mod tests {
             drain_deadline: Duration::from_secs(30),
             has_control: false,
             has_tls: false,
+            catch_panics: false,
         });
         assert!(
             f.warnings

@@ -49,6 +49,53 @@ fn test_head_reads_counts_the_reads_of_a_head() {
     assert_eq!(reads.load(Ordering::Relaxed), 3);
 }
 
+struct Ends(Arc<std::sync::Mutex<Vec<serve_net::RequestEnd>>>);
+
+impl HttpService for Ends {
+    fn call(&self, req: &HttpRequest<'_>, _e: &Envelope, reply: &mut HttpReply) -> Outcome {
+        assert_ne!(req.path(), "/boom", "a service bug");
+        reply.text(200, "ok");
+        Outcome::Done
+    }
+    fn done(&self, _e: &Envelope, finished: &Finished) {
+        self.0.lock().unwrap().push(finished.end);
+    }
+}
+
+#[test]
+fn test_caught_service_panic_answers_500_and_the_server_lives() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    use serve_net::{ListenerSpec, RequestEnd, Server};
+    let ends = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .catch_service_panics(true)
+        .serve(Ends(Arc::clone(&ends)))
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let ask = |path: &str| {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            s,
+            "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut got = String::new();
+        let _ = s.read_to_string(&mut got);
+        got
+    };
+    assert!(ask("/boom").starts_with("HTTP/1.1 500"));
+    assert!(ask("/ok").starts_with("HTTP/1.1 200"));
+    let _ = server.drain(std::time::Duration::from_secs(2));
+    let ends = ends.lock().unwrap();
+    assert_eq!(ends[0], RequestEnd::ServicePanic);
+    assert_eq!(ends[1], RequestEnd::Replied);
+}
+
 #[cfg(unix)]
 mod restart {
     use std::io::{Read, Write};

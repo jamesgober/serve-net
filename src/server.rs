@@ -51,6 +51,7 @@ impl Server {
                 accept_failure_window: Duration::from_secs(30),
                 has_control: false,
                 has_tls: false,
+                catch_panics: false,
                 notify: Arc::new(crate::NoNotify),
                 transport: None,
                 clock: None,
@@ -71,6 +72,7 @@ struct Config {
     accept_failure_window: Duration,
     has_control: bool,
     has_tls: bool,
+    catch_panics: bool,
     notify: Arc<dyn Notify>,
     transport: Option<net_io::Limits>,
     clock: Option<Arc<dyn net_io::Clock>>,
@@ -117,6 +119,14 @@ impl<H> ServerBuilder<H> {
     /// The deadline `wait` uses when a drain is requested without one (default 30 s).
     pub fn drain_deadline(mut self, deadline: Duration) -> Self {
         self.config.drain_deadline = deadline;
+        self
+    }
+
+    /// Catches a panicking service: the 500 refusal, the connection closes,
+    /// `done` runs with `RequestEnd::ServicePanic`. Effective in
+    /// `panic = "unwind"` builds; `build` warns in an abort build.
+    pub fn catch_service_panics(mut self, on: bool) -> Self {
+        self.config.catch_panics = on;
         self
     }
 
@@ -422,6 +432,7 @@ impl<H: Hooks> ServerBuilder<H> {
             drain_deadline: c.drain_deadline,
             has_control: c.has_control,
             has_tls: c.has_tls,
+            catch_panics: c.catch_panics,
         });
         if let Some(errors) = ConfigErrors::from_vec(findings.errors) {
             return Err(errors);
@@ -444,6 +455,7 @@ impl<H: Hooks> ServerBuilder<H> {
             clock: c.clock,
             has_control: c.has_control,
             has_tls: c.has_tls,
+            catch_panics: c.catch_panics,
             warnings: findings.warnings,
             hooks: self.hooks,
         })
@@ -498,6 +510,7 @@ pub struct Built<H: Hooks = DefaultHooks> {
     pub(crate) clock: Option<Arc<dyn net_io::Clock>>,
     pub(crate) has_control: bool,
     pub(crate) has_tls: bool,
+    pub(crate) catch_panics: bool,
     pub(crate) warnings: Vec<ConfigWarning>,
     pub(crate) hooks: H,
 }
@@ -560,6 +573,7 @@ where
             clock,
             has_control,
             has_tls,
+            catch_panics,
             hooks,
             ..
         } = self;
@@ -675,6 +689,7 @@ where
             control: Arc::clone(&merged),
             tables: Arc::clone(&tables),
             counters: Arc::clone(&counters),
+            catch_panics,
         });
         for l in &listeners {
             if let Some(reason) = l.public_bind {

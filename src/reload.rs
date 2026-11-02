@@ -135,6 +135,7 @@ impl Reloader {
             drain_deadline,
             has_control: self.has_control,
             has_tls: self.has_tls,
+            catch_panics: false,
         });
         let mut errors = findings.errors;
         let (soft, hard, threads) = connection_caps(&limits, &workers);

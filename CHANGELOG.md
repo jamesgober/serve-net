@@ -11,6 +11,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- `ServerBuilder::catch_service_panics`: a caught panic answers 500, closes
+  the connection, and reports `RequestEnd::ServicePanic`.
+
 ### Changed
 
 - http-net 0.9.
