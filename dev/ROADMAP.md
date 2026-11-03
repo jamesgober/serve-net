@@ -16,8 +16,8 @@ A serve-net version is published only when every first-party crate it depends on
 | 0.2 | net-io 0.2 design lock (published 2026-10-23); http-net 0.6 (published) |
 | 0.3 | **net-io 0.3 published** (TCP, the blocking driver, sessions, completer, control line, events); http-net 0.6 |
 | 0.4 | net-io 0.4 (PROXY, Unix sockets, the TLS seam with ALPN, inherited and handed-off listeners, descriptor 0); fcgi-net 0.3; ws-net 0.2; tls-net for direct TLS; net-io runtime listener add and remove for reload |
-| 0.5 | net-io 0.5 (the reactor, Windows AF_UNIX) |
-| 0.6 | http-net 0.6 or later (reply reuse: done) |
+| 0.5 | net-io 0.5 (the reactor, Windows AF_UNIX): published 2026-11-02 |
+| 0.6 | http-net 0.6 or later (reply reuse: done); ws-net 0.2 (published); fcgi-net and tls-net for the items moved from 0.5 (D-078) |
 | 0.7 to 1.0 | net-io 0.7 or later (its hardening), so serve-net's soak runs on hardened transport |
 
 ## Reconciliation with the 0.1 roadmap (recorded 2026-10-23)
@@ -102,14 +102,26 @@ Exit: the ingress cases run for direct, PROXY v1 and v2, forwarded headers, and 
 - `docs/DEPLOYMENT.md`: Apache, nginx, HAProxy, Unix sockets, systemd, reload, the restart model.
 - Moved to 0.5.0 (D-066, a hard reason: the crates do not exist yet): FastCGI, WebSocket upgrades, `Http1OrH2ByAlpn`, threat tests T-19 and T-21, the `fastcgi_mapping` fuzz target, a TLS test with a real engine, a `Type=notify-reload` run under real systemd.
 
-## v0.5.0 - Feature complete
+## v0.5.0 - Reactor (DONE, 2026-11-03)
 Exit: on net-io's reactor, 10,000 idle keep-alive connections with bounded memory on Linux, macOS, and Windows; deferred replies through an `Offload` pool; every P0, P1, and P2 item of `docs/API.md` implemented and documented; `docs/PLATFORM-NOTES.md` written.
-- Waiting on crates that are scaffolds today (D-066): over fcgi-net, `fastcgi`, `FastCgiListen`, `FastCgiIngress`, `Ingress::FastCgi`, `engine::FastCgi`, `ListenerSpec::fastcgi_descriptor_zero`, T-19, the `fastcgi_mapping` fuzz target (`mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0); over ws-net, `HeadAction::Upgrade`, `UpgradeTarget`, `UpgradedConn`, `HttpService::upgraded`, `engine::WebSocket`, T-21; over tls-net, an end-to-end TLS test and `EngineChoice::Http1OrH2ByAlpn`. A `Type=notify-reload` unit reloading under load under real systemd.
-- API: `Budget::dedicated_workers`, `BodyPolicy::Stream`, `HttpBody::Chunk`, `HttpReply::stream`, `Workers::reactor`, `catch_service_panics`, `InFlightCap::reserve`, `Offload`, `OffloadPool`, `OffloadJob`, `WatchdogPinger`.
-- Threat tests T-25, T-27, T-37.
 
-## v0.6.0 - Optimisation
-Exit: NFR-1, NFR-2, NFR-3, NFR-5 met, or each gap recorded in `docs/PERFORMANCE.md` with its cause and the plan to close it before 1.0 (a missed 20% target blocks 1.0); `docs/PERFORMANCE.md` published.
+Released as "Reactor", not "Feature complete": the items over other crates moved to 0.6.0 (D-078). The rest of the exit is met.
+- [x] net-io 0.5's reactor (D-075): `Workers::reactor`, and `Workers::auto()` picks it; `max_deferred_per_worker` reaches its completion queue. CI runs the whole suite on both drivers.
+- [x] 10,000 idle keep-alive connections in CI on Linux, macOS, and Windows: 76 to 90 MiB, every connection answering afterwards (`tests/idle.rs`). Bounded, at about 9 KB each against NFR-3's 4 KiB, due at 0.6 (D-076).
+- [x] API done: `Budget::dedicated_workers` (blocking driver, D-074), `BodyPolicy::Stream`, `HttpBody::Chunk`, `HttpReply::stream`, `ReplyStream`, `Outcome::More` (D-073), `catch_service_panics`, `InFlightCap::reserve` (D-069), `Offload`, `OffloadPool`, `OffloadJob` (D-071), `WatchdogPinger` (D-068).
+- [x] Threat tests T-25, T-27, T-37.
+- [x] `docs/PLATFORM-NOTES.md`.
+- Moved to 0.6.0 (D-078): WebSocket upgrades, FastCGI, `Http1OrH2ByAlpn` with an end-to-end TLS test, a `Type=notify-reload` run under real systemd.
+- Carried, each in the register below: the drain workaround of D-072 until net-io fixes the accept race; `dedicated_workers` on the reactor is a connection seat, not a worker set of its own, because net-io 0.5 has none.
+- Open on Windows, named in the release notes: T-30. `tests/restart.rs` passes on a 24-core machine and fails on CI's small runners with connection resets and connects that time out, in net-io 0.5's in-process hand-off of one socket to two servers. Reported to net-io; the test stays Unix only until it passes there.
+
+## v0.6.0 - Optimisation, and the protocols moved from 0.5
+Exit: NFR-1, NFR-2, NFR-3, NFR-5 met, or each gap recorded in `docs/PERFORMANCE.md` with its cause and the plan to close it before 1.0 (a missed 20% target blocks 1.0); `docs/PERFORMANCE.md` published; every item moved from 0.5 done, or recorded here as waiting for a crate that is not on crates.io.
+- WebSocket upgrades over ws-net 0.2 (published): `HeadAction::Upgrade`, `UpgradeTarget`, `UpgradedConn`, `HttpService::upgraded`, `engine::WebSocket`, `WebSocketConn`, feature `ws`, T-21.
+- A `Type=notify-reload` unit reloading under load under real systemd, in CI on Linux.
+- When fcgi-net is published: FastCGI on Linux and macOS first (`fastcgi`, `FastCgiListen`, `FastCgiIngress`, `Ingress::FastCgi`, `engine::FastCgi`, `ListenerSpec::fastcgi_descriptor_zero`, T-19, the `fastcgi_mapping` fuzz target, `mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0). Windows waits for the decision on a Windows FastCGI deployment.
+- When tls-net is published: an end-to-end TLS test and `EngineChoice::Http1OrH2ByAlpn`.
+- The idle trim to NFR-3's 4 KiB (D-076) once net-io returns the output buffer after `on_timeout`.
 - Benchmarks against hyper with hyper-util, actix-web, may-minihttp, nginx, h2o, and Pingora (restart and idle memory only).
 - Idea I-3 (engine input without the copy) measured and decided; idea I-6 measured.
 
@@ -146,15 +158,21 @@ Exit: every item in the register below is closed or carried into `docs/STABILITY
 | Gate denials: a status outside 400 to 599 becomes 403 | D-050 | confirm with bouncer-io's codes |
 | The crate-level `allow(dead_code)` without the `http1` feature | 0.3 | gate the forwarded walk and the HTTP head context on the feature instead |
 | `Running` keeps its server in an `Option` and reaches it through `unreachable!()` after `drain` or `wait` took it | 0.3 | a shape with no unreachable path |
+| Idle memory is about 8.9 KB per connection against a 4 KiB target | D-076 | add the idle trim once net-io returns the output buffer after `on_timeout`; due at 0.6 (P-5) |
+| T-30 is not met on Windows: two servers sharing a socket lost requests on CI's runners | CI, 0.4 and 0.5; known issue in the 0.5.0 release notes | net-io to say whether two servers on one socket in one process is supported on Windows or `share_listeners` is the way; then run `tests/restart.rs` there. Closed in this pass at the latest |
+| `dedicated_workers` on the reactor keeps connection seats, not workers: a flood on another profile still shares the dedicated profile's worker threads | D-074, 0.5 | a worker set per profile from net-io (asked), or document the seat as the guarantee |
+| A drain settles accepts by watching counters (at most 150 ms), and a listener removed by reload can reset connections in the accept window | D-072 | drop the workaround when net-io fixes the race; reported to net-io |
+| An offload job copies the head and the body, and the copy outlives the worker's wipe | D-071 | measure the copy; hand the body over without one, and wipe the copy under a wiping profile |
+| A service that streams stays on the worker, and a slow generator on the reactor stalls that worker; a streamed reply cannot be deferred once its head has left | D-073 | decide with real use whether parts should go through a pool or a token |
+| `DetachedHead` keeps its own copy format while http-net now has `OwnedRequestHead` | D-071 | build one on the other if the public shape allows it |
+| `tests/loopback.rs` exhausts loopback ports next to a restart loop, and `Outcome::More` or a reserve under a real flood has no soak yet | 0.5 | cover in the 0.7 soak |
 | Two `impl InFlightCap` blocks (the index-based internals for tests) | 0.3 | fold into one |
 | serve-net handles no signals; every first program writes a stop channel | OD-8, hello-serve API friction | decide with the examples and a real deployment, as OD-8 planned for 0.9 |
 | Showing transport counters by close reason needed hand-built `CloseReason` values | hello-serve API friction | net-io 0.4 added `Stats::closes` and `Stats::refusals`; check serve-net's `Stats` reads as easily |
-| http-net is pinned at 0.6 while later versions exist | 0.3 | take the current http-net, with the allocation and benchmark tests as the check |
 | `InFlightCap` budgets (`max_in_flight`) keep their start-up values across a reload, and http-net's engine limits apply to new connections only | D-063 | give admission a reload path that costs nothing on the hot path (atomics sized at start), or document it as final |
 | `DetachedHead` makes one plain copy per detach; the API describes pooled buffers | D-065 | pool per worker (with `Offload`, 0.5), or correct the API |
 | net-io's PROXY listeners and TLS cannot change on a live listener | D-063 | fine as `ReloadListener`, or ask net-io for it if a deployment needs it |
 | The test suite needs `RUST_TEST_THREADS=4`: 256 threads per default server exhaust descriptors | 0.4 | the reactor removes the cause; confirm and drop the setting |
-| The zero-loss restart test runs on Linux and macOS only; on Windows two servers sharing a socket lost requests in CI | 0.4 | net-io's 0.5 promises Windows hand-off with zero refused: turn the test on there |
 | A failed `bind` closes inherited and handed-off sockets instead of releasing them to the owner | 0.4, D-059 | needs net-io to hand adopted sockets back when `build` fails (asked in the shared notes); then release them |
 | Anything else listed as "not yet" or "deferred" in this file, `dev/PLAN.md`, or `CHANGELOG.md` | all versions | sweep the documents for open wording before the exit |
 

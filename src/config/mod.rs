@@ -17,4 +17,5 @@ pub use limits::{KeepAlive, Limits};
 pub use listener::{ListenerSource, ListenerSpec, UnixMode};
 pub use profile::{Budget, EngineChoice, Profile, ProfileId, ProfileTable};
 pub(crate) use profile::{Compiled, DEFAULT_LANE};
+pub(crate) use workers::REACTOR_CONNECTIONS;
 pub use workers::Workers;

@@ -12,7 +12,9 @@ use crate::conn::{ListenerRuntime, Tables};
 use crate::error::{ConfigError, ConfigErrors, RuleId, ServeError, Subject};
 use crate::notify::Notifier;
 use crate::running::ListenerMeta;
-use crate::server::{connection_caps, file_owner, listener_meta, listener_runtime, net_listener};
+use crate::server::{
+    connection_caps, file_owner, listener_meta, listener_runtime, net_listener, shared_seats,
+};
 use crate::snapshot::Snapshot;
 
 /// A server's configuration as plain data, so a program can build it from
@@ -135,6 +137,8 @@ impl Reloader {
             drain_deadline,
             has_control: self.has_control,
             has_tls: self.has_tls,
+            catch_panics: false,
+            reserved_percent: 0,
         });
         let mut errors = findings.errors;
         let (soft, hard, threads) = connection_caps(&limits, &workers);
@@ -282,13 +286,31 @@ impl Reloader {
                 None => Cap::new(p.budget.max_connections),
             })
             .collect();
+        let dedicated = table
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let n = p.budget.dedicated.map(u32::from);
+                match old.dedicated.get(i).and_then(Option::as_ref) {
+                    Some(cap) => {
+                        // Seats in use stay taken even when the profile gave
+                        // its dedication up: a limit of 0 only stops new ones.
+                        cap.set_limit(Some(n.unwrap_or(0)));
+                        Some(Arc::clone(cap))
+                    }
+                    None => n.map(|n| Cap::new(Some(n))),
+                }
+            })
+            .collect();
+        let shared = shared_seats(soft, &table);
         let profile_count = u16::try_from(table.len()).unwrap_or(u16::MAX);
         self.tables.publish(Tables {
             profiles: table,
             listeners: listeners_table,
             profile_caps,
+            dedicated,
         });
-        self.rt.global.set_limit(Some(soft));
+        self.rt.global.set_limit(Some(shared));
 
         // Open the new doors, then close and drain what left.
         let opened = server.open_door();

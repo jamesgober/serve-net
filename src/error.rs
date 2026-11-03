@@ -95,6 +95,8 @@ pub enum RuleId {
     LockdownWithoutCritical,
     /// Warning: no listener.
     NoListeners,
+    /// `catch_service_panics` in a build where panics abort.
+    CatchPanicsInAbortBuild,
 }
 
 impl RuleId {
@@ -142,6 +144,7 @@ impl RuleId {
             RuleId::ShortIdleBehindProxy => "short_idle_behind_proxy",
             RuleId::LockdownWithoutCritical => "lockdown_without_critical",
             RuleId::NoListeners => "no_listeners",
+            RuleId::CatchPanicsInAbortBuild => "catch_panics_in_abort_build",
         }
     }
 }

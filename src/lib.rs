@@ -8,9 +8,9 @@
 //!
 //! ## Status
 //!
-//! `0.4.0`: HTTP/1.1 over net-io's blocking driver, directly, over TLS, behind
-//! a reverse proxy, or on a Unix socket, with live reload and restarts that
-//! drop nothing. The public API is locked in `docs/API.md`, and the design behind
+//! `0.5.0`: HTTP/1.1 over net-io's reactor (or its blocking pool), directly,
+//! over TLS, behind a reverse proxy, or on a Unix socket, with streaming bodies,
+//! an offload pool, live reload, and restarts that drop nothing. The public API is locked in `docs/API.md`, and the design behind
 //! it in `dev/PLAN.md` (both in the
 //! [repository](https://github.com/jamesgober/serve-net)).
 //!
@@ -72,12 +72,12 @@ pub use error::{ConfigError, ConfigErrors, ConfigWarning, EndReason, RuleId, Ser
 pub use health::{Health, HealthIssue, ListenerInfo, ListenerState};
 pub use hooks::{
     Admit, Admitted, Checkpoint, CheckpointAt, DefaultHooks, Dispatch, HookSet, Hooks, InFlightCap,
-    Inline, NoCheckpoint, NoObserver, Observer, Shed, Verdict,
+    Inline, NoCheckpoint, NoObserver, Observer, Offload, OffloadJob, OffloadPool, Shed, Verdict,
 };
 #[cfg(feature = "http1")]
 pub use http::{
     DetachedHead, Fields, Handler, HttpBody, HttpFamily, HttpHead, HttpParts, HttpReply,
-    HttpRequest, HttpService, handler, http, http_behind_proxy,
+    HttpRequest, HttpService, ReplyStream, handler, http, http_behind_proxy,
 };
 #[cfg(feature = "http1")]
 pub use http_net::{Method, Version};
@@ -86,7 +86,7 @@ pub use net::{
     EventSink, Gate, Lane, NoControl, NoopSink, ProxyVersions, SimpleControl, TrustedProxies,
     WorkerId,
 };
-pub use notify::{NoNotify, Notify, SystemdNotify};
+pub use notify::{NoNotify, Notify, SystemdNotify, WatchdogPinger};
 pub use reload::{ReloadSummary, ServerConfig};
 pub use reply::{CompleteError, Reply, ReplyToken};
 pub use running::{Bound, DrainHandle, DrainReport, Running};

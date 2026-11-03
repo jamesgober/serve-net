@@ -18,9 +18,10 @@ use super::{Conn, Io, Phase, Shared, Step, Timeout};
 use crate::client::{ClientInfo, IngressKind, Scheme};
 use crate::config::ProxyKind;
 use crate::engine::{Family, Service};
-use crate::hooks::{Hooks, Observer};
+use crate::hooks::{Hooks, JobService, Observer};
 use crate::net::{ConnectionId, WorkerId};
 use crate::reply::{PostFail, Waker};
+use crate::stats::Count;
 
 /// A worker's completion queue as the machine's waker.
 struct CompleterWaker(Completer);
@@ -60,6 +61,24 @@ impl Cap {
         self.open.fetch_add(1, Ordering::AcqRel) >= self.limit.load(Ordering::Acquire)
     }
 
+    /// Takes a seat only if one is free.
+    fn try_take(&self) -> bool {
+        let limit = self.limit.load(Ordering::Acquire);
+        let mut open = self.open.load(Ordering::Acquire);
+        while open < limit {
+            match self.open.compare_exchange_weak(
+                open,
+                open + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => open = actual,
+            }
+        }
+        false
+    }
+
     fn give_back(&self) {
         self.open.fetch_sub(1, Ordering::AcqRel);
     }
@@ -89,15 +108,28 @@ struct Seat {
 }
 
 impl Seat {
-    fn take(global: &Arc<Cap>, listener: &Arc<Cap>, profile: Option<&Arc<Cap>>) -> (Seat, bool) {
-        let mut over = global.take();
+    fn take(
+        global: &Arc<Cap>,
+        dedicated: Option<&Arc<Cap>>,
+        listener: &Arc<Cap>,
+        profile: Option<&Arc<Cap>>,
+    ) -> (Seat, bool) {
+        // A profile's own seats first; they do not count against the others.
+        let mut over = false;
+        let pool = match dedicated {
+            Some(own) if own.try_take() => own,
+            _ => {
+                over = global.take();
+                global
+            }
+        };
         over |= listener.take();
         if let Some(c) = profile {
             over |= c.take();
         }
         let seat = Seat {
             caps: [
-                Some(Arc::clone(global)),
+                Some(Arc::clone(pool)),
                 Some(Arc::clone(listener)),
                 profile.cloned(),
             ],
@@ -203,6 +235,7 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::Session for ServeSess
             rt: &self.rt,
         };
         let s = self.conn.on_open(&mut io, self.over_cap);
+        self.conn.count_opened(self.worker);
         handed(s, cx, &mut self.resume)
     }
 
@@ -295,6 +328,17 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::SessionFactory for Fa
     type Session = ServeSession<F, S, H>;
 
     fn open(&self, info: &ConnectionInfo) -> Result<Self::Session, RefusalCause> {
+        let session = self.session(info);
+        if session.is_err() {
+            let worker = info.worker.get();
+            self.shared.counters.count(worker, Count::Opened);
+        }
+        session
+    }
+}
+
+impl<F: Family, S: Service<F> + 'static, H: Hooks> Factory<F, S, H> {
+    fn session(&self, info: &ConnectionInfo) -> Result<ServeSession<F, S, H>, RefusalCause> {
         let listener = info.listener.map_or(0, |l| usize::from(l.get()));
         let tables = self.shared.tables.load();
         let Some(runtime) = tables.listeners.get(listener).and_then(Option::as_ref) else {
@@ -337,8 +381,10 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::SessionFactory for Fa
                 runtime.declared_scheme
             });
         }
-        let profile_cap = tables.profile_caps.get(usize::from(runtime.profile.0));
-        let (seat, over_cap) = Seat::take(&self.rt.global, &runtime.cap, profile_cap);
+        let profile = usize::from(runtime.profile.0);
+        let profile_cap = tables.profile_caps.get(profile);
+        let dedicated = tables.dedicated.get(profile).and_then(Option::as_ref);
+        let (seat, over_cap) = Seat::take(&self.rt.global, dedicated, &runtime.cap, profile_cap);
         if over_cap {
             self.shared
                 .observer
@@ -355,6 +401,7 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::SessionFactory for Fa
         if proxy_protocol.is_some() {
             conn.set_proxy_facts(info.proxy.clone());
         }
+        conn.offload_through(Arc::clone(&self.shared) as Arc<dyn JobService<F>>);
         Ok(ServeSession {
             conn,
             rt: Arc::clone(&self.rt),

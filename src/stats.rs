@@ -86,6 +86,7 @@ pub(crate) struct WorkerCounters {
     bytes_out: AtomicU64,
     finished_draining: AtomicU64,
     refused_draining: AtomicU64,
+    opened: AtomicU64,
     refused_by: [AtomicU64; KINDS],
     /// Moves on every event; `health` reads it to tell a stalled worker.
     progress: AtomicU64,
@@ -110,7 +111,12 @@ pub(crate) enum Count {
     BytesIn(u64),
     BytesOut(u64),
     FinishedDraining,
-    Refused { kind: RefusalKind, draining: bool },
+    /// A connection reached its session, or was refused by the factory.
+    Opened,
+    Refused {
+        kind: RefusalKind,
+        draining: bool,
+    },
 }
 
 /// Every worker's counters.
@@ -144,6 +150,7 @@ impl Counters {
             Count::BytesIn(n) => add(&w.bytes_in, n),
             Count::BytesOut(n) => add(&w.bytes_out, n),
             Count::FinishedDraining => add(&w.finished_draining, 1),
+            Count::Opened => add(&w.opened, 1),
             Count::Refused { kind, draining } => {
                 add(&w.refused, 1);
                 add(&w.refused_by[kind_index(kind)], 1);
@@ -194,6 +201,14 @@ impl Counters {
                 w.in_call.load(Ordering::Relaxed),
             )
         })
+    }
+
+    /// Connections that reached their session.
+    pub(crate) fn opened(&self) -> u64 {
+        self.workers
+            .iter()
+            .map(|w| w.opened.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Requests finished and refused while a drain ran.

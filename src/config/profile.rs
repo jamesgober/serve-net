@@ -25,6 +25,7 @@ impl ProfileId {
 pub struct Budget {
     pub(crate) max_connections: Option<u32>,
     pub(crate) max_in_flight: Option<u32>,
+    pub(crate) dedicated: Option<u16>,
 }
 
 impl Budget {
@@ -34,6 +35,7 @@ impl Budget {
         Budget {
             max_connections: None,
             max_in_flight: None,
+            dedicated: None,
         }
     }
 
@@ -48,6 +50,19 @@ impl Budget {
     #[must_use]
     pub const fn max_in_flight(mut self, n: u32) -> Self {
         self.max_in_flight = Some(n);
+        self
+    }
+
+    /// Keeps `n` workers for this profile alone, so a flood on other
+    /// listeners cannot take them (an admin listener). They come out of the
+    /// server's soft connection cap: other profiles get the cap less every
+    /// dedication, and this profile uses the rest of the cap once its own are
+    /// taken. On the blocking driver a worker is a connection's thread, so
+    /// this is a seat that stays free; it costs one atomic per connection on
+    /// the profile, and capacity other profiles give up.
+    #[must_use]
+    pub const fn dedicated_workers(mut self, n: u16) -> Self {
+        self.dedicated = Some(n);
         self
     }
 }

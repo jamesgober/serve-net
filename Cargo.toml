@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "serve-net"
-version = "0.4.0"
+version = "0.5.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -58,8 +58,8 @@ http1 = ["dep:http-net"]
 [dependencies]
 # First-party crates at published versions only (dev/PLAN.md section 3.2).
 # net-io: the transport (required).
-net-io = "0.4"
-http-net = { version = "0.6", default-features = false, optional = true }
+net-io = "0.5"
+http-net = { version = "0.9", default-features = false, optional = true }
 
 
 # DEV DEPENDENCIES
@@ -77,7 +77,7 @@ loom = "0.7"
 # LINTS
 # #################################
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(serve_net_loom)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(serve_net_loom)", "cfg(serve_net_blocking_tests)"] }
 
 
 # BENCHMARKS

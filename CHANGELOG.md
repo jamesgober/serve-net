@@ -13,6 +13,55 @@
 
 ---
 
+## [0.5.0] - 2026-11-03
+
+The reactor: thousands of connections per worker, streaming bodies, an
+offload pool for slow work, and restarts that no longer lose requests under
+load.
+
+### Added
+
+- `ServerBuilder::catch_service_panics`: a caught panic answers 500, closes
+  the connection, and reports `RequestEnd::ServicePanic`.
+- `InFlightCap::reserve`: capacity kept for one lane; ordinary traffic cannot
+  take it. Rule `ReserveOverflow` is now checked. `Admit::driver` and
+  `Admit::reserved_percent`, both with defaults.
+- `Offload`, `OffloadPool`, `OffloadJob`: `Io` and `Cpu` services run on a
+  bounded pool the owner provides; a full pool answers the busy refusal.
+  `Family::detach` and `DetachedRequest` for custom families.
+- Streaming: `BodyPolicy::Stream` with `HttpBody::Chunk`, `HttpReply::stream`
+  and `ReplyStream`, and `Outcome::More`. A slow reader holds back the service,
+  not memory. Provided `Family` methods for custom families.
+- `Budget::dedicated_workers`: workers kept for one profile, out of reach of
+  a flood on other listeners.
+- `Workers::reactor`, and `Workers::auto()` now picks the reactor: one worker
+  per logical CPU, thousands of connections on each. A service that blocks
+  delays every connection of its worker; use `Offload`, or `Workers::blocking`.
+- `WatchdogPinger`: pings a service manager only while every worker is
+  healthy, so a stuck worker gets the process restarted.
+
+### Changed
+
+- http-net 0.9, net-io 0.5.
+- The default driver is the reactor, and `Limits::max_deferred_per_worker`
+  reaches net-io's completion queue on it.
+- `Outcome` and `BodyPolicy` gain a variant each; both are `#[non_exhaustive]`.
+
+### Fixed
+
+- A drain could reset connections accepted as the door closed, with their
+  request unread, so a restart under load lost requests.
+- A blocking pool of 17 threads or fewer with no `max_connections` had a soft
+  connection cap of 1 and served one client at a time; the headroom is now at
+  most a quarter of the pool.
+
+### Moved
+
+- WebSocket upgrades, FastCGI, `Http1OrH2ByAlpn`, and an end-to-end TLS test
+  move to 0.6.0. FastCGI and TLS wait for fcgi-net and tls-net.
+
+---
+
 ## [0.4.0] - 2026-11-02
 
 Deployment: behind any front end, over Unix sockets, under systemd, and
@@ -163,7 +212,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/serve-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/serve-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/serve-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/serve-net/compare/v0.1.0...v0.2.0

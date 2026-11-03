@@ -8,7 +8,7 @@ use crate::config::ProxyKind;
 use crate::config::validate::{self, Draft};
 use crate::config::{
     Ingress, KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId, ProfileTable,
-    ProxySource, Workers,
+    ProxySource, REACTOR_CONNECTIONS, Workers,
 };
 use crate::conn::session::{Cap, Factory, Runtime};
 use crate::conn::{ListenerRuntime, Shared, Tables, UnixRuntime};
@@ -16,7 +16,7 @@ use crate::engine::{Family, Service};
 use crate::error::{ConfigErrors, ConfigWarning, ServeError};
 use crate::health::{HealthState, Tap};
 use crate::hooks::{Admit, Checkpoint, DefaultHooks, Dispatch, HookSet, Hooks, Observer};
-use crate::net::{ControlLine, EventSink, Gate};
+use crate::net::{ControlLine, DriverKind, EventSink, Gate};
 use crate::notify::{Notifier, Notify, ServerEvents};
 use crate::reload::{Reloader, ServerConfig, transport_key};
 #[cfg(feature = "http1")]
@@ -51,6 +51,8 @@ impl Server {
                 accept_failure_window: Duration::from_secs(30),
                 has_control: false,
                 has_tls: false,
+                catch_panics: false,
+                reserved_percent: 0,
                 notify: Arc::new(crate::NoNotify),
                 transport: None,
                 clock: None,
@@ -71,6 +73,8 @@ struct Config {
     accept_failure_window: Duration,
     has_control: bool,
     has_tls: bool,
+    catch_panics: bool,
+    reserved_percent: u32,
     notify: Arc<dyn Notify>,
     transport: Option<net_io::Limits>,
     clock: Option<Arc<dyn net_io::Clock>>,
@@ -120,6 +124,14 @@ impl<H> ServerBuilder<H> {
         self
     }
 
+    /// Catches a panicking service: the 500 refusal, the connection closes,
+    /// `done` runs with `RequestEnd::ServicePanic`. Effective in
+    /// `panic = "unwind"` builds; `build` warns in an abort build.
+    pub fn catch_service_panics(mut self, on: bool) -> Self {
+        self.config.catch_panics = on;
+        self
+    }
+
     /// The base net-io limits for every listener; what serve-net maps from
     /// its own limits is set on top.
     pub fn transport_limits(mut self, limits: net_io::Limits) -> Self {
@@ -165,7 +177,11 @@ impl<H> ServerBuilder<H> {
 #[allow(clippy::type_complexity)]
 impl<A, D, K, O, G, E, C, T> ServerBuilder<HookSet<A, D, K, O, G, E, C, T>> {
     /// Replaces admission.
-    pub fn admit<A2: Admit>(self, admit: A2) -> ServerBuilder<HookSet<A2, D, K, O, G, E, C, T>> {
+    pub fn admit<A2: Admit>(
+        mut self,
+        admit: A2,
+    ) -> ServerBuilder<HookSet<A2, D, K, O, G, E, C, T>> {
+        self.config.reserved_percent = admit.reserved_percent();
         let HookSet {
             dispatch,
             checkpoint,
@@ -422,6 +438,8 @@ impl<H: Hooks> ServerBuilder<H> {
             drain_deadline: c.drain_deadline,
             has_control: c.has_control,
             has_tls: c.has_tls,
+            catch_panics: c.catch_panics,
+            reserved_percent: c.reserved_percent,
         });
         if let Some(errors) = ConfigErrors::from_vec(findings.errors) {
             return Err(errors);
@@ -444,6 +462,7 @@ impl<H: Hooks> ServerBuilder<H> {
             clock: c.clock,
             has_control: c.has_control,
             has_tls: c.has_tls,
+            catch_panics: c.catch_panics,
             warnings: findings.warnings,
             hooks: self.hooks,
         })
@@ -498,6 +517,7 @@ pub struct Built<H: Hooks = DefaultHooks> {
     pub(crate) clock: Option<Arc<dyn net_io::Clock>>,
     pub(crate) has_control: bool,
     pub(crate) has_tls: bool,
+    pub(crate) catch_panics: bool,
     pub(crate) warnings: Vec<ConfigWarning>,
     pub(crate) hooks: H,
 }
@@ -560,12 +580,14 @@ where
             clock,
             has_control,
             has_tls,
+            catch_panics,
             hooks,
             ..
         } = self;
         let (soft, hard, threads) = connection_caps(&limits, &workers);
 
         let mut admit = hooks.admit;
+        admit.driver(workers.resolved(), soft);
         admit.prepare(threads, &profiles);
         let counters = Arc::new(Counters::new(threads));
         let runtime_listeners = listeners
@@ -581,18 +603,29 @@ where
             .iter()
             .map(|p| Cap::new(p.budget.max_connections))
             .collect();
-        let rt = Arc::new(Runtime::new(Some(soft), threads));
+        let dedicated = profiles
+            .iter()
+            .map(|p| p.budget.dedicated.map(|n| Cap::new(Some(u32::from(n)))))
+            .collect();
+        let rt = Arc::new(Runtime::new(Some(shared_seats(soft, &profiles)), threads));
 
-        let global = transport
+        let mut global = transport
             .as_ref()
             .map_or_else(net_io::Limits::builder, net_io::Limits::to_builder)
-            .max_connections(hard)
-            .drain_timeout(drain_deadline)
-            .build()
-            .map_err(ServeError::Start)?;
+            .drain_timeout(drain_deadline);
+        let reactor = workers.resolved() == DriverKind::Reactor;
+        if reactor {
+            global = global.completion_queue(limits.max_deferred_per_worker);
+        }
+        // With no cap asked for, the reactor's own default fits what
+        // descriptors the process has, where a fixed cap would refuse to start.
+        if !reactor || limits.max_connections.is_some() {
+            global = global.max_connections(hard);
+        }
+        let global = global.build().map_err(ServeError::Start)?;
         let merged = Arc::new(Merged::new(Arc::clone(&hooks.control)));
         let mut net = net_io::ServerBuilder::new()
-            .driver(workers.kind())
+            .driver(workers.resolved())
             .workers(threads)
             .limits(global)
             .control(Arc::clone(&merged));
@@ -664,6 +697,7 @@ where
             profiles,
             listeners: runtime_listeners.into_iter().map(Some).collect(),
             profile_caps,
+            dedicated,
         }));
         let shared = Arc::new(Shared::<F, S, HookSet<A, D, K, O, G, E, C, T>> {
             family,
@@ -675,6 +709,8 @@ where
             control: Arc::clone(&merged),
             tables: Arc::clone(&tables),
             counters: Arc::clone(&counters),
+            catch_panics,
+            adaptive_keep_alive: !reactor,
         });
         for l in &listeners {
             if let Some(reason) = l.public_bind {
@@ -757,14 +793,35 @@ impl net_io::Clock for SharedClock {
 /// be written when the pool covers the soft cap plus its headroom (D-043,
 /// D-044).
 pub(crate) fn connection_caps(limits: &Limits, workers: &Workers) -> (u32, u32, u16) {
+    let blocking = workers.resolved() == DriverKind::Blocking;
     let asked = workers.blocking_threads();
+    let pool = if blocking {
+        u32::from(asked)
+    } else {
+        REACTOR_CONNECTIONS
+    };
     let soft = limits.max_connections.unwrap_or_else(|| {
-        let t = u32::from(asked);
-        t.saturating_sub(limits.headroom_for(t)).max(1)
+        // A small pool keeps most of its threads for clients.
+        pool.saturating_sub(limits.headroom_for(pool).min(pool / 4))
+            .max(1)
     });
     let hard = soft.saturating_add(limits.headroom_for(soft));
-    let threads = u16::try_from(hard).unwrap_or(u16::MAX).max(asked);
+    let threads = if blocking {
+        u16::try_from(hard).unwrap_or(u16::MAX).max(asked)
+    } else {
+        workers.reactor_workers()
+    };
     (soft, hard, threads)
+}
+
+/// The soft cap left for connections without a dedicated seat.
+pub(crate) fn shared_seats(soft: u32, profiles: &ProfileTable) -> u32 {
+    let kept: u32 = profiles
+        .iter()
+        .filter_map(|p| p.budget.dedicated)
+        .map(u32::from)
+        .sum();
+    soft.saturating_sub(kept)
 }
 
 /// A listener's entry in the tables.

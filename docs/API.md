@@ -1,7 +1,7 @@
 # serve-net - API Reference
 
 > Reference for every public item in `serve-net`, with signatures, behaviour, errors, costs, and examples.
-> **Current release: `0.4.0`.** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
+> **Current release: `0.5.0`.** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -149,8 +149,8 @@ Every cost is a target on reference hardware. Numbers marked **[est.]** are esti
 |---|---|---|---|
 | (none) | always | the server, listeners, ingress, profiles, limits, hooks, snapshots, the engine and family traits | `0.3.0` |
 | `http1` | on | the HTTP family over http-net: `HttpService`, `HttpRequest`, `HttpReply`, `engine::Http1`, the Tier 1 functions `http` and `http_behind_proxy`, `testing` | `0.3.0` |
-| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.5.0` |
-| `ws` | off | WebSocket upgrades over ws-net: `engine::WebSocket`, `UpgradeTarget::WebSocket` (implies `http1`) | `0.5.0` |
+| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.6.0` |
+| `ws` | off | WebSocket upgrades over ws-net: `engine::WebSocket`, `UpgradeTarget::WebSocket` (implies `http1`) | `0.6.0` |
 | `h2` | off | HTTP/2 over h2-net: `engine::H2`, ALPN `h2` | after `1.0.0`, or earlier as a minor version when h2-net reaches its 0.3 |
 
 Features are additive. `--no-default-features` builds the server with custom families only and passes CI on its own. The crate has no third-party runtime dependency in any feature combination; its first-party dependencies are net-io (always), http-net, fcgi-net, ws-net, and h2-net (by feature), each at a published version.
@@ -308,7 +308,7 @@ A FastCGI responder for Apache (`mod_fcgid`, `mod_proxy_fcgi`) or nginx (`fastcg
 
 | Grade | Tier | Version | Feature |
 |---|---|---|---|
-| P1 | 1 | `0.5.0` | `fastcgi` |
+| P1 | 1 | `0.6.0` | `fastcgi` |
 
 Errors: `ServeError::Inherited` ("descriptor 0 is not a listening socket: the process was not started by a FastCGI process manager; use FastCgiListen::Tcp or Unix"), `ServeError::Bind`, `ServeError::Config` (`PublicBind`). `DescriptorZero` and `Unix` are Unix only (mod_fcgid on Windows uses named pipes, after `1.0.0`).
 
@@ -785,7 +785,7 @@ impl ListenerSpec {
     pub fn tcp<A: ToSocketAddrs>(name: &str, addr: A) -> Self;
     pub fn unix(name: &str, path: impl Into<PathBuf>) -> Self;                     // P1, 0.4.0
     pub fn inherited(name: &str) -> Self;                                           // P1, 0.4.0
-    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.5.0, Unix
+    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.6.0, Unix
     pub fn handed_off(name: &str, listener: net_io::ListenerHandle) -> Self;        // P0, 0.4.0
 }
 ```
@@ -911,7 +911,7 @@ pub enum Ingress {
     DirectTls,                                  // P0, 0.4.0: the same over TLS (net-io's TLS seam)
     Proxy(ProxySource),                         // behind a reverse proxy or load balancer
     Unix(UnixPeerTrust, Option<ProxySource>),   // P1, 0.4.0: None means the local peer is the client
-    FastCgi(FastCgiIngress),                    // P1, 0.5.0, feature fastcgi
+    FastCgi(FastCgiIngress),                    // P1, 0.6.0, feature fastcgi
 }
 impl Default for Ingress;   // Direct
 ```
@@ -928,7 +928,7 @@ How clients reach a listener, and therefore where the real client comes from. Ex
 
 | Grade | Tier | Version |
 |---|---|---|
-| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`); `0.5.0` (`FastCgi`) |
+| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`); `0.6.0` (`FastCgi`) |
 
 Errors (at `build`): `ForwardedOnDirect`, `TwoClientSources`, `PublicBind`, `TrustEmpty`, `TrustWildcard`, `TrustTooBroad`, `FastCgiTrust`, `TlsOnFastCgi`, `TlsWithoutAcceptor`, `PeerCredentialsUnavailable`.
 
@@ -1034,7 +1034,7 @@ impl FastCgiIngress {
 }
 ```
 
-The FastCGI ingress options. `REMOTE_ADDR` is believed only because only trusted front ends can connect (rule `FastCgiTrust` refuses an empty list on TCP). P1, Tier 2, `0.4.0`, feature `fastcgi`.
+The FastCGI ingress options. `REMOTE_ADDR` is believed only because only trusted front ends can connect (rule `FastCgiTrust` refuses an empty list on TCP). P1, Tier 2, `0.6.0`, feature `fastcgi`.
 
 ---
 
@@ -1214,11 +1214,11 @@ impl Budget {
     pub const fn new() -> Self;
     pub const fn max_connections(self, n: u32) -> Self;     // soft cap for the profile
     pub const fn max_in_flight(self, n: u32) -> Self;       // split across workers by InFlightCap
-    pub const fn dedicated_workers(self, n: u16) -> Self;   // P2, 0.5.0: an isolated worker set (admin listener)
+    pub const fn dedicated_workers(self, n: u16) -> Self;   // P2, 0.5.0: workers kept for this profile (admin listener)
 }
 ```
 
-A profile's share of the server. Unset values are unlimited within the server's own caps. Zero is refused (`RuleId::ZeroCap`). P0, Tier 2, `0.3.0` (`dedicated_workers` `0.5.0`).
+A profile's share of the server. Unset values are unlimited within the server's own caps. Zero is refused (`RuleId::ZeroCap`). `dedicated_workers(n)` keeps `n` workers for the profile alone: they come out of the server's soft connection cap, other profiles get the cap less every dedication, and this profile uses the rest of the cap once its own are taken. On the blocking driver a worker is a connection's thread, so a dedication is a seat that stays free; dedications that leave nothing for other profiles are refused (`ReserveOverflow`). A reload applies new dedications to connections that open after it. P0, Tier 2, `0.3.0` (`dedicated_workers` `0.5.0`); one atomic per connection on the profile, and the capacity other profiles give up.
 
 ### `ProfileTable`
 
@@ -1242,13 +1242,13 @@ The compiled, immutable table, published through a [`Snapshot`](#snapshot) so a 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EngineChoice {
     #[default] Http1,
-    FastCgi,                                       // P1, 0.5.0
-    Http1OrH2ByAlpn,                               // P1, 0.5.0 (h2 with feature h2)
+    FastCgi,                                       // P1, 0.6.0
+    Http1OrH2ByAlpn,                               // P1, 0.6.0 (h2 with feature h2)
     Custom { alpn: &'static [&'static str] },      // a family given to bind_family; ALPN ids it serves
 }
 ```
 
-The engine a profile's connections start with, and the ALPN protocols offered on its TLS listeners. A profile without h2 never offers `h2`. An ALPN result with no compiled engine closes the connection (`EndReason::NoEngine`). ALPN choices on a listener without TLS are refused (`RuleId::AlpnWithoutTls`). P0 (`Http1`, `Custom`) `0.3.0`, P1 (`FastCgi`, `Http1OrH2ByAlpn`) `0.4.0`, Tier 2.
+The engine a profile's connections start with, and the ALPN protocols offered on its TLS listeners. A profile without h2 never offers `h2`. An ALPN result with no compiled engine closes the connection (`EndReason::NoEngine`). ALPN choices on a listener without TLS are refused (`RuleId::AlpnWithoutTls`). P0 (`Http1`, `Custom`) `0.3.0`, P1 (`FastCgi`, `Http1OrH2ByAlpn`) `0.6.0`, Tier 2.
 
 ---
 
@@ -1269,7 +1269,7 @@ pub trait HttpService: Send + Sync {
 
     fn call(&self, request: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome;
 
-    fn upgraded(&self, env: &Envelope, conn: UpgradedConn) {           // P1, 0.5.0
+    fn upgraded(&self, env: &Envelope, conn: UpgradedConn) {           // P1, 0.6.0
         let _ = (env, conn);
     }
 
@@ -1293,7 +1293,7 @@ A service used by a running server must also be `'static` (it moves to the worke
 
 | Grade | Tier | Version | Cost |
 |---|---|---|---|
-| P0 | 2 | `0.3.0` (`upgraded` `0.4.0`) | one direct call per method with inline dispatch, about 1 ns [est.] |
+| P0 | 2 | `0.3.0` (`upgraded` `0.6.0`) | one direct call per method with inline dispatch, about 1 ns [est.] |
 
 ```rust
 use serve_net::{BodyPolicy, Envelope, Finished, HeadAction, HttpHead, HttpReply, HttpRequest, HttpService, Outcome, WorkClass};
@@ -1378,7 +1378,7 @@ pub enum HeadAction {
     Proceed,                                          // the profile's body policy
     ProceedWith(BodyPolicy),
     Refuse { status: u16, retry_after: Option<Duration> },
-    Upgrade(UpgradeTarget),                           // P1, 0.5.0
+    Upgrade(UpgradeTarget),                           // P1, 0.6.0
 }
 impl HeadAction {
     pub const fn refuse(status: u16) -> Self;         // Refuse { status, retry_after: None }
@@ -1394,7 +1394,7 @@ What `head` decided. `Refuse` answers with the engine's refusal bytes for that s
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyPolicy {
     Buffer { max: u64 },      // read the whole body before call (the default, max = Limits::max_body)
-    Stream,                   // P2, 0.5.0: call at the head, body chunks as they arrive
+    Stream,                   // P2, 0.5.0: one call per piece of the body as it arrives
     Discard { max: u64 },     // read and drop up to max, then the reply; beyond max, close without reading
 }
 ```
@@ -1402,7 +1402,7 @@ pub enum BodyPolicy {
 | Policy | Behaviour | Grade | Version |
 |---|---|---|---|
 | `Buffer` | the body is read into a pooled buffer, bounded by `max` and the engine's own `max_body` (the smaller wins), under the request deadline and the minimum rate; a declared length over the bound is refused (413) before any body byte is read | P0 | `0.3.0` |
-| `Stream` | `call` runs at the head. Reactor: repeated `call`s with `HttpBody::Chunk`, reads paused while the service holds a chunk (push). Blocking: a reader that parks for more (pull) | P2 | `0.5.0` |
+| `Stream` | repeated `call`s with `HttpBody::Chunk`, one per piece of the body as it arrives, reads paused during each call; the same on every driver. A request with no body gets one call with empty bytes and `last: true`. Each call returns `Outcome::More` until the last piece; answering earlier drops the rest of the body and closes the connection. The engine's `max_body`, the request deadline, and the minimum rate apply; `head` is where to refuse before any body byte. `BeforeDispatch` runs for each piece. Streams stay on the worker, even under `Offload` | P2 | `0.5.0` |
 | `Discard` | for answering without the body (a redirect after a large upload attempt): the body is read and dropped up to `max` so the connection stays usable; beyond `max` the connection closes after the reply | P0 | `0.3.0` |
 
 ### `HttpRequest`, `HttpBody`
@@ -1461,10 +1461,16 @@ impl Reply<HttpFamily> {
     pub fn stream(&mut self) -> ReplyStream<'_>;                                 // P2, 0.5.0
 }
 impl fmt::Debug for Reply<HttpFamily>;                                           // set-cookie and credential values redacted
+
+pub struct ReplyStream<'a> { /* the reply */ }
+impl ReplyStream<'_> {
+    pub fn send(&mut self, bytes: &[u8]) -> &mut Self;   // copied; leaves when call returns
+    pub fn sent(&self) -> u64;                           // bytes in earlier parts
+}
 // From the generic Reply<F> (all families): defer(&mut self) -> ReplyToken<F>, see ReplyToken.
 ```
 
-The reply a service writes. `HttpReply` is the HTTP family's form of the generic [`Reply`](#family-httpfamily), so deferral works the same for every family. Buffered: nothing reaches the network until `call` returns, so the connection gate's egress check and a `Checkpoint` denial see the whole reply before any byte leaves. A reply the service did not touch is `200` with an empty body. Invalid field names or values (a CR or LF in a value, a non-token name, a framing field such as `content-length`) are recorded and turn the reply into the 500 refusal when it is written, never into a malformed response. `Date` is added unless set; no `Server` field is added. The buffer is reused across requests (no allocation in steady state) and wiped on return when the profile wipes.
+The reply a service writes. `HttpReply` is the HTTP family's form of the generic [`Reply`](#family-httpfamily), so deferral works the same for every family. Buffered: nothing reaches the network until `call` returns, so the connection gate's egress check and a `Checkpoint` denial see the whole reply before any byte leaves. `stream` is the exception, for bodies too large to hold or not yet known: the service calls it in every `call` of the reply and adds a part; `Outcome::More` asks to be called again once the client has taken that part, so a slow reader holds back the service and not memory, and `Outcome::Done` or `Close` ends the reply with the last part. The body is chunked (close-delimited to an HTTP/1.0 client); a `HEAD` request gets the head alone and one call. Status and fields go with the first part; each part passes `BeforeDispatch`, `BeforeReply`, and the connection gate. After the head no refusal can follow, so a panic, a denial, or an encoding error closes the connection abortively and the client sees a truncated body. A streamed reply cannot be deferred once its head has left. It stays on the worker: a service that streams its reply does not run under `Offload`, and `Outcome::More` from a job is answered with the 500 refusal. A reply the service did not touch is `200` with an empty body. Invalid field names or values (a CR or LF in a value, a non-token name, a framing field such as `content-length`) are recorded and turn the reply into the 500 refusal when it is written, never into a malformed response. `Date` is added unless set; no `Server` field is added. The buffer is reused across requests (no allocation in steady state) and wiped on return when the profile wipes.
 
 | Grade | Tier | Version | Cost |
 |---|---|---|---|
@@ -1501,10 +1507,10 @@ assert_eq!(reply.status, 500);
 #[non_exhaustive]
 #[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Outcome { Done, Deferred, Close }
+pub enum Outcome { Done, Deferred, Close, More }
 ```
 
-What `call` returns. `Done`: the reply is complete. `Deferred`: the service called `reply.defer()` and completes the reply later through the token. `Close`: send what the reply holds (nothing if it is untouched) and close the connection. After `defer()` the reply belongs to the token, so any outcome other than `Deferred` is treated as `Deferred` (and reported through the observer in debug builds); `Deferred` without a `defer()` answers the 500 refusal and is reported. P0, Tier 2, `0.3.0`.
+What `call` returns. `Done`: the reply is complete. `Deferred`: the service called `reply.defer()` and completes the reply later through the token. `Close`: send what the reply holds (nothing if it is untouched) and close the connection. `More` (`0.5.0`): call again, with the next piece of a `BodyPolicy::Stream` body or, with a streamed reply open, when the client has taken what was sent; anywhere else it is a service bug, answered with the 500 refusal. After `defer()` the reply belongs to the token, so any outcome other than `Deferred` is treated as `Deferred` (and reported through the observer in debug builds); `Deferred` without a `defer()` answers the 500 refusal and is reported. P0, Tier 2, `0.3.0`.
 
 ### `ReplyToken`, `CompleteError`
 
@@ -1647,7 +1653,7 @@ impl UpgradedConn {
 }
 ```
 
-`head` returns `HeadAction::Upgrade(target)`; serve-net validates the handshake through the target engine (ws-net checks the WebSocket key and version and answers its own status on failure, before anything else is written), writes the 101, replaces the engine on the connection, feeds it the bytes that arrived with the request, switches deadlines and limits to the target profile, and calls `HttpService::upgraded`. `Upgrade: h2c` never reaches this path: it is not an upgrade offer, and the request is served as HTTP/1.1. A 2xx to `CONNECT` is refused unless a profile allows tunnels (after `1.0.0`). P1, Tier 2, `0.4.0`. `WebSocketConn` is specified with [`engine::WebSocket`](#enginewebsocket).
+`head` returns `HeadAction::Upgrade(target)`; serve-net validates the handshake through the target engine (ws-net checks the WebSocket key and version and answers its own status on failure, before anything else is written), writes the 101, replaces the engine on the connection, feeds it the bytes that arrived with the request, switches deadlines and limits to the target profile, and calls `HttpService::upgraded`. `Upgrade: h2c` never reaches this path: it is not an upgrade offer, and the request is served as HTTP/1.1. A 2xx to `CONNECT` is refused unless a profile allows tunnels (after `1.0.0`). P1, Tier 2, `0.6.0`. `WebSocketConn` is specified with [`engine::WebSocket`](#enginewebsocket).
 
 ---
 
@@ -1694,7 +1700,7 @@ serve-net's budgets: the request-level ones it enforces itself and the transport
 | `linger` | net-io's graceful linger | a reset destroying the last reply |
 | `engine_limits` | http-net (start line, header bytes and count, field line, trailers) | oversized heads |
 
-**Connection caps.** Three soft caps are checked in order when a connection opens: global (`Limits::max_connections`, default: the blocking worker count, or 10,000 on the reactor), per listener (`ListenerSpec::max_connections`), and per profile (`Budget::max_connections`). The first that is full answers with the busy refusal (503, `Retry-After` with jitter, close) without reading the request. net-io's hard cap is set `hard_cap_headroom` above the global soft cap; beyond it net-io resets connections without involving serve-net, so a flood large enough to pass the headroom costs one reset per connection. Cost: two atomics per connection [est. 5-20 ns].
+**Connection caps.** Three soft caps are checked in order when a connection opens: global (`Limits::max_connections`, default: the blocking pool less its headroom, or 8,750 on the reactor, under a hard cap of 10,000 or what the process's descriptors allow), per listener (`ListenerSpec::max_connections`), and per profile (`Budget::max_connections`). The first that is full answers with the busy refusal (503, `Retry-After` with jitter, close) without reading the request. net-io's hard cap is set `hard_cap_headroom` above the global soft cap; beyond it net-io resets connections without involving serve-net, so a flood large enough to pass the headroom costs one reset per connection. Cost: two atomics per connection [est. 5-20 ns].
 
 P0, Tier 2, `0.3.0`.
 
@@ -1731,7 +1737,7 @@ How long a connection stays open between requests.
 
 - **Idle timeout.** Between requests a connection closes without a response after `idle`. The default depends on the listener's ingress: 20 s on direct listeners (browsers hold many idle connections; a blocking worker is held while idle) and 60 s behind a proxy or FastCGI front end, because the backend must outlive the front end's reuse window or the front end reuses a connection the backend is closing and answers 502 (behind Apache, keep `ProxyPass ... ttl=` below it).
 - **Requests per connection** and **age**: the response that reaches `max_requests`, and the first response after `max_age`, carry the close signal; an idle connection past its age is closed.
-- **Under pressure** (blocking driver, where every connection holds a thread): above 75% of threads busy the idle timeout of a connection returning to idle is `under_pressure`; above 90% every response carries the close signal. The shortened idle is net-io's per-connection idle override, set at each response.
+- **Under pressure** (blocking driver only, where every connection holds a thread; an idle reactor connection holds next to nothing, so the reactor keeps it): above 75% of threads busy the idle timeout of a connection returning to idle is `under_pressure`; above 90% every response carries the close signal. The shortened idle is net-io's per-connection idle override, set at each response.
 
 P0, Tier 2, `0.3.0`.
 
@@ -1751,9 +1757,9 @@ let api = KeepAlive::new().max_requests(10_000).max_age(Duration::from_secs(600)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Workers { /* driver kind, count */ }
 impl Workers {
-    pub fn auto() -> Self;                         // net-io's Auto: the reactor where available, else blocking
+    pub fn auto() -> Self;                         // the reactor, one worker per logical CPU
     pub fn blocking(threads: u16) -> Self;         // default 256 threads
-    pub fn reactor(workers: u16) -> Self;          // P0, 0.5.0; default: logical CPUs
+    pub fn reactor(workers: u16) -> Self;          // P0, 0.5.0; 0: one per logical CPU
     pub fn uring(workers: u16) -> Self;            // P3, after 1.0.0 (Linux)
     pub fn kind(&self) -> net_io::DriverKind;
     pub fn count(&self) -> Option<u16>;            // None: the driver's default
@@ -1782,7 +1788,7 @@ assert_eq!(small.count(), Some(32));
 | write stall | 30 s plus 256 B/s over 10 s | 10 s | none | none | 60 s (`send_timeout`, between writes) |
 | header bytes, count | 16 KiB, 100 (http-net) | same | about 400 KB, 100 | 32 fields | 8 KiB per line, 4 buffers |
 | body | 1 MiB | 1 MiB | none | per extractor | 1 MiB |
-| connections | blocking: 256 threads; reactor: 10,000 | 64 | none | 25,000 per worker | `worker_connections` |
+| connections | blocking: 224 of 256 threads; reactor: 8,750 of 10,000 | 64 | none | 25,000 per worker | `worker_connections` |
 | drain deadline | 30 s | none (waits) | the caller's | 30 s | `worker_shutdown_timeout`, unset |
 | lingering close | 2 s, 64 KiB | 1 s, 256 KiB | none | 1 s | 30 s total, 5 s per read |
 | accept backlog | 1,024 | OS default | the caller's | 1,024 | 511 on Linux |
@@ -1825,9 +1831,11 @@ The bundle of hook types a builder carries. Programs never name these types: the
 
 ```rust
 pub trait Admit: Send + Sync + 'static {
+    fn driver(&mut self, kind: DriverKind, connections: u32) { let _ = (kind, connections); }   // 0.5.0: before prepare
     fn prepare(&mut self, workers: u16, profiles: &ProfileTable) {
         let _ = (workers, profiles);
     }
+    fn reserved_percent(&self) -> u32 { 0 }                    // 0.5.0: above 100 refused at build
     fn admit(&self, worker: WorkerId, env: &Envelope) -> Result<Admitted, Shed>;
     fn release(&self, worker: WorkerId, env: &Envelope, admitted: Admitted);
 }
@@ -1886,7 +1894,7 @@ impl Admit for InFlightCap;
 
 The default admission control: a real cap on requests in flight per worker and per profile (`Budget::max_in_flight`, split into per-worker shares, rounded up, at least 1). Over the cap the request gets the busy refusal with `Retry-After` = `base` plus a jitter in `[0, base)` seconds, so refused clients do not all come back in the same second. Counters are per worker, cache-line padded, and written only by their worker with plain relaxed loads and stores. On the blocking driver each worker serves one connection at a time, so the per-worker cap is 1 by construction and the profile cap does the work.
 
-`reserve(lane, percent)` keeps a share of each worker's cap for one lane: a request takes from its own lane's reserve first, then from the shared pool; lanes without a reserve use only the shared pool, so a flood of ordinary traffic can never take the slots of health checks or administrators. Reserves summing above 100% are refused at `build`.
+`reserve(lane, percent)` keeps a share of each worker's cap for one lane: a request takes from its own lane's reserve first, then from the shared pool; lanes without a reserve use only the shared pool, so a flood of ordinary traffic can never take the slots of health checks or administrators. Reserves summing above 100% are refused at `build`. A reserve keeps at least one slot, but unless the reserves sum to 100% other lanes keep one too. A worker too small to hold a share counts the reserves across all workers instead, and the blocking driver, where every connection runs one request at most, takes the shares of its soft connection cap: the same promise for one contended atomic per request, about 20 ns [est.]. On larger workers a reserve costs an array index, and nothing when none is set.
 
 | Grade | Tier | Version | Cost |
 |---|---|---|---|
@@ -1942,7 +1950,7 @@ impl<P: OffloadPool> Offload<P> { pub fn new(pool: P) -> Self; }
 impl<P: OffloadPool> Dispatch for Offload<P>;
 ```
 
-`Offload` runs `Quick` services inline and submits `Io` and `Cpu` services to the pool as a job holding a detached head, the body, a copy of the envelope, and a reply token; the worker goes straight back to its other connections. A full pool hands the job back and serve-net answers the busy refusal: the queue is bounded, never unbounded. On the blocking driver `Offload` behaves as `Inline` (each thread is its connection's own) and `build` warns. P1, Tier 3, `0.5.0`; about 2-10 µs per offloaded request for hand-off and completion [est.].
+`Offload` runs `Quick` services inline and submits `Io` and `Cpu` services to the pool as a job holding a detached head, the body, a copy of the envelope, and a reply token. A full pool hands the job back and serve-net answers the busy refusal: the queue is bounded, never unbounded. On a reactor the worker goes straight back to its other connections; on the blocking driver its thread parks until the reply arrives, and the pool bounds how many slow calls run at once (hashing on 256 threads at a time is what this prevents). A panicking service answers the 500 refusal and leaves the pool's thread alive; a job dropped without running answers the same. A service inside a job may still call `reply.defer()`. A family without `Family::detach`, and a test connection, run the service on the worker. P1, Tier 3, `0.5.0`; about 2-10 µs per offloaded request for hand-off and completion, plus a copy of the head and body [est.]; `Quick` services pay nothing. The copy holds request data for as long as the job lives, and a wiping profile does not reach it.
 
 ### `Checkpoint`, `CheckpointAt`, `Verdict`, `NoCheckpoint`
 
@@ -2302,7 +2310,7 @@ impl RuleId { pub const fn as_str(self) -> &'static str; }   // stable snake_cas
 | `AddressResolve` | an address that resolved to nothing | none |
 | `BadHeaderName` | a `SingleAddress` field name that is not a token | none |
 | `IngressNeedsHttp` | forwarded headers or FastCGI on a listener whose profile serves a custom family | none |
-| `ReserveOverflow` | lane reserves summing above 100% | none |
+| `ReserveOverflow` | lane reserves summing above 100%, or dedicated workers leaving no connection for the other profiles | none |
 | `TooMany` | more than 64 listeners or 255 profiles | none |
 
 The last group are warnings, kept in `Built::warnings()`: a proxy listener left at `Scheme::Http` with `trust_scheme` off; `min_rate` 0; `catch_service_panics` in an abort build; `Offload` on the blocking driver; keep-alive idle under 5 s behind a proxy (front-end reuse races); `Lockdown`-relevant configuration with no critical profile; a configuration with no listener. P0, Tier 2, `0.3.0`.
@@ -2516,7 +2524,7 @@ The HTTP/1.1 engine: an adapter over `http_net::ServerConn` with the profile's `
 
 ### `engine::FastCgi`
 
-The FastCGI responder: an adapter over fcgi-net. One request at a time per connection; answers `FCGI_GET_VALUES`; an `FCGI_ABORT_REQUEST` ends the request with `RequestEnd::PeerGone` and cancels a pending `ReplyToken`. P1, Tier 3, `0.4.0`, feature `fastcgi`.
+The FastCGI responder: an adapter over fcgi-net. One request at a time per connection; answers `FCGI_GET_VALUES`; an `FCGI_ABORT_REQUEST` ends the request with `RequestEnd::PeerGone` and cancels a pending `ReplyToken`. P1, Tier 3, `0.6.0`, feature `fastcgi`.
 
 ### `engine::WebSocket`
 
@@ -2524,7 +2532,7 @@ The FastCGI responder: an adapter over fcgi-net. One request at a time per conne
 pub struct WebSocketConn { /* the ws-net connection and its socket */ }
 ```
 
-The WebSocket engine after an upgrade: an adapter over `ws_net::Connection::server()` with the target profile's limits; ping handling stays in ws-net; a drain closes with 1001 ("going away"). `WebSocketConn` (from `UpgradedConn::into_websocket`) sends and receives messages through the worker. P1, Tier 3, `0.4.0`, feature `ws`.
+The WebSocket engine after an upgrade: an adapter over `ws_net::Connection::server()` with the target profile's limits; ping handling stays in ws-net; a drain closes with 1001 ("going away"). `WebSocketConn` (from `UpgradedConn::into_websocket`) sends and receives messages through the worker. P1, Tier 3, `0.6.0`, feature `ws`.
 
 ### `engine::H2`
 

@@ -22,6 +22,12 @@ pub enum BodyPolicy {
         /// The most bytes read and dropped.
         max: u64,
     },
+    /// Call the service once per piece of the body as it arrives, with reads
+    /// paused during each call. The service returns [`Outcome::More`] until
+    /// the last piece; answering earlier drops the rest of the body and
+    /// closes the connection. The engine's body limit, the request deadline,
+    /// and the minimum rate still apply.
+    Stream,
 }
 
 /// What `head` decided.
@@ -63,6 +69,11 @@ pub enum Outcome {
     Deferred,
     /// Send what the reply holds and close the connection.
     Close,
+    /// Call the service again: with the next piece of the body under
+    /// [`BodyPolicy::Stream`], or, with a streamed reply open, when the client
+    /// has taken what was sent. Anywhere else it is a service bug, answered
+    /// with the 500 refusal.
+    More,
 }
 
 /// How a service behaves, for dispatchers that move slow work off the worker.
