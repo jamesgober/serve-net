@@ -4,6 +4,7 @@
 use std::time::{Duration, Instant};
 
 use crate::engine::RefusalKind;
+use crate::envelope::Envelope;
 
 /// How a request body is read.
 #[non_exhaustive]
@@ -32,7 +33,7 @@ pub enum BodyPolicy {
 
 /// What `head` decided.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum HeadAction {
     /// Continue with the profile's body policy.
     Proceed,
@@ -45,6 +46,12 @@ pub enum HeadAction {
         /// `Retry-After`, when given.
         retry_after: Option<Duration>,
     },
+    /// Switch the connection to another protocol after this request. The
+    /// handshake is checked first: an invalid one is refused with 400, a
+    /// request that offered no such upgrade with 500 (a service bug).
+    /// Admission and the checkpoints apply to the upgrade request as to any
+    /// other.
+    Upgrade(UpgradeTarget),
 }
 
 impl HeadAction {
@@ -55,6 +62,50 @@ impl HeadAction {
             status,
             retry_after: None,
         }
+    }
+}
+
+/// The protocol a connection switches to.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub enum UpgradeTarget {
+    /// A WebSocket over ws-net (feature `ws`).
+    #[cfg(feature = "ws")]
+    WebSocket(crate::ws::WebSocketTarget),
+}
+
+#[cfg(feature = "ws")]
+impl From<crate::ws::WebSocketTarget> for UpgradeTarget {
+    fn from(target: crate::ws::WebSocketTarget) -> Self {
+        UpgradeTarget::WebSocket(target)
+    }
+}
+
+/// The connection after a switch, as `upgraded` sees it.
+#[derive(Debug)]
+pub struct UpgradedConn {
+    pub(crate) env: Envelope,
+    pub(crate) protocol: &'static str,
+    pub(crate) subprotocol: Option<&'static str>,
+}
+
+impl UpgradedConn {
+    /// The upgrade request's envelope; it stays the connection's envelope.
+    #[must_use]
+    pub fn envelope(&self) -> &Envelope {
+        &self.env
+    }
+
+    /// The protocol switched to (`"websocket"`).
+    #[must_use]
+    pub fn protocol(&self) -> &'static str {
+        self.protocol
+    }
+
+    /// The subprotocol the 101 named, if any.
+    #[must_use]
+    pub fn subprotocol(&self) -> Option<&'static str> {
+        self.subprotocol
     }
 }
 
@@ -113,6 +164,9 @@ pub enum RequestEnd {
     ServicePanic,
     /// A deferred reply's token was dropped without completing it.
     Dropped,
+    /// The switch response (101) was handed to the transport; the connection
+    /// now speaks another protocol.
+    Upgraded,
 }
 
 /// What happened to a request, given to `done` and the observer.

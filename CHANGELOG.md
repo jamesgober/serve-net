@@ -11,6 +11,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- WebSocket upgrades (feature `ws`, over ws-net 0.2): `HeadAction::Upgrade`
+  with `WebSocketTarget`, `WebSocketService` called once per message on the
+  worker, `WebSocketConn` to send, `WsMessage`, `WsSendError`;
+  `UpgradedConn`, `HttpService::upgraded`, `Family::upgrade`, and
+  `RequestEnd::Upgraded`. Each message passes the control line and the
+  checkpoint; pings after a quiet interval; output bounded per connection.
+
+### Changed
+
+- `HeadAction` is `Clone` and no longer `Copy` or `PartialEq`.
+
 ---
 
 ## [0.5.0] - 2026-11-03

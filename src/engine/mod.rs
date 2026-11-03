@@ -13,7 +13,7 @@ use crate::client::ClientInfo;
 use crate::config::{Limits, Profile, ProxySource};
 use crate::envelope::Envelope;
 use crate::reply::Reply;
-use crate::service::{HeadAction, Outcome, WorkClass};
+use crate::service::{HeadAction, Outcome, UpgradeTarget, UpgradedConn, WorkClass};
 
 #[cfg(feature = "http1")]
 pub(crate) mod http1;
@@ -381,6 +381,23 @@ pub trait Family: Send + Sync + 'static {
         let _ = request;
         None
     }
+    /// Checks the handshake of an upgrade the service asked for and writes
+    /// the switch response. After it the engine reports
+    /// [`EngineEvent::Upgraded`] and [`Engine::remaining_input`] holds the
+    /// new protocol's first bytes. A family without upgrades refuses with 500.
+    fn upgrade(
+        &self,
+        engine: &mut Self::Engine,
+        target: &UpgradeTarget,
+        unix_secs: u64,
+        out: &mut OutBuf,
+    ) -> Result<(), EngineError> {
+        let _ = (engine, target, unix_secs, out);
+        Err(EngineError {
+            kind: RefusalKind::Internal,
+            status: 500,
+        })
+    }
 }
 
 /// An owned copy of a family's request.
@@ -401,6 +418,10 @@ pub trait Service<F: Family>: Send + Sync {
     }
     /// The request is complete.
     fn call(&self, request: &F::Request<'_>, env: &Envelope, reply: &mut Reply<F>) -> Outcome;
+    /// After a switch response the service asked for left.
+    fn upgraded(&self, env: &Envelope, conn: UpgradedConn) {
+        let _ = (env, conn);
+    }
     /// Exactly once per request that reached `head`.
     fn done(&self, env: &Envelope, finished: &Finished) {
         let _ = (env, finished);

@@ -117,7 +117,8 @@ Released as "Reactor", not "Feature complete": the items over other crates moved
 
 ## v0.6.0 - Optimisation, and the protocols moved from 0.5
 Exit: NFR-1, NFR-2, NFR-3, NFR-5 met, or each gap recorded in `docs/PERFORMANCE.md` with its cause and the plan to close it before 1.0 (a missed 20% target blocks 1.0); `docs/PERFORMANCE.md` published; every item moved from 0.5 done, or recorded here as waiting for a crate that is not on crates.io.
-- WebSocket upgrades over ws-net 0.2 (published): `HeadAction::Upgrade`, `UpgradeTarget`, `UpgradedConn`, `HttpService::upgraded`, `engine::WebSocket`, `WebSocketConn`, feature `ws`, T-21.
+- [x] WebSocket upgrades over ws-net 0.2 (D-079): `HeadAction::Upgrade`, `UpgradeTarget`, `UpgradedConn`, `HttpService::upgraded`, `WebSocketTarget`, `WebSocketService`, `WebSocketConn`, `WsMessage`, `WsSendError`, `Family::upgrade`, `RequestEnd::Upgraded`, feature `ws`; T-21 (`tests/websocket.rs`, on both drivers).
+- WebSocket push from another thread and a 1001 Close at drain start: waiting on net-io to wake a connection that waits for input (D-079, a hard reason: net-io 0.5 wakes only parked connections).
 - A `Type=notify-reload` unit reloading under load under real systemd, in CI on Linux.
 - When fcgi-net is published: FastCGI on Linux and macOS first (`fastcgi`, `FastCgiListen`, `FastCgiIngress`, `Ingress::FastCgi`, `engine::FastCgi`, `ListenerSpec::fastcgi_descriptor_zero`, T-19, the `fastcgi_mapping` fuzz target, `mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0). Windows waits for the decision on a Windows FastCGI deployment.
 - When tls-net is published: an end-to-end TLS test and `EngineChoice::Http1OrH2ByAlpn`.
@@ -161,6 +162,11 @@ Exit: every item in the register below is closed or carried into `docs/STABILITY
 | Idle memory is about 8.9 KB per connection against a 4 KiB target | D-076 | add the idle trim once net-io returns the output buffer after `on_timeout`; due at 0.6 (P-5) |
 | T-30 is not met on Windows: two servers sharing a socket lost requests on CI's runners | CI, 0.4 and 0.5; known issue in the 0.5.0 release notes | net-io to say whether two servers on one socket in one process is supported on Windows or `share_listeners` is the way; then run `tests/restart.rs` there. Closed in this pass at the latest |
 | `dedicated_workers` on the reactor keeps connection seats, not workers: a flood on another profile still shares the dedicated profile's worker threads | D-074, 0.5 | a worker set per profile from net-io (asked), or document the seat as the guarantee |
+| A WebSocket service cannot send from another thread, and a drain closes an open socket without a Close frame | D-079 | net-io to deliver wakes (and the drain) to a connection waiting for input (asked); then `WebSocketConn` gains an owned sender with a bounded queue |
+| ws-net keeps message and input buffers that a wiping profile does not zero | D-079 | ws-net to offer a wipe (asked); until then document it next to `wipe_buffers` |
+| A gate denial of the 101 closes the connection instead of answering 403 | D-079 | mark the 101 as a reply start (`begin_reply`) and give the upgraded state the HTTP refusal until the 101 leaves |
+| `UpgradeTarget::Custom` from the locked text is not built | D-079 | build it with the first custom family that upgrades, or drop it from the API |
+| WebSocket idle memory and per-message cost are estimates | D-079 | measure in the 0.6 performance pass beside the 10,000 idle test |
 | A drain settles accepts by watching counters (at most 150 ms), and a listener removed by reload can reset connections in the accept window | D-072 | drop the workaround when net-io fixes the race; reported to net-io |
 | An offload job copies the head and the body, and the copy outlives the worker's wipe | D-071 | measure the copy; hand the body over without one, and wipe the copy under a wiping profile |
 | A service that streams stays on the worker, and a slow generator on the reactor stalls that worker; a streamed reply cannot be deferred once its head has left | D-073 | decide with real use whether parts should go through a pool or a token |

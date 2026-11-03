@@ -33,13 +33,14 @@ use crate::hooks::{
 };
 use crate::net::{CloseReason, ConnectionId, ControlLine, ControlState, WorkerId};
 use crate::reply::{DeferSlot, Link, Reply, SlotState, WAKE_REPLY, Waker};
-use crate::service::{BodyPolicy, Finished, HeadAction, Outcome, RequestEnd};
+use crate::service::{BodyPolicy, Finished, HeadAction, Outcome, RequestEnd, UpgradeTarget};
 use crate::snapshot::Snapshot;
 use crate::stats::{Count, Counters};
 
 pub(crate) mod session;
 #[cfg(all(test, feature = "http1"))]
 mod tests;
+mod upgraded;
 
 /// What the machine asks the transport to do next (net-io `Step`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,6 +223,8 @@ enum State {
     Writing,
     /// A closing reply or refusal is being handed over; then close.
     Closing,
+    /// The connection switched protocols (`HeadAction::Upgrade`).
+    Upgraded,
     /// Finished.
     Closed,
 }
@@ -293,6 +296,12 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     draining_seen: bool,
     /// The connection's PROXY header facts, on a PROXY listener.
     proxy_facts: Option<Arc<net_io::ProxyFacts>>,
+    /// The upgrade the service asked for in `head`, made once the request
+    /// passed admission and the checkpoints.
+    upgrade: Option<UpgradeTarget>,
+    /// The WebSocket after a switch.
+    #[cfg(feature = "ws")]
+    ws: Option<Box<crate::ws::WsLink>>,
 }
 
 impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
@@ -389,6 +398,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             wipe,
             draining_seen: false,
             proxy_facts: None,
+            upgrade: None,
+            #[cfg(feature = "ws")]
+            ws: None,
         }
     }
 
@@ -509,6 +521,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                     return (0, step);
                 }
             }
+            State::Upgraded => {
+                let (n, step) = self.upgraded_data(io, input);
+                self.count(io, Count::BytesIn(n as u64));
+                return (n, step);
+            }
             State::AwaitHead | State::ReadBody => {}
         }
         let (n, step) = self.process(io, input);
@@ -526,6 +543,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 .get_or_insert(EndReason::Transport(CloseReason::PeerClosed));
             return Step::Close;
         }
+        if self.state == State::Upgraded {
+            return self.upgraded_peer_closed(io);
+        }
         self.engine.feed_eof();
         if matches!(
             self.state,
@@ -539,6 +559,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
 
     /// All pending output was flushed.
     pub(crate) fn on_writable<I: Io>(&mut self, io: &mut I) -> Step {
+        if self.state == State::Upgraded {
+            return self.upgraded_data(io, &[]).1;
+        }
         if self.state == State::Streaming && self.out_sent >= self.out.len() && !self.body_open {
             // The client took the last part: the service makes the next.
             return self.dispatch(io);
@@ -636,6 +659,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 self.state = State::Closed;
                 Step::Abort
             }
+            (Timeout::Exchange, State::Upgraded) => self.upgraded_timer(io),
             (Timeout::Transport(reason), _) => {
                 self.end.get_or_insert(EndReason::Transport(reason));
                 Step::Close
@@ -652,6 +676,12 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     /// refusal for `status` replaces it, and the connection closes (net-io
     /// closes it with `EgressDenied`).
     pub(crate) fn on_denied(&mut self, status: u16, worker: WorkerId) -> &[u8] {
+        if self.state == State::Upgraded {
+            // Another protocol: no HTTP refusal fits; net-io closes it.
+            self.end = Some(EndReason::Denied);
+            self.state = State::Closed;
+            return &[];
+        }
         if matches!(self.state, State::Parked { .. }) {
             self.cancel_deferred();
         }
@@ -708,6 +738,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             (false, None) => EndReason::Drained,
         };
         self.state = State::Closed;
+        self.upgraded_closed();
         self.shared
             .observer
             .connection_ended(self.connection, end, self.seq);
@@ -728,6 +759,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             State::Closing | State::Writing if self.out_sent < self.out.len() => Step::Write,
             State::Closing => Step::Close,
             State::Streaming => Step::Write,
+            State::Upgraded if self.out_sent < self.out.len() => Step::Write,
             _ => Step::Read,
         }
     }
@@ -1033,6 +1065,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let policy = match action {
             HeadAction::Proceed => default_policy,
             HeadAction::ProceedWith(p) => p,
+            HeadAction::Upgrade(target) => {
+                // The upgrade request carries no body: a declared one is 413.
+                self.upgrade = Some(target);
+                BodyPolicy::Buffer { max: 0 }
+            }
             HeadAction::Refuse {
                 status,
                 retry_after,
@@ -1155,6 +1192,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 return self.refuse(io, RefusalKind::Denied, status, None, RequestEnd::Denied);
             }
             Verdict::Kill => return self.kill(),
+        }
+        if let Some(target) = self.upgrade.take() {
+            return self.switch(io, target);
         }
         // A deferral gets the next generation; the slot is made once per connection.
         self.generation = self.generation.wrapping_add(1);
@@ -1639,6 +1679,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
 
     /// Ends the current request: `done`, the observer, and admission release, once.
     fn finish_request(&mut self, end: RequestEnd) {
+        self.upgrade = None;
         let Some(r) = self.request.take() else { return };
         let worker = self.env.worker.get();
         let counters = &self.shared.counters;

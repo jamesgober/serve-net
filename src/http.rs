@@ -18,7 +18,7 @@ use crate::engine::{
 use crate::envelope::Envelope;
 use crate::forwarded::{self, FieldLines, Lines, WalkError};
 use crate::reply::Reply;
-use crate::service::{HeadAction, Outcome, WorkClass};
+use crate::service::{HeadAction, Outcome, UpgradeTarget, UpgradedConn, WorkClass};
 
 /// The reply an HTTP service writes.
 pub type HttpReply = Reply<HttpFamily>;
@@ -884,6 +884,20 @@ impl Family for HttpFamily {
     ) -> Result<u16, EngineError> {
         encode(engine, parts, false, unix_secs, out).map(|(status, _)| status)
     }
+
+    fn upgrade(
+        &self,
+        engine: &mut Http1,
+        target: &UpgradeTarget,
+        unix_secs: u64,
+        out: &mut OutBuf,
+    ) -> Result<(), EngineError> {
+        let _ = (&engine, unix_secs, &out);
+        match *target {
+            #[cfg(feature = "ws")]
+            UpgradeTarget::WebSocket(ref t) => crate::ws::switch_http1(engine, t, unix_secs, out),
+        }
+    }
 }
 
 /// Writes the reply's head, and its body unless `chunked`.
@@ -978,6 +992,13 @@ pub trait HttpService: Send + Sync {
     /// The request is complete.
     fn call(&self, request: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome;
 
+    /// After the 101 for an upgrade this service asked for in `head` left,
+    /// and after `done` for that request. The conversation itself belongs to
+    /// the upgrade target (a [`WebSocketService`](crate::WebSocketService)).
+    fn upgraded(&self, env: &Envelope, conn: UpgradedConn) {
+        let _ = (env, conn);
+    }
+
     /// Exactly once per request that reached `head`, on every path.
     fn done(&self, env: &Envelope, finished: &Finished) {
         let _ = (env, finished);
@@ -991,6 +1012,9 @@ impl<S: HttpService> Service<HttpFamily> for S {
     }
     fn call(&self, request: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome {
         HttpService::call(self, request, env, reply)
+    }
+    fn upgraded(&self, env: &Envelope, conn: UpgradedConn) {
+        HttpService::upgraded(self, env, conn);
     }
     fn done(&self, env: &Envelope, finished: &Finished) {
         HttpService::done(self, env, finished);
