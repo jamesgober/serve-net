@@ -407,7 +407,7 @@ pub trait DetachedRequest<F: Family>: Send {
 }
 
 /// A service over a family's types: the same calls in the same order as
-/// [`HttpService`](crate::HttpService).
+/// `HttpService` (feature `http1`).
 pub trait Service<F: Family>: Send + Sync {
     /// How the service behaves.
     const WORK: WorkClass = WorkClass::Quick;

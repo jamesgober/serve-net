@@ -994,7 +994,7 @@ pub trait HttpService: Send + Sync {
 
     /// After the 101 for an upgrade this service asked for in `head` left,
     /// and after `done` for that request. The conversation itself belongs to
-    /// the upgrade target (a [`WebSocketService`](crate::WebSocketService)).
+    /// the upgrade target (a `WebSocketService`, feature `ws`).
     fn upgraded(&self, env: &Envelope, conn: UpgradedConn) {
         let _ = (env, conn);
     }

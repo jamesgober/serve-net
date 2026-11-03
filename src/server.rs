@@ -558,7 +558,7 @@ where
         self.bind_family(crate::HttpFamily, service)
     }
 
-    /// As [`bind`](Self::bind), for a custom protocol family.
+    /// As `bind` (feature `http1`), for a custom protocol family.
     ///
     /// # Errors
     ///
