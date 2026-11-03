@@ -1,7 +1,7 @@
 # serve-net - API Reference
 
 > Reference for every public item in `serve-net`, with signatures, behaviour, errors, costs, and examples.
-> **Current release: `0.4.0`.** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
+> **Current release: `0.5.0`.** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -149,8 +149,8 @@ Every cost is a target on reference hardware. Numbers marked **[est.]** are esti
 |---|---|---|---|
 | (none) | always | the server, listeners, ingress, profiles, limits, hooks, snapshots, the engine and family traits | `0.3.0` |
 | `http1` | on | the HTTP family over http-net: `HttpService`, `HttpRequest`, `HttpReply`, `engine::Http1`, the Tier 1 functions `http` and `http_behind_proxy`, `testing` | `0.3.0` |
-| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.5.0` |
-| `ws` | off | WebSocket upgrades over ws-net: `engine::WebSocket`, `UpgradeTarget::WebSocket` (implies `http1`) | `0.5.0` |
+| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.6.0` |
+| `ws` | off | WebSocket upgrades over ws-net: `engine::WebSocket`, `UpgradeTarget::WebSocket` (implies `http1`) | `0.6.0` |
 | `h2` | off | HTTP/2 over h2-net: `engine::H2`, ALPN `h2` | after `1.0.0`, or earlier as a minor version when h2-net reaches its 0.3 |
 
 Features are additive. `--no-default-features` builds the server with custom families only and passes CI on its own. The crate has no third-party runtime dependency in any feature combination; its first-party dependencies are net-io (always), http-net, fcgi-net, ws-net, and h2-net (by feature), each at a published version.
@@ -308,7 +308,7 @@ A FastCGI responder for Apache (`mod_fcgid`, `mod_proxy_fcgi`) or nginx (`fastcg
 
 | Grade | Tier | Version | Feature |
 |---|---|---|---|
-| P1 | 1 | `0.5.0` | `fastcgi` |
+| P1 | 1 | `0.6.0` | `fastcgi` |
 
 Errors: `ServeError::Inherited` ("descriptor 0 is not a listening socket: the process was not started by a FastCGI process manager; use FastCgiListen::Tcp or Unix"), `ServeError::Bind`, `ServeError::Config` (`PublicBind`). `DescriptorZero` and `Unix` are Unix only (mod_fcgid on Windows uses named pipes, after `1.0.0`).
 
@@ -785,7 +785,7 @@ impl ListenerSpec {
     pub fn tcp<A: ToSocketAddrs>(name: &str, addr: A) -> Self;
     pub fn unix(name: &str, path: impl Into<PathBuf>) -> Self;                     // P1, 0.4.0
     pub fn inherited(name: &str) -> Self;                                           // P1, 0.4.0
-    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.5.0, Unix
+    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.6.0, Unix
     pub fn handed_off(name: &str, listener: net_io::ListenerHandle) -> Self;        // P0, 0.4.0
 }
 ```
@@ -911,7 +911,7 @@ pub enum Ingress {
     DirectTls,                                  // P0, 0.4.0: the same over TLS (net-io's TLS seam)
     Proxy(ProxySource),                         // behind a reverse proxy or load balancer
     Unix(UnixPeerTrust, Option<ProxySource>),   // P1, 0.4.0: None means the local peer is the client
-    FastCgi(FastCgiIngress),                    // P1, 0.5.0, feature fastcgi
+    FastCgi(FastCgiIngress),                    // P1, 0.6.0, feature fastcgi
 }
 impl Default for Ingress;   // Direct
 ```
@@ -928,7 +928,7 @@ How clients reach a listener, and therefore where the real client comes from. Ex
 
 | Grade | Tier | Version |
 |---|---|---|
-| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`); `0.5.0` (`FastCgi`) |
+| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`); `0.6.0` (`FastCgi`) |
 
 Errors (at `build`): `ForwardedOnDirect`, `TwoClientSources`, `PublicBind`, `TrustEmpty`, `TrustWildcard`, `TrustTooBroad`, `FastCgiTrust`, `TlsOnFastCgi`, `TlsWithoutAcceptor`, `PeerCredentialsUnavailable`.
 
@@ -1034,7 +1034,7 @@ impl FastCgiIngress {
 }
 ```
 
-The FastCGI ingress options. `REMOTE_ADDR` is believed only because only trusted front ends can connect (rule `FastCgiTrust` refuses an empty list on TCP). P1, Tier 2, `0.4.0`, feature `fastcgi`.
+The FastCGI ingress options. `REMOTE_ADDR` is believed only because only trusted front ends can connect (rule `FastCgiTrust` refuses an empty list on TCP). P1, Tier 2, `0.6.0`, feature `fastcgi`.
 
 ---
 
@@ -1242,13 +1242,13 @@ The compiled, immutable table, published through a [`Snapshot`](#snapshot) so a 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EngineChoice {
     #[default] Http1,
-    FastCgi,                                       // P1, 0.5.0
-    Http1OrH2ByAlpn,                               // P1, 0.5.0 (h2 with feature h2)
+    FastCgi,                                       // P1, 0.6.0
+    Http1OrH2ByAlpn,                               // P1, 0.6.0 (h2 with feature h2)
     Custom { alpn: &'static [&'static str] },      // a family given to bind_family; ALPN ids it serves
 }
 ```
 
-The engine a profile's connections start with, and the ALPN protocols offered on its TLS listeners. A profile without h2 never offers `h2`. An ALPN result with no compiled engine closes the connection (`EndReason::NoEngine`). ALPN choices on a listener without TLS are refused (`RuleId::AlpnWithoutTls`). P0 (`Http1`, `Custom`) `0.3.0`, P1 (`FastCgi`, `Http1OrH2ByAlpn`) `0.4.0`, Tier 2.
+The engine a profile's connections start with, and the ALPN protocols offered on its TLS listeners. A profile without h2 never offers `h2`. An ALPN result with no compiled engine closes the connection (`EndReason::NoEngine`). ALPN choices on a listener without TLS are refused (`RuleId::AlpnWithoutTls`). P0 (`Http1`, `Custom`) `0.3.0`, P1 (`FastCgi`, `Http1OrH2ByAlpn`) `0.6.0`, Tier 2.
 
 ---
 
@@ -1269,7 +1269,7 @@ pub trait HttpService: Send + Sync {
 
     fn call(&self, request: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome;
 
-    fn upgraded(&self, env: &Envelope, conn: UpgradedConn) {           // P1, 0.5.0
+    fn upgraded(&self, env: &Envelope, conn: UpgradedConn) {           // P1, 0.6.0
         let _ = (env, conn);
     }
 
@@ -1293,7 +1293,7 @@ A service used by a running server must also be `'static` (it moves to the worke
 
 | Grade | Tier | Version | Cost |
 |---|---|---|---|
-| P0 | 2 | `0.3.0` (`upgraded` `0.4.0`) | one direct call per method with inline dispatch, about 1 ns [est.] |
+| P0 | 2 | `0.3.0` (`upgraded` `0.6.0`) | one direct call per method with inline dispatch, about 1 ns [est.] |
 
 ```rust
 use serve_net::{BodyPolicy, Envelope, Finished, HeadAction, HttpHead, HttpReply, HttpRequest, HttpService, Outcome, WorkClass};
@@ -1378,7 +1378,7 @@ pub enum HeadAction {
     Proceed,                                          // the profile's body policy
     ProceedWith(BodyPolicy),
     Refuse { status: u16, retry_after: Option<Duration> },
-    Upgrade(UpgradeTarget),                           // P1, 0.5.0
+    Upgrade(UpgradeTarget),                           // P1, 0.6.0
 }
 impl HeadAction {
     pub const fn refuse(status: u16) -> Self;         // Refuse { status, retry_after: None }
@@ -1653,7 +1653,7 @@ impl UpgradedConn {
 }
 ```
 
-`head` returns `HeadAction::Upgrade(target)`; serve-net validates the handshake through the target engine (ws-net checks the WebSocket key and version and answers its own status on failure, before anything else is written), writes the 101, replaces the engine on the connection, feeds it the bytes that arrived with the request, switches deadlines and limits to the target profile, and calls `HttpService::upgraded`. `Upgrade: h2c` never reaches this path: it is not an upgrade offer, and the request is served as HTTP/1.1. A 2xx to `CONNECT` is refused unless a profile allows tunnels (after `1.0.0`). P1, Tier 2, `0.4.0`. `WebSocketConn` is specified with [`engine::WebSocket`](#enginewebsocket).
+`head` returns `HeadAction::Upgrade(target)`; serve-net validates the handshake through the target engine (ws-net checks the WebSocket key and version and answers its own status on failure, before anything else is written), writes the 101, replaces the engine on the connection, feeds it the bytes that arrived with the request, switches deadlines and limits to the target profile, and calls `HttpService::upgraded`. `Upgrade: h2c` never reaches this path: it is not an upgrade offer, and the request is served as HTTP/1.1. A 2xx to `CONNECT` is refused unless a profile allows tunnels (after `1.0.0`). P1, Tier 2, `0.6.0`. `WebSocketConn` is specified with [`engine::WebSocket`](#enginewebsocket).
 
 ---
 
@@ -2524,7 +2524,7 @@ The HTTP/1.1 engine: an adapter over `http_net::ServerConn` with the profile's `
 
 ### `engine::FastCgi`
 
-The FastCGI responder: an adapter over fcgi-net. One request at a time per connection; answers `FCGI_GET_VALUES`; an `FCGI_ABORT_REQUEST` ends the request with `RequestEnd::PeerGone` and cancels a pending `ReplyToken`. P1, Tier 3, `0.4.0`, feature `fastcgi`.
+The FastCGI responder: an adapter over fcgi-net. One request at a time per connection; answers `FCGI_GET_VALUES`; an `FCGI_ABORT_REQUEST` ends the request with `RequestEnd::PeerGone` and cancels a pending `ReplyToken`. P1, Tier 3, `0.6.0`, feature `fastcgi`.
 
 ### `engine::WebSocket`
 
@@ -2532,7 +2532,7 @@ The FastCGI responder: an adapter over fcgi-net. One request at a time per conne
 pub struct WebSocketConn { /* the ws-net connection and its socket */ }
 ```
 
-The WebSocket engine after an upgrade: an adapter over `ws_net::Connection::server()` with the target profile's limits; ping handling stays in ws-net; a drain closes with 1001 ("going away"). `WebSocketConn` (from `UpgradedConn::into_websocket`) sends and receives messages through the worker. P1, Tier 3, `0.4.0`, feature `ws`.
+The WebSocket engine after an upgrade: an adapter over `ws_net::Connection::server()` with the target profile's limits; ping handling stays in ws-net; a drain closes with 1001 ("going away"). `WebSocketConn` (from `UpgradedConn::into_websocket`) sends and receives messages through the worker. P1, Tier 3, `0.6.0`, feature `ws`.
 
 ### `engine::H2`
 

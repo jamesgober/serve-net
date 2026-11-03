@@ -11,6 +11,14 @@
 
 ## [Unreleased]
 
+---
+
+## [0.5.0] - 2026-11-03
+
+The reactor: thousands of connections per worker, streaming bodies, an
+offload pool for slow work, and restarts that no longer lose requests under
+load.
+
 ### Added
 
 - `ServerBuilder::catch_service_panics`: a caught panic answers 500, closes
@@ -46,6 +54,11 @@
 - A blocking pool of 17 threads or fewer with no `max_connections` had a soft
   connection cap of 1 and served one client at a time; the headroom is now at
   most a quarter of the pool.
+
+### Moved
+
+- WebSocket upgrades, FastCGI, `Http1OrH2ByAlpn`, and an end-to-end TLS test
+  move to 0.6.0. FastCGI and TLS wait for fcgi-net and tls-net.
 
 ---
 
@@ -199,7 +212,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/serve-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/serve-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/serve-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/serve-net/compare/v0.1.0...v0.2.0

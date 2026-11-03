@@ -8,9 +8,9 @@
 //!
 //! ## Status
 //!
-//! `0.4.0`: HTTP/1.1 over net-io's blocking driver, directly, over TLS, behind
-//! a reverse proxy, or on a Unix socket, with live reload and restarts that
-//! drop nothing. The public API is locked in `docs/API.md`, and the design behind
+//! `0.5.0`: HTTP/1.1 over net-io's reactor (or its blocking pool), directly,
+//! over TLS, behind a reverse proxy, or on a Unix socket, with streaming bodies,
+//! an offload pool, live reload, and restarts that drop nothing. The public API is locked in `docs/API.md`, and the design behind
 //! it in `dev/PLAN.md` (both in the
 //! [repository](https://github.com/jamesgober/serve-net)).
 //!
