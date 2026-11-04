@@ -42,3 +42,10 @@ path = "fuzz_targets/config.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "forwarded_proto_host"
+path = "fuzz_targets/forwarded_proto_host.rs"
+test = false
+doc = false
+bench = false

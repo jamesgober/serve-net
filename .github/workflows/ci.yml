@@ -115,7 +115,7 @@ jobs:
       - name: Run each target for 30 s (corpus outside the repository)
         working-directory: fuzz
         run: |
-          for t in forwarded_xff forwarded_rfc7239 conn_sim config; do
+          for t in forwarded_xff forwarded_rfc7239 forwarded_proto_host conn_sim config; do
             mkdir -p "$RUNNER_TEMP/corpus/$t"
             # The prebuilt cargo-fuzz is a musl build and would default to its
             # own target, which the address sanitizer does not support.
