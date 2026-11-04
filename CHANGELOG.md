@@ -13,6 +13,23 @@
 
 ---
 
+## [0.6.1] - 2026-11-04
+
+### Security
+
+- net-io 0.6. net-io 0.5.0 did not apply the minimum transfer rate on the
+  reactor to a peer that sent more often than the check interval, so a client
+  trickling a byte every 40 ms kept its connection (slowloris). The reactor is
+  serve-net's default driver, so 0.5.0 and 0.6.0 were affected with default
+  settings; the blocking pool was not.
+
+### Fixed
+
+- serve-net 0.5.0 and 0.6.0 could not be added to a new project: they require
+  net-io 0.5, whose only release is yanked. 0.6.1 requires net-io 0.6.
+
+---
+
 ## [0.6.0] - 2026-11-04
 
 Upgrades: WebSocket on the same listener, a run under real systemd in CI,
@@ -257,7 +274,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/jamesgober/serve-net/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/jamesgober/serve-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/serve-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/serve-net/compare/v0.3.0...v0.4.0

@@ -150,6 +150,7 @@ Exit: every item in the register below is closed or carried into `docs/STABILITY
 | Item | From | What to decide or do |
 |---|---|---|
 | The forwarded walk measured about 165 ns for three entries against a 100 ns target [est.]; 137 ns at 0.6 (`docs/PERFORMANCE.md`) | 0.3 progress, D-040 | meet the target or record why not, with numbers |
+| `test_loopback_a_slow_body_is_answered_by_the_request_deadline` failed once on the Windows blocking driver in a local gate under heavy machine load (no 408 within its 5 s window after the manual clock passed the deadline); 16 of 16 runs passed after, alone and with its binary | 0.6.1 gate | find whether a wake can miss a worker blocked in a read under `SO_RCVTIMEO` with a manual clock, and make the test wait on the event rather than a fixed window |
 | serve-net's own work per keep-alive request is 172 ns against NFR-1's 150 ns | D-081 | profile on a Linux host with `perf` (the replied-at clock read, the reply build and encode, the second head view, the counters); meet the target or record why not |
 | NFR-5 and the overload targets are not measured | D-081 | run PLAN section 10.2 on reference hardware before 1.0; a missed 20% target blocks 1.0 |
 | Every [est.] cost in `dev/PLAN.md` | PLAN section 9 and the threat table | each replaced by a benchmark (due at 0.6), or listed as unmeasured with the reason |

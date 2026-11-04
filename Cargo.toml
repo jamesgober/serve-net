@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "serve-net"
-version = "0.6.0"
+version = "0.6.1"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -61,7 +61,7 @@ ws = ["http1", "dep:ws-net"]
 [dependencies]
 # First-party crates at published versions only (dev/PLAN.md section 3.2).
 # net-io: the transport (required).
-net-io = "0.5"
+net-io = "0.6"
 http-net = { version = "0.9", default-features = false, optional = true }
 ws-net = { version = "0.2", default-features = false, optional = true }
 
