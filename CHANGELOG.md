@@ -13,6 +13,29 @@
 
 ---
 
+## [0.6.2] - 2026-11-04
+
+### Security
+
+- With `ProxySource::trust_host(true)`, a client that was not a trusted proxy
+  could set the authority the service saw in `call` by sending
+  `X-Forwarded-Host` or `Forwarded: host=`. `head` saw the right authority; the
+  view of the request built again for `call` took the host field without
+  checking that the walk had passed a trusted hop. The authority now comes from
+  a forwarded field only when the peer is a trusted proxy, at `head` and at
+  `call` alike. Affects 0.3.0 to 0.6.1 on listeners behind forwarded headers
+  with `trust_host` on; the client address and the scheme were not affected.
+
+### Added
+
+- `tests/threats.rs`: attack tests for T-3 (a client that never reads),
+  T-6 (10,000 pipelined requests), T-8, T-13, T-17, T-29 (a request kept
+  open through a drain), T-34, and T-35.
+- The `forwarded_proto_host` fuzz target (T-17), which found the issue above;
+  its oracle requires `head` and `call` to see the same request.
+
+---
+
 ## [0.6.1] - 2026-11-04
 
 ### Security
@@ -274,7 +297,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/jamesgober/serve-net/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/jamesgober/serve-net/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/jamesgober/serve-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/serve-net/compare/v0.4.0...v0.5.0

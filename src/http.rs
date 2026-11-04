@@ -725,8 +725,11 @@ impl Family for HttpFamily {
         match proxy.kind {
             ProxyKind::Headers(source) => {
                 if let Some(client) = cx.resolved {
-                    // Built again for the call: the walk already ran at the head.
-                    let host = if proxy.trust_host {
+                    // Built again for the call: the walk already ran at the
+                    // head. The host is the proxy's only when that walk went
+                    // through a trusted hop; from any other peer the
+                    // forwarded fields are the client's own words (T-17).
+                    let host = if proxy.trust_host && client.ingress() == IngressKind::Forwarded {
                         forwarded::trusted_host(source, &raw)
                     } else {
                         None
