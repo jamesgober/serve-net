@@ -18,6 +18,7 @@ env:
 jobs:
   test:
     name: Test (${{ matrix.os }} / ${{ matrix.rust }})
+    timeout-minutes: 30
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -58,6 +59,7 @@ jobs:
 
   idle:
     name: 10,000 idle connections (${{ matrix.os }})
+    timeout-minutes: 30
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -79,6 +81,7 @@ jobs:
 
   security:
     name: Security (audit + deny)
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -97,6 +100,7 @@ jobs:
 
   fuzz:
     name: Fuzz smoke (nightly)
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -120,6 +124,7 @@ jobs:
 
   interop:
     name: Interop (nginx, Apache, HAProxy)
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -130,6 +135,7 @@ jobs:
 
   loom:
     name: Loom models
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "--cfg serve_net_loom -D warnings"
@@ -140,3 +146,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run the loom models
         run: cargo test --lib --release loom_tests
+
+  systemd:
+    name: systemd (notify-reload, watchdog)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Ten reloads under load as a real unit
+        run: bash .github/systemd/run.sh

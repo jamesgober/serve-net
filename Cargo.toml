@@ -104,6 +104,10 @@ required-features = ["http1"]
 name = "websocket"
 required-features = ["ws"]
 
+[[example]]
+name = "systemd"
+required-features = ["http1"]
+
 [[bench]]
 name = "core"
 harness = false

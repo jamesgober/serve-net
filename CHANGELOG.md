@@ -19,6 +19,8 @@
   `UpgradedConn`, `HttpService::upgraded`, `Family::upgrade`, and
   `RequestEnd::Upgraded`. Each message passes the control line and the
   checkpoint; pings after a quiet interval; output bounded per connection.
+- `examples/systemd.rs` and a CI job that runs it under real systemd as a
+  `Type=notify-reload` unit with a watchdog, reloaded ten times under load.
 
 ### Changed
 
