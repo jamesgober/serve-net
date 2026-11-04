@@ -1,7 +1,7 @@
 # serve-net - API Reference
 
 > Reference for every public item in `serve-net`, with signatures, behaviour, errors, costs, and examples.
-> **Current release: `0.5.0`.** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
+> **Current release: `0.6.0`.** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -70,7 +70,7 @@
   - [`Finished`, `RequestEnd`](#finished-requestend)
   - [`WorkClass`](#workclass)
   - [`DetachedHead`](#detachedhead)
-  - [Upgrades: `UpgradeTarget`, `UpgradedConn`](#upgrades-upgradetarget-upgradedconn)
+  - [Upgrades: `UpgradeTarget`, `UpgradedConn`, WebSocket](#upgrades-upgradetarget-upgradedconn-websocket)
 - [Limits, keep-alive, workers](#limits-keep-alive-workers)
   - [`Limits`](#limits)
   - [`KeepAlive`](#keepalive)
@@ -149,8 +149,8 @@ Every cost is a target on reference hardware. Numbers marked **[est.]** are esti
 |---|---|---|---|
 | (none) | always | the server, listeners, ingress, profiles, limits, hooks, snapshots, the engine and family traits | `0.3.0` |
 | `http1` | on | the HTTP family over http-net: `HttpService`, `HttpRequest`, `HttpReply`, `engine::Http1`, the Tier 1 functions `http` and `http_behind_proxy`, `testing` | `0.3.0` |
-| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.6.0` |
-| `ws` | off | WebSocket upgrades over ws-net: `engine::WebSocket`, `UpgradeTarget::WebSocket` (implies `http1`) | `0.6.0` |
+| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.7.0` |
+| `ws` | off | WebSocket upgrades over ws-net: `UpgradeTarget::WebSocket`, `WebSocketTarget`, `WebSocketService`, `WebSocketConn`, `WsMessage`, `WsSendError`, the `ws_net` re-export (implies `http1`) | `0.6.0` |
 | `h2` | off | HTTP/2 over h2-net: `engine::H2`, ALPN `h2` | after `1.0.0`, or earlier as a minor version when h2-net reaches its 0.3 |
 
 Features are additive. `--no-default-features` builds the server with custom families only and passes CI on its own. The crate has no third-party runtime dependency in any feature combination; its first-party dependencies are net-io (always), http-net, fcgi-net, ws-net, and h2-net (by feature), each at a published version.
@@ -308,7 +308,7 @@ A FastCGI responder for Apache (`mod_fcgid`, `mod_proxy_fcgi`) or nginx (`fastcg
 
 | Grade | Tier | Version | Feature |
 |---|---|---|---|
-| P1 | 1 | `0.6.0` | `fastcgi` |
+| P1 | 1 | `0.7.0` | `fastcgi` |
 
 Errors: `ServeError::Inherited` ("descriptor 0 is not a listening socket: the process was not started by a FastCGI process manager; use FastCgiListen::Tcp or Unix"), `ServeError::Bind`, `ServeError::Config` (`PublicBind`). `DescriptorZero` and `Unix` are Unix only (mod_fcgid on Windows uses named pipes, after `1.0.0`).
 
@@ -785,7 +785,7 @@ impl ListenerSpec {
     pub fn tcp<A: ToSocketAddrs>(name: &str, addr: A) -> Self;
     pub fn unix(name: &str, path: impl Into<PathBuf>) -> Self;                     // P1, 0.4.0
     pub fn inherited(name: &str) -> Self;                                           // P1, 0.4.0
-    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.6.0, Unix
+    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.7.0, Unix
     pub fn handed_off(name: &str, listener: net_io::ListenerHandle) -> Self;        // P0, 0.4.0
 }
 ```
@@ -911,7 +911,7 @@ pub enum Ingress {
     DirectTls,                                  // P0, 0.4.0: the same over TLS (net-io's TLS seam)
     Proxy(ProxySource),                         // behind a reverse proxy or load balancer
     Unix(UnixPeerTrust, Option<ProxySource>),   // P1, 0.4.0: None means the local peer is the client
-    FastCgi(FastCgiIngress),                    // P1, 0.6.0, feature fastcgi
+    FastCgi(FastCgiIngress),                    // P1, 0.7.0, feature fastcgi
 }
 impl Default for Ingress;   // Direct
 ```
@@ -928,7 +928,7 @@ How clients reach a listener, and therefore where the real client comes from. Ex
 
 | Grade | Tier | Version |
 |---|---|---|
-| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`); `0.6.0` (`FastCgi`) |
+| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`); `0.7.0` (`FastCgi`) |
 
 Errors (at `build`): `ForwardedOnDirect`, `TwoClientSources`, `PublicBind`, `TrustEmpty`, `TrustWildcard`, `TrustTooBroad`, `FastCgiTrust`, `TlsOnFastCgi`, `TlsWithoutAcceptor`, `PeerCredentialsUnavailable`.
 
@@ -1034,7 +1034,7 @@ impl FastCgiIngress {
 }
 ```
 
-The FastCGI ingress options. `REMOTE_ADDR` is believed only because only trusted front ends can connect (rule `FastCgiTrust` refuses an empty list on TCP). P1, Tier 2, `0.6.0`, feature `fastcgi`.
+The FastCGI ingress options. `REMOTE_ADDR` is believed only because only trusted front ends can connect (rule `FastCgiTrust` refuses an empty list on TCP). P1, Tier 2, `0.7.0`, feature `fastcgi`.
 
 ---
 
@@ -1242,13 +1242,13 @@ The compiled, immutable table, published through a [`Snapshot`](#snapshot) so a 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EngineChoice {
     #[default] Http1,
-    FastCgi,                                       // P1, 0.6.0
-    Http1OrH2ByAlpn,                               // P1, 0.6.0 (h2 with feature h2)
+    FastCgi,                                       // P1, 0.7.0
+    Http1OrH2ByAlpn,                               // P1, 0.7.0 (h2 with feature h2)
     Custom { alpn: &'static [&'static str] },      // a family given to bind_family; ALPN ids it serves
 }
 ```
 
-The engine a profile's connections start with, and the ALPN protocols offered on its TLS listeners. A profile without h2 never offers `h2`. An ALPN result with no compiled engine closes the connection (`EndReason::NoEngine`). ALPN choices on a listener without TLS are refused (`RuleId::AlpnWithoutTls`). P0 (`Http1`, `Custom`) `0.3.0`, P1 (`FastCgi`, `Http1OrH2ByAlpn`) `0.6.0`, Tier 2.
+The engine a profile's connections start with, and the ALPN protocols offered on its TLS listeners. A profile without h2 never offers `h2`. An ALPN result with no compiled engine closes the connection (`EndReason::NoEngine`). ALPN choices on a listener without TLS are refused (`RuleId::AlpnWithoutTls`). P0 (`Http1`, `Custom`) `0.3.0`, P1 (`FastCgi`, `Http1OrH2ByAlpn`) `0.7.0`, Tier 2.
 
 ---
 
@@ -1286,7 +1286,7 @@ The contract between serve-net and an HTTP service, in the order serve-net calls
 | `head` | the head is complete; before admission and before any body byte | choose the lane (`env.set_lane`) and the body policy, refuse, ask for an upgrade, store one word (`env.set_user_word`) | block, read the body |
 | (`Admit`, `Checkpoint`) | serve-net's admission and revocation checks | | |
 | `call` | the body is complete (buffered policy) | answer, defer (`reply.defer()`), close | keep borrowed request data past return (use `request.detach_head()`) |
-| `upgraded` | after a 101 the service asked for | own the new conversation | |
+| `upgraded` | after the 101 the service asked for left, after `done` for that request | note the switch; the conversation belongs to the upgrade target | |
 | `done` | exactly once per request that reached `head`, on every path, after the last reply byte was handed to net-io or the request ended any other way | return per-request resources, record metrics | fail (it returns `()`) |
 
 A service used by a running server must also be `'static` (it moves to the worker threads); `bind` requires it. The traits themselves do not, so `testing::respond` can borrow a service (D-038). `WORK` says how the service behaves ([`WorkClass`](#workclass)); [`Dispatch`](#dispatch-inline) implementations use it. A service reports failure through the reply (a status) or `Outcome::Close`; a panic is handled per [`catch_service_panics`](#serverbuilder-configuration).
@@ -1373,7 +1373,7 @@ assert_eq!(reply.status, 200);
 
 ```rust
 #[non_exhaustive]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum HeadAction {
     Proceed,                                          // the profile's body policy
     ProceedWith(BodyPolicy),
@@ -1385,7 +1385,7 @@ impl HeadAction {
 }
 ```
 
-What `head` decided. `Refuse` answers with the engine's refusal bytes for that status (a fixed short body, the close signal, `Retry-After` when given) without reading the body; a status outside 400 to 599 becomes 500 and is reported. `Upgrade` for a protocol the request did not offer is a service bug: serve-net answers 500 and reports it. P0, Tier 2, `0.3.0`.
+What `head` decided. `Refuse` answers with the engine's refusal bytes for that status (a fixed short body, the close signal, `Retry-After` when given) without reading the body; a status outside 400 to 599 becomes 500 and is reported. `Upgrade` switches protocols after this request ([Upgrades](#upgrades-upgradetarget-upgradedconn-websocket)); one the request did not offer is a service bug: serve-net answers 500 and reports it. `HeadAction` is `Clone` and not `Copy` since `0.6.0`, as `Upgrade` holds the target. P0, Tier 2, `0.3.0`.
 
 ### `BodyPolicy`
 
@@ -1601,7 +1601,7 @@ pub struct Finished {
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RequestEnd { Replied, Refused(RefusalKind), Shed, Denied, TimedOut, PeerGone, Drained, Killed, ServicePanic, Dropped }
+pub enum RequestEnd { Replied, Refused(RefusalKind), Shed, Denied, TimedOut, PeerGone, Drained, Killed, ServicePanic, Dropped, Upgraded }
 ```
 
 What happened to a request, given to `done` and `Observer::request_finished`. `Dropped` means a `ReplyToken` was dropped without `complete`. `head_reads` is a cheap tool signal: a browser sends its head in one or two reads, a slowloris tool in many (idea I-4). P0, Tier 2, `0.3.0`.
@@ -1636,24 +1636,96 @@ impl fmt::Debug for DetachedHead;   // credential values redacted
 
 An owned, `Send` copy of a request head with the same accessors, for work that outlives `call`. Made from pooled vectors (one copy of the head, typically under 1 KiB, about 20-60 ns [est.]) and returned to its worker's pool on drop. The head is always copied, never swapped with the connection buffer, because that buffer still holds pipelined input and the body window. P0, Tier 3, `0.3.0`.
 
-### Upgrades: `UpgradeTarget`, `UpgradedConn`
+### Upgrades: `UpgradeTarget`, `UpgradedConn`, WebSocket
 
 ```rust
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum UpgradeTarget {
-    WebSocket { limits: ws_net::Limits, profile: Option<ProfileId> },        // feature ws
-    Custom { protocol: &'static str, profile: Option<ProfileId> },          // a custom family's engine
+    WebSocket(WebSocketTarget),                                   // feature ws
 }
+impl From<WebSocketTarget> for UpgradeTarget;
 
-pub struct UpgradedConn { /* the connection, now owned by the new engine */ }
+#[derive(Debug)]
+pub struct UpgradedConn { /* the envelope and the protocol switched to */ }
 impl UpgradedConn {
     pub fn envelope(&self) -> &Envelope;
-    pub fn into_websocket(self) -> Result<WebSocketConn, UpgradedConn>;     // feature ws
+    pub fn protocol(&self) -> &'static str;                       // "websocket"
+    pub fn subprotocol(&self) -> Option<&'static str>;            // what the 101 named
 }
+
+// feature ws
+#[derive(Clone)]
+#[must_use]
+pub struct WebSocketTarget { /* the service, budgets, subprotocol, pacing */ }
+impl WebSocketTarget {
+    pub fn new<S: WebSocketService>(service: S) -> Self;          // 64 KiB frames, 1 MiB messages, ping after 30 s
+    pub fn shared(service: Arc<dyn WebSocketService>) -> Self;    // one reference count per upgrade
+    pub fn limits(self, limits: ws_net::Limits) -> Self;
+    pub fn subprotocol(self, name: &'static str) -> Self;         // must be one the client offered
+    pub fn profile(self, id: ProfileId) -> Self;                  // whose max_pending_output applies after the switch
+    pub fn max_pending_output(self, bytes: usize) -> Self;
+    pub fn ping_interval(self, interval: Duration) -> Self;       // at least 1 s
+}
+
+pub trait WebSocketService: Send + Sync + 'static {
+    fn opened(&self, env: &Envelope, conn: &mut WebSocketConn<'_>) { let _ = (env, conn); }
+    fn message(&self, env: &Envelope, message: WsMessage<'_>, conn: &mut WebSocketConn<'_>);
+    fn closed(&self, env: &Envelope, code: Option<u16>) { let _ = (env, code); }
+}
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WsMessage<'a> { Text(&'a str), Binary(&'a [u8]) }
+
+pub struct WebSocketConn<'a> { /* the connection's sending side during a call */ }
+impl WebSocketConn<'_> {
+    pub fn send_text(&mut self, text: &str) -> Result<(), WsSendError>;
+    pub fn send_binary(&mut self, data: &[u8]) -> Result<(), WsSendError>;
+    pub fn close(&mut self, code: u16, reason: &str) -> Result<(), WsSendError>;
+    pub fn pending_output(&mut self) -> usize;
+}
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WsSendError { Full, Closed, Invalid }
 ```
 
-`head` returns `HeadAction::Upgrade(target)`; serve-net validates the handshake through the target engine (ws-net checks the WebSocket key and version and answers its own status on failure, before anything else is written), writes the 101, replaces the engine on the connection, feeds it the bytes that arrived with the request, switches deadlines and limits to the target profile, and calls `HttpService::upgraded`. `Upgrade: h2c` never reaches this path: it is not an upgrade offer, and the request is served as HTTP/1.1. A 2xx to `CONNECT` is refused unless a profile allows tunnels (after `1.0.0`). P1, Tier 2, `0.6.0`. `WebSocketConn` is specified with [`engine::WebSocket`](#enginewebsocket).
+`head` returns `HeadAction::Upgrade(target)`. The upgrade request then goes through admission and the checkpoints like any request (a declared body is refused with 413). serve-net checks the handshake through ws-net (`ServerHandshake::from_request`: method, version 13, the key, `Host`, `Origin`, the offered subprotocols) and answers an invalid one with 400 before anything else is written. An upgrade the client never offered, or a subprotocol it did not offer, is a service bug: 500, reported through `Observer::service_error`. Otherwise http-net writes the 101 with `sec-websocket-accept`, the upgrade request ends (`done` with `RequestEnd::Upgraded`, its admission released), `HttpService::upgraded` runs, the HTTP engine's buffers are released, and the bytes that arrived after the request go to ws-net, never to the HTTP parser (T-21). `Upgrade: h2c` never reaches this path: it is not an upgrade offer, and the request is served as HTTP/1.1. A 2xx to `CONNECT` is refused unless a profile allows tunnels (after `1.0.0`).
+
+After the switch the target's `WebSocketService` is called on the worker: `opened` once, `message` once per complete message (text validated as UTF-8, fragments joined), `closed` exactly once. Before each message the connection passes the checks a request passes before its service call: the control line (draining or stopping closes with 1001, lockdown or a shed lane with 1013) and `Checkpoint` at `BeforeDispatch` (a denial closes with 1008, a kill aborts), so a session revoked while the socket is open stops at the next message. A protocol violation closes with ws-net's code (1002, 1007, 1009); a caught panic (`catch_service_panics`) with 1011. Pings are answered by ws-net. A connection quiet for `ping_interval` is pinged, and one that sends nothing for another interval is closed. A close handshake the service starts waits 5 s for the client's Close.
+
+Sends go into ws-net's output and leave when the call returns. Output is bounded: past `max_pending_output` a send returns `WsSendError::Full`, and the connection stops reading until the client takes what is queued, so a client that does not read holds back its own input, not the server's memory.
+
+Not yet: sending from another thread (server push) and a 1001 Close at the start of a drain both need net-io to wake a connection that waits for input; net-io 0.5 delivers wakes only to parked connections (asked of net-io). Until then a drain closes an open WebSocket without a Close frame (the client sees 1006), and a service sends only from its own calls.
+
+| Grade | Tier | Version | Cost |
+|---|---|---|---|
+| P1 | 2 | `0.6.0` | the upgrade: one SHA-1 of the key and one 101, about 1-2 µs [est.]; per message: one copy of the message out of ws-net (so the service can send while it reads it), the control-line load and the checkpoint call, about 50 ns plus the copy [est.]; per idle connection: ws-net's connection, serve-net's copy buffers emptied after each message (at most 64 KiB kept), about 1 KiB [est., measured in 0.6's performance pass] |
+
+```rust
+use std::sync::Arc;
+use serve_net::{Envelope, HeadAction, HttpHead, WebSocketConn, WebSocketService, WebSocketTarget, WsMessage};
+
+struct Echo;
+impl WebSocketService for Echo {
+    fn message(&self, _env: &Envelope, message: WsMessage<'_>, conn: &mut WebSocketConn<'_>) {
+        let _ = match message {
+            WsMessage::Text(t) => conn.send_text(t),
+            WsMessage::Binary(b) => conn.send_binary(b),
+            _ => Ok(()),
+        };
+    }
+}
+
+// In HttpService::head:
+fn head(echo: &Arc<dyn WebSocketService>, head: &HttpHead<'_>) -> HeadAction {
+    match head.path() {
+        "/ws" => HeadAction::Upgrade(WebSocketTarget::shared(Arc::clone(echo)).into()),
+        _ => HeadAction::Proceed,
+    }
+}
+```
 
 ---
 
@@ -2454,6 +2526,16 @@ pub trait Family: Send + Sync + 'static {
     fn clear_parts(&self, parts: &mut Self::Parts, wipe: bool);
     fn respond(&self, engine: &mut Self::Engine, parts: &mut Self::Parts, unix_secs: u64, out: &mut OutBuf)
         -> Result<u16, EngineError>;                                    // the status written
+
+    // Provided: streaming (0.5.0), detaching for Offload (0.5.0), upgrades (0.6.0).
+    fn request_chunk<'a>(&self, head: Self::Head<'a>, body: &'a [u8], last: bool) -> Self::Request<'a>;
+    fn reply_stream(&self, parts: &Self::Parts) -> bool { false }
+    fn respond_stream(&self, engine: &mut Self::Engine, parts: &mut Self::Parts, first: bool, last: bool,
+        unix_secs: u64, out: &mut OutBuf) -> Result<u16, EngineError>;  // default: 500
+    fn next_stream_part(&self, parts: &mut Self::Parts, wipe: bool);
+    fn detach(&self, request: &Self::Request<'_>) -> Option<Box<dyn DetachedRequest<Self>>> where Self: Sized { None }
+    fn upgrade(&self, engine: &mut Self::Engine, target: &UpgradeTarget, unix_secs: u64, out: &mut OutBuf)
+        -> Result<(), EngineError>;                                     // check the handshake, write the switch; default: 500
 }
 
 pub struct HeadContext<'c> { /* the connection's client and the listener's ingress rules */ }
@@ -2484,6 +2566,7 @@ pub trait Service<F: Family>: Send + Sync {
     const WORK: WorkClass = WorkClass::Quick;
     fn head(&self, head: &F::Head<'_>, env: &mut Envelope) -> HeadAction { let _ = (head, env); HeadAction::Proceed }
     fn call(&self, request: &F::Request<'_>, env: &Envelope, reply: &mut Reply<F>) -> Outcome;
+    fn upgraded(&self, env: &Envelope, conn: UpgradedConn) { let _ = (env, conn); }      // 0.6.0
     fn done(&self, env: &Envelope, finished: &Finished) { let _ = (env, finished); }
 }
 impl<S: HttpService> Service<HttpFamily> for S;
@@ -2524,15 +2607,11 @@ The HTTP/1.1 engine: an adapter over `http_net::ServerConn` with the profile's `
 
 ### `engine::FastCgi`
 
-The FastCGI responder: an adapter over fcgi-net. One request at a time per connection; answers `FCGI_GET_VALUES`; an `FCGI_ABORT_REQUEST` ends the request with `RequestEnd::PeerGone` and cancels a pending `ReplyToken`. P1, Tier 3, `0.6.0`, feature `fastcgi`.
+The FastCGI responder: an adapter over fcgi-net. One request at a time per connection; answers `FCGI_GET_VALUES`; an `FCGI_ABORT_REQUEST` ends the request with `RequestEnd::PeerGone` and cancels a pending `ReplyToken`. P1, Tier 3, `0.7.0`, feature `fastcgi`.
 
 ### `engine::WebSocket`
 
-```rust
-pub struct WebSocketConn { /* the ws-net connection and its socket */ }
-```
-
-The WebSocket engine after an upgrade: an adapter over `ws_net::Connection::server()` with the target profile's limits; ping handling stays in ws-net; a drain closes with 1001 ("going away"). `WebSocketConn` (from `UpgradedConn::into_websocket`) sends and receives messages through the worker. P1, Tier 3, `0.6.0`, feature `ws`.
+The WebSocket side of a connection after an upgrade is ws-net's `Connection::server()` with the target's budgets, driven by the connection's machine rather than an `Engine` of its own: see [Upgrades](#upgrades-upgradetarget-upgradedconn-websocket). `WebSocketConn` is the sending side a `WebSocketService` gets. P1, Tier 3, `0.6.0`, feature `ws`.
 
 ### `engine::H2`
 

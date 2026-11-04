@@ -75,7 +75,7 @@ pub(crate) struct Link<P> {
 }
 
 /// The reply a service fills: its family's reply data plus what serve-net
-/// needs to defer it. For HTTP this is [`HttpReply`](crate::HttpReply).
+/// needs to defer it. For HTTP this is `HttpReply` (feature `http1`).
 pub struct Reply<F: Family> {
     pub(crate) parts: F::Parts,
     pub(crate) link: Option<Link<F::Parts>>,

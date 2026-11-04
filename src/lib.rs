@@ -8,9 +8,9 @@
 //!
 //! ## Status
 //!
-//! `0.5.0`: HTTP/1.1 over net-io's reactor (or its blocking pool), directly,
-//! over TLS, behind a reverse proxy, or on a Unix socket, with streaming bodies,
-//! an offload pool, live reload, and restarts that drop nothing. The public API is locked in `docs/API.md`, and the design behind
+//! `0.6.0`: HTTP/1.1 over net-io's reactor (or its blocking pool), directly,
+//! over TLS, behind a reverse proxy, or on a Unix socket, with WebSocket
+//! upgrades (feature `ws`), streaming bodies, an offload pool, live reload, and restarts that drop nothing. The public API is locked in `docs/API.md`, and the design behind
 //! it in `dev/PLAN.md` (both in the
 //! [repository](https://github.com/jamesgober/serve-net)).
 //!
@@ -60,6 +60,8 @@ mod stats;
 mod sync;
 #[cfg(feature = "http1")]
 pub mod testing;
+#[cfg(feature = "ws")]
+mod ws;
 
 pub use client::{ClientInfo, IngressKind, Scheme};
 pub use config::{
@@ -91,15 +93,22 @@ pub use reload::{ReloadSummary, ServerConfig};
 pub use reply::{CompleteError, Reply, ReplyToken};
 pub use running::{Bound, DrainHandle, DrainReport, Running};
 pub use server::{Built, Server, ServerBuilder};
-pub use service::{BodyPolicy, Finished, HeadAction, Outcome, RequestEnd, WorkClass};
+pub use service::{
+    BodyPolicy, Finished, HeadAction, Outcome, RequestEnd, UpgradeTarget, UpgradedConn, WorkClass,
+};
 pub use snapshot::{Snapshot, SnapshotReader};
 pub use stats::Stats;
+#[cfg(feature = "ws")]
+pub use ws::{WebSocketConn, WebSocketService, WebSocketTarget, WsMessage, WsSendError};
 
 /// http-net, for its engine limits and types.
 #[cfg(feature = "http1")]
 pub use http_net;
 /// net-io, for everything serve-net does not re-export by name.
 pub use net_io;
+/// ws-net, for its budgets and close codes.
+#[cfg(feature = "ws")]
+pub use ws_net;
 
 /// Crate version string, populated by Cargo at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

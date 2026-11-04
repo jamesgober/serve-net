@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "serve-net"
-version = "0.5.0"
+version = "0.6.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -51,6 +51,9 @@ default = ["http1"]
 # The HTTP family over http-net: HttpService, HttpRequest, HttpReply,
 # engine::Http1, the Tier 1 functions, and the testing helpers.
 http1 = ["dep:http-net"]
+# WebSocket upgrades over ws-net: UpgradeTarget::WebSocket, WebSocketService,
+# WebSocketTarget, WebSocketConn.
+ws = ["http1", "dep:ws-net"]
 
 
 # DEPENDENCIES
@@ -60,6 +63,7 @@ http1 = ["dep:http-net"]
 # net-io: the transport (required).
 net-io = "0.5"
 http-net = { version = "0.9", default-features = false, optional = true }
+ws-net = { version = "0.2", default-features = false, optional = true }
 
 
 # DEV DEPENDENCIES
@@ -67,6 +71,8 @@ http-net = { version = "0.9", default-features = false, optional = true }
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# The client side of the WebSocket tests (masking needs `std`).
+ws-net = "0.2"
 
 # The loom models run with RUSTFLAGS="--cfg serve_net_loom" (a name of our
 # own: `--cfg loom` reaches every crate in the build, net-io included).
@@ -92,6 +98,14 @@ required-features = ["http1"]
 
 [[example]]
 name = "interop"
+required-features = ["http1"]
+
+[[example]]
+name = "websocket"
+required-features = ["ws"]
+
+[[example]]
+name = "systemd"
 required-features = ["http1"]
 
 [[bench]]
