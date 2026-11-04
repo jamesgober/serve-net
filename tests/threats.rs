@@ -250,9 +250,13 @@ fn connect(addr: SocketAddr) -> TcpStream {
 fn closed_within(stream: &mut TcpStream, limit: Duration) -> bool {
     let start = Instant::now();
     let mut buf = [0u8; 64 * 1024];
-    stream
+    // macOS refuses the option (EINVAL) on a socket the peer already reset.
+    if stream
         .set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
+        .is_err()
+    {
+        return true;
+    }
     while start.elapsed() < limit {
         match stream.read(&mut buf) {
             Ok(0) => return true,
