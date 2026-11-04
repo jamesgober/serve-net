@@ -115,20 +115,21 @@ Released as "Reactor", not "Feature complete": the items over other crates moved
 - Carried, each in the register below: the drain workaround of D-072 until net-io fixes the accept race; `dedicated_workers` on the reactor is a connection seat, not a worker set of its own, because net-io 0.5 has none.
 - Open on Windows, named in the release notes: T-30. `tests/restart.rs` passes on a 24-core machine and fails on CI's small runners with connection resets and connects that time out, in net-io 0.5's in-process hand-off of one socket to two servers. Reported to net-io; the test stays Unix only until it passes there.
 
-## v0.6.0 - Optimisation, and the protocols moved from 0.5
+## v0.6.0 - Upgrades (DONE, 2026-11-04)
 Exit: NFR-1, NFR-2, NFR-3, NFR-5 met, or each gap recorded in `docs/PERFORMANCE.md` with its cause and the plan to close it before 1.0 (a missed 20% target blocks 1.0); `docs/PERFORMANCE.md` published; every item moved from 0.5 done, or recorded here as waiting for a crate that is not on crates.io.
 - [x] WebSocket upgrades over ws-net 0.2 (D-079): `HeadAction::Upgrade`, `UpgradeTarget`, `UpgradedConn`, `HttpService::upgraded`, `WebSocketTarget`, `WebSocketService`, `WebSocketConn`, `WsMessage`, `WsSendError`, `Family::upgrade`, `RequestEnd::Upgraded`, feature `ws`; T-21 (`tests/websocket.rs`, on both drivers).
-- WebSocket push from another thread and a 1001 Close at drain start: waiting on net-io to wake a connection that waits for input (D-079, a hard reason: net-io 0.5 wakes only parked connections).
 - [x] A `Type=notify-reload` unit reloading under load under real systemd, in CI on Linux: `examples/systemd.rs` as a transient unit with `WatchdogSec=2`, ten reloads under 2,000 requests, every answer 200, a clean stop (`.github/systemd/run.sh`). Every external call in the script and every CI job has a time limit (D-080).
-- When fcgi-net is published: FastCGI on Linux and macOS first (`fastcgi`, `FastCgiListen`, `FastCgiIngress`, `Ingress::FastCgi`, `engine::FastCgi`, `ListenerSpec::fastcgi_descriptor_zero`, T-19, the `fastcgi_mapping` fuzz target, `mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0). Windows waits for the decision on a Windows FastCGI deployment.
-- When tls-net is published: an end-to-end TLS test and `EngineChoice::Http1OrH2ByAlpn`.
-- The idle trim to NFR-3's 4 KiB (D-076) once net-io returns the output buffer after `on_timeout`.
 - [x] `docs/PERFORMANCE.md` with the method, the hardware, and every target's status (D-081). NFR-1: 172 ns against 150 ns, down from about 220 ns; NFR-2 met; NFR-3 waits on net-io (D-076); NFR-11 met (0.32 ns).
 - [x] Idea I-3 measured and decided: the copy is 1.7 ns per head and about 6.5 ns per KiB, not worth an http-net API for heads (D-081).
 - Benchmarks against hyper with hyper-util, actix-web, may-minihttp, nginx, h2o, and Pingora (restart and idle memory only), the overload targets P-6 and P-7, P-12, and idea I-6: waiting for reference hardware (a load generator on a separate machine, PLAN section 10.2), a hard reason: a shared development machine measures its own load generator.
+- Released as "Upgrades" with the items over other crates moved to 0.7.0 (D-082): FastCGI and TLS with ALPN wait for fcgi-net and tls-net, which are not on crates.io; the idle trim and WebSocket push wait for net-io 0.6.0, which carries the fixes. The competitor benchmarks (NFR-5) are a 1.0 blocker in `docs/STABILITY-1.0.md`.
+- Settled during the release: a local run of the systemd job that looked stuck for over 280 s. A stale failed unit left the user manager `degraded`, the script fell back to `sudo`, and sudo's password prompt under `timeout` stopped the job with `SIGTTIN`. Fixed in the script and with a time limit on every CI job (D-080); CI was not affected.
 
-## v0.7.0 - Hardening
-Exit: zero open findings; the 24 h soak clean (NFR-18); `docs/SECURITY.md` written.
+## v0.7.0 - Hardening, and the items moved from 0.6
+Exit: zero open findings; the 24 h soak clean (NFR-18); `docs/SECURITY.md` written; every item moved from 0.6 done, or recorded here as waiting for a crate that is not on crates.io.
+- Moved from 0.6 (D-082). When fcgi-net is published: FastCGI on Linux and macOS first (`fastcgi`, `FastCgiListen`, `FastCgiIngress`, `Ingress::FastCgi`, `engine::FastCgi`, `ListenerSpec::fastcgi_descriptor_zero`, T-19, the `fastcgi_mapping` fuzz target, `mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0). Windows waits for the decision on a Windows FastCGI deployment.
+- Moved from 0.6 (D-082). When tls-net is published: an end-to-end TLS test and `EngineChoice::Http1OrH2ByAlpn`.
+- Moved from 0.6 (D-082). When net-io 0.6.0 is on crates.io: the idle trim to NFR-3's 4 KiB (D-076), WebSocket push from another thread with a bounded queue, and a 1001 Close at drain start (D-079).
 - Every fuzz target running with an out-of-repo corpus; every threat with its attack test; loom models complete; the leak test; kill-at-every-step restart testing (idea I-9); an adversarial review with every finding fixed test-first.
 
 ## v0.8.0 - Alpha

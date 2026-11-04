@@ -11,6 +11,13 @@
 
 ## [Unreleased]
 
+---
+
+## [0.6.0] - 2026-11-04
+
+Upgrades: WebSocket on the same listener, a run under real systemd in CI,
+and less work per request.
+
 ### Added
 
 - WebSocket upgrades (feature `ws`, over ws-net 0.2): `HeadAction::Upgrade`
@@ -21,16 +28,33 @@
   checkpoint; pings after a quiet interval; output bounded per connection.
 - `examples/systemd.rs` and a CI job that runs it under real systemd as a
   `Type=notify-reload` unit with a watchdog, reloaded ten times under load.
-
 - `docs/PERFORMANCE.md`: the method, the hardware, and each performance
-  target's status.
+  target's status; `docs/STABILITY-1.0.md`, the blockers to 1.0 as they
+  become known.
 
 ### Changed
 
 - `HeadAction` is `Clone` and no longer `Copy` or `PartialEq`.
-- About 20% less work per keep-alive request: the request path no longer
+- About a fifth less of serve-net's own work per keep-alive request (about
+  220 to 172 ns; 308 to 267 ns for the whole request): the request path no longer
   clones the server's shared state per request, and release builds no longer
   read the clock around every service call.
+- Every CI job has a time limit.
+
+### Fixed
+
+- The systemd CI script could hang: a user manager reporting `degraded` made
+  it fall back to `sudo`, whose password prompt under `timeout` stopped the
+  job with `SIGTTIN`. It now counts any manager state as up, runs `sudo -n`,
+  and limits every call; the unit uses `KillMode=mixed` so the stop reaches
+  the wrapper and the server drains. Found in a local run; CI and the library
+  were not affected.
+
+### Moved
+
+- To 0.7.0: FastCGI and `Http1OrH2ByAlpn` with an end-to-end TLS test, which
+  wait for fcgi-net and tls-net; the idle memory trim, WebSocket sends from
+  another thread, and a 1001 Close at drain start, which wait for net-io 0.6.
 
 ---
 
@@ -233,7 +257,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jamesgober/serve-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/serve-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/serve-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/serve-net/compare/v0.2.0...v0.3.0
