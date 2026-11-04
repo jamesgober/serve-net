@@ -81,6 +81,64 @@ fn request_path(c: &mut Criterion) {
     group.finish();
 }
 
+/// NFR-1 by subtraction: http-net's `ServerConn` alone, parsing the same
+/// request and writing the same reply with a cached `Date`, the calls
+/// serve-net's HTTP engine makes. `request/keep_alive_get` less this is
+/// serve-net's own work per request (with the test harness's copy of the
+/// output, so an upper bound).
+fn engine_alone(c: &mut Criterion) {
+    use http_net::{OutgoingBody, ResponseHeadRef, ServerConn, ServerEvent};
+    let mut group = c.benchmark_group("engine");
+    group.throughput(Throughput::Elements(1));
+    let mut conn = ServerConn::new();
+    let mut dates = http_net::DateCache::new();
+    let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let fields: [(&str, &[u8]); 1] = [("content-type", b"text/plain")];
+    group.bench_function("http_net_alone_keep_alive_get", |b| {
+        b.iter(|| {
+            out.clear();
+            let n = conn.feed(black_box(GET));
+            assert_eq!(n, GET.len());
+            loop {
+                match conn.poll() {
+                    Ok(ServerEvent::AwaitingResponse) => {
+                        let head = ResponseHeadRef::new(200, &fields, OutgoingBody::Full(11));
+                        let date = dates.update(1_762_000_000);
+                        if let Ok(http_net::BodyPlan::Raw) =
+                            conn.write_head(&head, Some(date), &mut out)
+                        {
+                            out.extend_from_slice(b"hello world");
+                        }
+                    }
+                    Ok(ServerEvent::NeedInput) => break,
+                    Ok(_) => {}
+                    Err(e) => panic!("{e:?}"),
+                }
+            }
+            black_box(out.len())
+        });
+    });
+    // Idea I-3: what feeding the engine from net-io's buffer costs, the one
+    // copy of each input byte, for this head and for a 4 KiB body.
+    let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    group.bench_function("input_copy_head", |b| {
+        b.iter(|| {
+            buf.clear();
+            buf.extend_from_slice(black_box(GET));
+            black_box(buf.len())
+        });
+    });
+    let body = vec![b'x'; 4096];
+    group.bench_function("input_copy_4k", |b| {
+        b.iter(|| {
+            buf.clear();
+            buf.extend_from_slice(black_box(&body));
+            black_box(buf.len())
+        });
+    });
+    group.finish();
+}
+
 fn shared_state(c: &mut Criterion) {
     let table = Snapshot::new(vec![1u64; 16]);
     let mut reader = table.reader();
@@ -94,5 +152,5 @@ fn shared_state(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, request_path, shared_state);
+criterion_group!(benches, request_path, engine_alone, shared_state);
 criterion_main!(benches);

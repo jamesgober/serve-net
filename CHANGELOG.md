@@ -22,9 +22,15 @@
 - `examples/systemd.rs` and a CI job that runs it under real systemd as a
   `Type=notify-reload` unit with a watchdog, reloaded ten times under load.
 
+- `docs/PERFORMANCE.md`: the method, the hardware, and each performance
+  target's status.
+
 ### Changed
 
 - `HeadAction` is `Clone` and no longer `Copy` or `PartialEq`.
+- About 20% less work per keep-alive request: the request path no longer
+  clones the server's shared state per request, and release builds no longer
+  read the clock around every service call.
 
 ---
 

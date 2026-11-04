@@ -993,10 +993,10 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             self.state = State::Closed;
             return Some(Step::Abort);
         }
-        let limits = self.limits();
-        let shared = Arc::clone(&self.shared);
         self.refresh_tables();
-        let tables = Arc::clone(&self.tables);
+        let limits = self.limits();
+        let shared = &*self.shared;
+        let tables = &*self.tables;
         let compiled = tables.profiles.compiled(self.env.profile);
         // Everything that borrows the engine's head happens in this block, so
         // the borrow ends before any refusal is written.
@@ -1180,8 +1180,8 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
 
     /// The request is complete: checkpoint, dispatch, service call.
     fn dispatch<I: Io>(&mut self, io: &mut I) -> Step {
-        let shared = Arc::clone(&self.shared);
         let _ = self.checkpoint();
+        let shared = &*self.shared;
         match shared
             .checkpoint
             .check(&self.env, CheckpointAt::BeforeDispatch)
@@ -1196,20 +1196,28 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         if let Some(target) = self.upgrade.take() {
             return self.switch(io, target);
         }
-        // A deferral gets the next generation; the slot is made once per connection.
+        // A deferral gets the next generation; the slot is made once per
+        // connection, and the reply keeps its link between calls (the reply
+        // is reachable only inside `call`), so only a deferral, which moves
+        // the link into its token, costs a clone.
         self.generation = self.generation.wrapping_add(1);
-        let slot = match &self.defer {
-            Some(s) => Arc::clone(s),
+        match self.reply.link.as_mut() {
+            Some(link) => link.generation = self.generation,
             None => {
-                let s = Arc::new(DeferSlot::new(io.waker(), self.connection));
-                self.defer = Some(Arc::clone(&s));
-                s
+                let slot = match &self.defer {
+                    Some(s) => Arc::clone(s),
+                    None => {
+                        let s = Arc::new(DeferSlot::new(io.waker(), self.connection));
+                        self.defer = Some(Arc::clone(&s));
+                        s
+                    }
+                };
+                self.reply.link = Some(Link {
+                    slot,
+                    generation: self.generation,
+                });
             }
-        };
-        self.reply.link = Some(Link {
-            slot,
-            generation: self.generation,
-        });
+        }
         self.reply.deferred = false;
         if self.reply_stream {
             shared
@@ -1226,8 +1234,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         };
         let mut panicked = false;
         let outcome = {
-            let tables = Arc::clone(&self.tables);
-            let listener = tables.listeners.get(self.listener).and_then(Option::as_ref);
+            let listener = self
+                .tables
+                .listeners
+                .get(self.listener)
+                .and_then(Option::as_ref);
             let cx = HeadContext {
                 client: &self.client,
                 proxy: listener.and_then(|l| l.proxy.as_ref()),
@@ -1250,7 +1261,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                             Some(last) => shared.family.request_chunk(head, body, last),
                             None => shared.family.request(head, body),
                         };
-                        let started = Instant::now();
+                        // The misdeclared-service check is a debug build's:
+                        // a release build reads no clock here.
+                        let started = cfg!(debug_assertions).then(Instant::now);
                         let worker = self.env.worker.get();
                         shared.counters.in_call(worker, true);
                         let (env, reply) = (&self.env, &mut self.reply);
@@ -1265,11 +1278,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                             run()
                         };
                         shared.counters.in_call(worker, false);
-                        if cfg!(debug_assertions)
-                            && <S as Service<F>>::WORK == crate::service::WorkClass::Quick
-                        {
+                        if let Some(started) = started {
                             let took = started.elapsed();
-                            if took > Duration::from_millis(1) {
+                            if <S as Service<F>>::WORK == crate::service::WorkClass::Quick
+                                && took > Duration::from_millis(1)
+                            {
                                 shared.observer.service_misdeclared(&self.env, took);
                             }
                         }
@@ -1283,7 +1296,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         }
         if panicked {
             self.reply.link = None;
-            shared
+            self.shared
                 .observer
                 .service_error(&self.env, "the service panicked");
             self.end = Some(EndReason::ServicePanic);
@@ -1303,7 +1316,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 retry_after: None,
                 close: false,
             };
-            shared.observer.request_shed(&self.env, &shed);
+            self.shared.observer.request_shed(&self.env, &shed);
             return self.refuse(
                 io,
                 RefusalKind::Busy,
@@ -1322,9 +1335,8 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 RequestEnd::Refused(RefusalKind::Internal),
             );
         };
-        self.reply.link = None;
         if self.env.lane_late {
-            shared
+            self.shared
                 .observer
                 .service_error(&self.env, "lane set after head");
         }
@@ -1332,7 +1344,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         if self.reply.deferred {
             if self.reply_stream {
                 // A reply already on the wire cannot wait for a token.
-                shared
+                self.shared
                     .observer
                     .service_error(&self.env, "a streamed reply was deferred");
                 self.cancel_deferred();
@@ -1349,7 +1361,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 self.drop_rest_of_body();
             }
             if outcome != Outcome::Deferred {
-                shared
+                self.shared
                     .observer
                     .service_error(&self.env, "reply deferred but call did not return Deferred");
             }
@@ -1367,13 +1379,13 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             return Step::Park { until };
         }
         if outcome == Outcome::More {
-            if shared.family.reply_stream(&self.reply.parts) {
+            if self.shared.family.reply_stream(&self.reply.parts) {
                 return self.send_part(io, outcome);
             }
             if mid_body {
                 return Step::Read;
             }
-            shared
+            self.shared
                 .observer
                 .service_error(&self.env, "More returned with nothing left to wait for");
             self.end = Some(EndReason::ServiceClosed);
@@ -1389,7 +1401,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             self.drop_rest_of_body();
         }
         if outcome == Outcome::Deferred {
-            shared
+            self.shared
                 .observer
                 .service_error(&self.env, "Deferred returned without reply.defer()");
             self.end = Some(EndReason::ServiceClosed);
@@ -1487,8 +1499,10 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
 
     /// Encodes and hands over the reply.
     fn respond<I: Io>(&mut self, io: &mut I, outcome: Outcome) -> Step {
-        let shared = Arc::clone(&self.shared);
         let control = self.checkpoint();
+        // A borrow, not a clone: every connection shares this `Arc`, and its
+        // count is one cache line for all workers.
+        let shared = &*self.shared;
         match shared
             .checkpoint
             .check(&self.env, CheckpointAt::BeforeReply)
@@ -1714,7 +1728,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 None
             },
         };
-        let shared = Arc::clone(&self.shared);
+        let shared = &*self.shared;
         shared.service.done(&self.env, &finished);
         shared.observer.request_finished(&self.env, &finished);
         if let Some(a) = r.admitted {

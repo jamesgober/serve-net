@@ -123,8 +123,9 @@ Exit: NFR-1, NFR-2, NFR-3, NFR-5 met, or each gap recorded in `docs/PERFORMANCE.
 - When fcgi-net is published: FastCGI on Linux and macOS first (`fastcgi`, `FastCgiListen`, `FastCgiIngress`, `Ingress::FastCgi`, `engine::FastCgi`, `ListenerSpec::fastcgi_descriptor_zero`, T-19, the `fastcgi_mapping` fuzz target, `mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0). Windows waits for the decision on a Windows FastCGI deployment.
 - When tls-net is published: an end-to-end TLS test and `EngineChoice::Http1OrH2ByAlpn`.
 - The idle trim to NFR-3's 4 KiB (D-076) once net-io returns the output buffer after `on_timeout`.
-- Benchmarks against hyper with hyper-util, actix-web, may-minihttp, nginx, h2o, and Pingora (restart and idle memory only).
-- Idea I-3 (engine input without the copy) measured and decided; idea I-6 measured.
+- [x] `docs/PERFORMANCE.md` with the method, the hardware, and every target's status (D-081). NFR-1: 172 ns against 150 ns, down from about 220 ns; NFR-2 met; NFR-3 waits on net-io (D-076); NFR-11 met (0.32 ns).
+- [x] Idea I-3 measured and decided: the copy is 1.7 ns per head and about 6.5 ns per KiB, not worth an http-net API for heads (D-081).
+- Benchmarks against hyper with hyper-util, actix-web, may-minihttp, nginx, h2o, and Pingora (restart and idle memory only), the overload targets P-6 and P-7, P-12, and idea I-6: waiting for reference hardware (a load generator on a separate machine, PLAN section 10.2), a hard reason: a shared development machine measures its own load generator.
 
 ## v0.7.0 - Hardening
 Exit: zero open findings; the 24 h soak clean (NFR-18); `docs/SECURITY.md` written.
@@ -147,7 +148,9 @@ Exit: every item in the register below is closed or carried into `docs/STABILITY
 
 | Item | From | What to decide or do |
 |---|---|---|
-| The forwarded walk measured about 165 ns for three entries against a 100 ns target [est.] | 0.3 progress, D-040 | meet the target or record why not, with numbers |
+| The forwarded walk measured about 165 ns for three entries against a 100 ns target [est.]; 137 ns at 0.6 (`docs/PERFORMANCE.md`) | 0.3 progress, D-040 | meet the target or record why not, with numbers |
+| serve-net's own work per keep-alive request is 172 ns against NFR-1's 150 ns | D-081 | profile on a Linux host with `perf` (the replied-at clock read, the reply build and encode, the second head view, the counters); meet the target or record why not |
+| NFR-5 and the overload targets are not measured | D-081 | run PLAN section 10.2 on reference hardware before 1.0; a missed 20% target blocks 1.0 |
 | Every [est.] cost in `dev/PLAN.md` | PLAN section 9 and the threat table | each replaced by a benchmark (due at 0.6), or listed as unmeasured with the reason |
 | The engine keeps its buffer between keep-alive requests; idle memory returns only through the reactor's per-worker pools | D-041 | confirm the reactor pools bound idle memory (NFR-1), or shrink after an idle period |
 | With no soft cap configured, the blocking pool's soft cap is the pool minus its headroom (224 of 256) | D-044 | confirm the default with a measured overload run (NFR-6), or change it |
