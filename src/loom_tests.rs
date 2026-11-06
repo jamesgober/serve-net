@@ -118,3 +118,79 @@ fn loom_in_flight_shared_cap_is_exact() {
         assert!(cap.admit_at(0, &env).is_ok(), "the slot came back");
     });
 }
+
+#[test]
+fn loom_two_drains_the_shorter_deadline_wins() {
+    // `Running::drain` and a `DrainHandle` on another thread at once: the
+    // shorter deadline stands, whichever order they land in.
+    use crate::running::{DrainSwitch, Merged};
+    loom::model(|| {
+        let line = Arc::new(Merged::new(Arc::new(net_io::NoControl)));
+        let now = std::time::Instant::now();
+        let (short, long) = (
+            now + std::time::Duration::from_secs(1),
+            now + std::time::Duration::from_secs(9),
+        );
+        let other = {
+            let line = Arc::clone(&line);
+            thread::spawn(move || line.request(long))
+        };
+        line.request(short);
+        other.join().unwrap();
+        assert_eq!(line.own_deadline(), Some(short));
+        assert!(line.is_draining());
+    });
+}
+
+#[cfg(feature = "ws")]
+#[test]
+fn loom_drain_races_an_upgraded_connection_closing() {
+    // A drain collects the upgraded connections while one closes: no goodbye
+    // is left waiting for a connection that is gone, or the drain would wait
+    // out its whole goodbye time.
+    use crate::running::{DrainSwitch, Merged};
+    loom::model(|| {
+        let line = Arc::new(Merged::new(Arc::new(net_io::NoControl)));
+        let id = ConnectionId::new(1).unwrap();
+        line.register_upgraded(id, Arc::new(Quiet));
+        let closer = {
+            let line = Arc::clone(&line);
+            thread::spawn(move || line.unregister_upgraded(id))
+        };
+        line.request(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        closer.join().unwrap();
+        assert!(
+            line.goodbyes_empty(),
+            "a goodbye waits for a closed connection"
+        );
+    });
+}
+
+#[cfg(feature = "ws")]
+#[test]
+fn loom_sender_races_the_connection_closing() {
+    // A `WsSender` pushes while the connection closes: a push either lands
+    // before the close (and is dropped with the queue) or is refused; nothing
+    // stays queued after the close.
+    use crate::ws::Outbox;
+    loom::model(|| {
+        let outbox = Arc::new(Outbox::new(
+            Arc::new(Quiet),
+            ConnectionId::new(1).unwrap(),
+            1024,
+        ));
+        let pusher = {
+            let outbox = Arc::clone(&outbox);
+            thread::spawn(move || outbox.push_text_for_tests("hi"))
+        };
+        outbox.close(true);
+        let pushed = pusher.join().unwrap();
+        let state = outbox.lock();
+        assert!(state.closed);
+        assert!(
+            state.items.is_empty() && state.bytes == 0,
+            "a message survived the close"
+        );
+        assert!(pushed.is_ok() || pushed == Err(crate::ws::WsSendError::Closed));
+    });
+}

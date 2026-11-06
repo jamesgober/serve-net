@@ -22,24 +22,39 @@ use crate::stats::{Counters, Stats};
 /// shows as `Draining` with its deadline; the owner's `Stopping` still wins.
 pub(crate) struct Merged<C: ControlLine> {
     owner: Arc<C>,
-    epoch: AtomicU64,
-    drain: Mutex<Option<Instant>>,
+    epoch: crate::sync::AtomicU64,
+    drain: crate::sync::Mutex<Option<Instant>>,
     /// Upgraded connections, told when a drain begins: they wait in the idle
     /// phase, where net-io's drain would close them without a goodbye.
-    upgraded: Mutex<std::collections::HashMap<ConnectionId, Arc<dyn Waker>>>,
+    upgraded: crate::sync::Mutex<std::collections::HashMap<ConnectionId, Arc<dyn Waker>>>,
     /// Upgraded connections told of the drain that have not said goodbye yet.
-    goodbyes: Mutex<std::collections::HashSet<ConnectionId>>,
+    goodbyes: crate::sync::Mutex<std::collections::HashSet<ConnectionId>>,
 }
 
 impl<C: ControlLine> Merged<C> {
     pub(crate) fn new(owner: Arc<C>) -> Self {
         Merged {
             owner,
-            epoch: AtomicU64::new(0),
-            drain: Mutex::new(None),
-            upgraded: Mutex::new(std::collections::HashMap::new()),
-            goodbyes: Mutex::new(std::collections::HashSet::new()),
+            epoch: crate::sync::AtomicU64::new(0),
+            drain: crate::sync::Mutex::new(None),
+            upgraded: crate::sync::Mutex::new(std::collections::HashMap::new()),
+            goodbyes: crate::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// The drain deadline asked for here (loom models).
+    #[cfg(serve_net_loom)]
+    pub(crate) fn own_deadline(&self) -> Option<Instant> {
+        self.own()
+    }
+
+    /// Whether every connection told of the drain said goodbye (loom models).
+    #[cfg(serve_net_loom)]
+    pub(crate) fn goodbyes_empty(&self) -> bool {
+        self.goodbyes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
     }
 
     /// An upgraded connection sent its goodbye (or closed) after a drain wake.
@@ -61,11 +76,10 @@ impl<C: ControlLine> Merged<C> {
 
     #[cfg(feature = "ws")]
     pub(crate) fn unregister_upgraded(&self, connection: ConnectionId) {
-        self.upgraded
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&connection);
+        let mut registry = self.upgraded.lock().unwrap_or_else(PoisonError::into_inner);
+        registry.remove(&connection);
         self.said_goodbye(connection);
+        drop(registry);
     }
 
     fn own(&self) -> Option<Instant> {
@@ -124,17 +138,22 @@ impl<C: ControlLine> DrainSwitch for Merged<C> {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         // Upgraded connections wait for input; wake each so it says goodbye
         // (a WebSocket's 1001) before net-io's drain closes idle connections.
-        let upgraded: Vec<(ConnectionId, Arc<dyn Waker>)> = self
-            .upgraded
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .map(|(id, w)| (*id, Arc::clone(w)))
-            .collect();
-        self.goodbyes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(upgraded.iter().map(|(id, _)| *id));
+        // The registry stays locked while the goodbyes are recorded: a
+        // connection that closes meanwhile is either not collected or, after,
+        // removes the id it finds (registry before goodbyes, as in
+        // `unregister_upgraded`).
+        let upgraded: Vec<(ConnectionId, Arc<dyn Waker>)> = {
+            let registry = self.upgraded.lock().unwrap_or_else(PoisonError::into_inner);
+            let list: Vec<_> = registry
+                .iter()
+                .map(|(id, w)| (*id, Arc::clone(w)))
+                .collect();
+            self.goodbyes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(list.iter().map(|(id, _)| *id));
+            list
+        };
         for (id, waker) in upgraded {
             if waker.post(id, crate::reply::WAKE_DRAIN, 0).is_err() {
                 self.said_goodbye(id);

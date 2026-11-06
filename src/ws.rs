@@ -163,7 +163,7 @@ pub(crate) struct OutboxState {
 
 /// The queue between `WsSender`s and the connection's worker.
 pub(crate) struct Outbox {
-    state: std::sync::Mutex<OutboxState>,
+    state: crate::sync::Mutex<OutboxState>,
     waker: Arc<dyn crate::reply::Waker>,
     connection: crate::net::ConnectionId,
     max_bytes: usize,
@@ -176,7 +176,7 @@ impl Outbox {
         max_bytes: usize,
     ) -> Self {
         Outbox {
-            state: std::sync::Mutex::new(OutboxState {
+            state: crate::sync::Mutex::new(OutboxState {
                 items: std::collections::VecDeque::new(),
                 bytes: 0,
                 closed: false,
@@ -187,10 +187,16 @@ impl Outbox {
         }
     }
 
-    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, OutboxState> {
+    pub(crate) fn lock(&self) -> crate::sync::MutexGuard<'_, OutboxState> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `push` of a text message (loom models).
+    #[cfg(serve_net_loom)]
+    pub(crate) fn push_text_for_tests(&self, text: &str) -> Result<(), WsSendError> {
+        self.push(Queued::Text(text.to_owned()))
     }
 
     fn push(&self, message: Queued) -> Result<(), WsSendError> {
