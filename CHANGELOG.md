@@ -38,6 +38,7 @@ Three findings of an adversarial review, each fixed with a regression test.
   `send-proxy-v2-ssl`) sets the `PP2_CLIENT_SSL` bit only for TLS clients, so
   plain clients were reported as `https`. The bit is checked now. Affects 0.4.0
   to 0.6.2 on PROXY listeners with `trust_scheme` on.
+- Advisory: [GHSA-jcp7-qqq6-xw24](https://github.com/jamesgober/serve-net/security/advisories/GHSA-jcp7-qqq6-xw24). 0.6.2 is yanked from crates.io.
 
 ---
 
