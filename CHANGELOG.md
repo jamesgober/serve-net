@@ -25,6 +25,8 @@
   a forwarded field only when the peer is a trusted proxy, at `head` and at
   `call` alike. Affects 0.3.0 to 0.6.1 on listeners behind forwarded headers
   with `trust_host` on; the client address and the scheme were not affected.
+  Advisory: [GHSA-7vvv-g6cw-p8gj](https://github.com/jamesgober/serve-net/security/advisories/GHSA-7vvv-g6cw-p8gj). 0.3.0 to 0.6.1 are yanked from
+  crates.io.
 
 ### Added
 
