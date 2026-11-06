@@ -175,7 +175,11 @@ pub(crate) fn resolve_from<'h, T: Trust, F: FieldLines<'h>>(
                     host: None,
                     forwarded: true,
                 };
-                proto_host_x(rules, head, &mut lines, &mut out)?;
+                // An RFC 7239 proxy neither sets nor strips the X- fields, so
+                // with no `Forwarded` element there is no scheme or host to take.
+                if rules.source != ForwardedSource::Forwarded {
+                    proto_host_x(rules, head, &mut lines, &mut out)?;
+                }
                 Ok(out)
             }
         };

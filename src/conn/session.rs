@@ -374,7 +374,9 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> Factory<F, S, H> {
                 && info
                     .proxy
                     .as_ref()
-                    .is_some_and(|f| f.ssl_client().is_some());
+                    // PP2_CLIENT_SSL: a proxy may send the SSL TLV on every
+                    // connection and set the bit only for TLS clients.
+                    .is_some_and(|f| f.ssl_client().is_some_and(|c| c & 0x01 != 0));
             client = client.with_scheme(if tls {
                 Scheme::Https
             } else {

@@ -510,3 +510,76 @@ fn test_ws_checkpoint_revokes_an_open_connection_1008() {
     wait_for("closed", || !seen.closed.lock().unwrap().is_empty());
     assert_eq!(*seen.closed.lock().unwrap(), vec![Some(1008)]);
 }
+
+/// T-21, found in the 0.7 review: input past the HTTP engine's buffer in the
+/// read that carries the upgrade goes to ws-net, never back to the HTTP
+/// parser. Before, a request smuggled after 64 KiB of frames was parsed and
+/// answered as HTTP, with the client's own `X-Forwarded-For` believed.
+#[test]
+fn test_ws_input_past_the_engine_buffer_is_never_parsed_as_http() {
+    use serve_net::testing::TestConnection;
+    use serve_net::{ProxySource, TrustedProxies};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct Quiet;
+    impl WebSocketService for Quiet {
+        fn message(&self, _e: &Envelope, _m: WsMessage<'_>, _c: &mut WebSocketConn<'_>) {}
+    }
+    struct Site(Arc<AtomicU32>);
+    impl HttpService for Site {
+        fn head(&self, head: &HttpHead<'_>, _env: &mut Envelope) -> HeadAction {
+            if head.path() == "/ws" {
+                HeadAction::Upgrade(WebSocketTarget::new(Quiet).into())
+            } else {
+                HeadAction::Proceed
+            }
+        }
+        fn call(&self, req: &HttpRequest<'_>, _env: &Envelope, reply: &mut HttpReply) -> Outcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            reply.text(200, &format!("served {}", req.path()));
+            Outcome::Done
+        }
+    }
+    fn frame(len: usize) -> Vec<u8> {
+        let mut f = vec![0x82, 0x80 | len as u8, 0, 0, 0, 0];
+        f.extend(std::iter::repeat_n(b'p', len));
+        f
+    }
+    for behind in [false, true] {
+        let calls = Arc::new(AtomicU32::new(0));
+        let site = Site(Arc::clone(&calls));
+        let mut conn = if behind {
+            TestConnection::behind(
+                site,
+                ProxySource::forwarded_for(TrustedProxies::loopback()),
+                serve_net::Profile::new(serve_net::ProfileId(0)),
+            )
+        } else {
+            TestConnection::new(site)
+        };
+        let mut bytes = b"GET /ws HTTP/1.1\r\nHost: a\r\nX-Forwarded-For: 198.51.100.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n".to_vec();
+        // Frames that fill the engine's 64 KiB buffer exactly.
+        let cap = 64 * 1024;
+        while cap - bytes.len() > 131 + 6 {
+            bytes.extend(frame(125));
+        }
+        let rest = cap - bytes.len();
+        bytes.extend(frame(rest - 6));
+        bytes.extend_from_slice(
+            b"GET /smuggled HTTP/1.1\r\nHost: a\r\nX-Forwarded-For: 10.9.9.9, 127.0.0.1\r\n\r\n",
+        );
+        let mut out = Vec::new();
+        conn.send_into(&bytes, &mut out);
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.starts_with("HTTP/1.1 101"),
+            "behind={behind}: {text:.80}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "behind={behind}: an HTTP call after the 101"
+        );
+        assert!(!text.contains("served"), "behind={behind}: {text}");
+    }
+}
