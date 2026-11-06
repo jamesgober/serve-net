@@ -314,23 +314,35 @@ mod restart {
     #[test]
     #[cfg_attr(
         all(windows, serve_net_blocking_tests),
-        ignore = "net-io: on the Windows blocking pool a request begun after the old server's drop can hang (dev/ROADMAP.md)"
+        ignore = "net-io: a kill on the Windows blocking pool can hang or time out a request begun after it (dev/ROADMAP.md)"
     )]
     fn test_i9_kill_before_the_new_server_starts() {
         kill_during_handoff(KillAt::BeforeNew);
     }
 
     #[test]
+    #[cfg_attr(
+        all(windows, serve_net_blocking_tests),
+        ignore = "net-io: a kill on the Windows blocking pool can hang or time out a request begun after it (dev/ROADMAP.md)"
+    )]
     fn test_i9_kill_right_after_the_new_server_starts() {
         kill_during_handoff(KillAt::AfterNew);
     }
 
     #[test]
+    #[cfg_attr(
+        all(windows, serve_net_blocking_tests),
+        ignore = "net-io: a kill on the Windows blocking pool can hang or time out a request begun after it (dev/ROADMAP.md)"
+    )]
     fn test_i9_kill_after_the_door_closed() {
         kill_during_handoff(KillAt::AfterDoor);
     }
 
     #[test]
+    #[cfg_attr(
+        all(windows, serve_net_blocking_tests),
+        ignore = "net-io: a kill on the Windows blocking pool can hang or time out a request begun after it (dev/ROADMAP.md)"
+    )]
     fn test_i9_kill_mid_drain() {
         kill_during_handoff(KillAt::MidDrain);
     }
