@@ -32,6 +32,35 @@
 
 ---
 
+## [0.6.3] - 2026-11-06
+
+Three findings of an adversarial review, each fixed with a regression test.
+
+### Security
+
+- After a WebSocket upgrade, input the HTTP engine had not yet taken in the
+  same read was fed back to it and parsed as a new HTTP request: a request
+  smuggled behind about 64 KiB of frames reached `call`, and behind a trusted
+  proxy (which forwards an upgraded connection as a tunnel) its own
+  `X-Forwarded-For` was believed. It now goes to the upgraded protocol.
+  Affects 0.6.0 to 0.6.2 with feature `ws`, when net-io reads more than the
+  HTTP engine's free buffer at once (above net-io's default 16 KiB read size),
+  and the test transport.
+- With `ForwardedSource::Forwarded` and `MissingHeader::UsePeer`, a request
+  from a trusted peer with no `Forwarded` element had `X-Forwarded-Host` and
+  `X-Forwarded-Proto` believed at `head`, fields an RFC 7239 proxy neither sets
+  nor strips; `call` saw the `Host` field. Neither is read for that source now.
+  Affects 0.3.0 to 0.6.2 with that source, `UsePeer`, and `trust_host` or
+  `trust_scheme` on.
+- A PROXY v2 SSL TLV marked the client `https` whenever it was present. A
+  proxy that sends the TLV on every connection (HAProxy's
+  `send-proxy-v2-ssl`) sets the `PP2_CLIENT_SSL` bit only for TLS clients, so
+  plain clients were reported as `https`. The bit is checked now. Affects 0.4.0
+  to 0.6.2 on PROXY listeners with `trust_scheme` on.
+- Advisory: [GHSA-jcp7-qqq6-xw24](https://github.com/jamesgober/serve-net/security/advisories/GHSA-jcp7-qqq6-xw24). 0.6.2 is yanked from crates.io.
+
+---
+
 ## [0.6.2] - 2026-11-04
 
 ### Security
@@ -318,7 +347,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/jamesgober/serve-net/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/jamesgober/serve-net/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/jamesgober/serve-net/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/jamesgober/serve-net/compare/v0.5.0...v0.6.0
