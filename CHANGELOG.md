@@ -11,6 +11,13 @@
 
 ## [Unreleased]
 
+---
+
+## [0.7.0] - 2026-11-07
+
+Hardening: TLS with ALPN, the idle trim, WebSocket push, a 24-hour soak, and
+an adversarial review with every finding fixed.
+
 ### Added
 
 - `EngineChoice::Http1OrH2ByAlpn`: the engine by the TLS handshake's ALPN
@@ -47,6 +54,11 @@
   is closed with `EndReason::NoEngine` before any byte reaches an engine. Before,
   an `Http1` profile fed an HTTP/2 connection to the HTTP/1.1 parser, which
   answered 400.
+
+### Moved
+
+- To 0.8.0: FastCGI (with T-19 and the `fastcgi_mapping` fuzz target), which
+  waits for fcgi-net.
 
 ---
 
@@ -365,7 +377,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.6.3...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/serve-net/compare/v0.6.3...v0.7.0
 [0.6.3]: https://github.com/jamesgober/serve-net/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/jamesgober/serve-net/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/jamesgober/serve-net/compare/v0.6.0...v0.6.1

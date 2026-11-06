@@ -125,9 +125,9 @@ Exit: NFR-1, NFR-2, NFR-3, NFR-5 met, or each gap recorded in `docs/PERFORMANCE.
 - Released as "Upgrades" with the items over other crates moved to 0.7.0 (D-082): FastCGI and TLS with ALPN wait for fcgi-net and tls-net, which are not on crates.io; the idle trim and WebSocket push wait for net-io 0.6.0, which carries the fixes. The competitor benchmarks (NFR-5) are a 1.0 blocker in `docs/STABILITY-1.0.md`.
 - Settled during the release: a local run of the systemd job that looked stuck for over 280 s. A stale failed unit left the user manager `degraded`, the script fell back to `sudo`, and sudo's password prompt under `timeout` stopped the job with `SIGTTIN`. Fixed in the script and with a time limit on every CI job (D-080); CI was not affected.
 
-## v0.7.0 - Hardening, and the items moved from 0.6
+## v0.7.0 - Hardening (DONE, 2026-11-07)
 Exit: zero open findings; the 24 h soak clean (NFR-18); `docs/SECURITY.md` written; every item moved from 0.6 done, or recorded here as waiting for a crate that is not on crates.io.
-- Moved from 0.6 (D-082). When fcgi-net is published: FastCGI on Linux and macOS first (`fastcgi`, `FastCgiListen`, `FastCgiIngress`, `Ingress::FastCgi`, `engine::FastCgi`, `ListenerSpec::fastcgi_descriptor_zero`, T-19, the `fastcgi_mapping` fuzz target, `mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0). Windows waits for the decision on a Windows FastCGI deployment.
+- FastCGI moves to 0.8.0 (D-097): fcgi-net is not on crates.io, a hard reason.
 - [x] Moved from 0.6 (D-082): an end-to-end TLS test (tls-net 0.5 on ring, `tests/tls_net.rs`) and `EngineChoice::Http1OrH2ByAlpn`, with every profile's ALPN result checked at open (D-085).
 - [x] Moved from 0.6 (D-082): the idle trim (D-087), on net-io 0.6.1: 4,049 bytes per idle connection, NFR-3 met.
 - [x] Moved from 0.6 (D-082): WebSocket push from another thread through a bounded queue (`WsSender`), and a 1001 Close at drain start (D-092).
@@ -135,16 +135,17 @@ Exit: zero open findings; the 24 h soak clean (NFR-18); `docs/SECURITY.md` writt
 - [x] Attack tests for T-15 (a dual-stack listener reports and caps `::ffff:127.0.0.1` as `127.0.0.1`; IPv6 listeners are v6-only unless asked) and T-18 (the default socket mode is `0o660`).
 - [x] Attack tests for T-32 (descriptor exhaustion: no accept spin, serving resumes; Linux, under `ulimit -n 128`), T-33 (64 connections of 256 KiB replies, the heap flat across rounds), T-40 (one deadline per connection, a fixed number of sets per request). Every threat now has an attack test except T-19, which waits for FastCGI. `RuleId::FastCgiTrust` lands with FastCGI; `RuleId::ForwardedOnDirect` cannot occur because `Ingress::Direct` carries no forwarded source, so it is documented as such or removed at the 0.9 API review.
 - [x] NFR-5 tooling (D-086): `compare/` against hyper, pinned on the development host and on a hosted runner; first hosted numbers in `docs/PERFORMANCE.md` (about 5% behind hyper, against 20% ahead). The pinned run waits for a quiet window.
-- The 24 h soak (`compare soak`, D-086): started 2026-11-06.
+- [x] The 24 h soak (`compare soak`, D-086) on net-io 0.6.1: clean (SOAK_RESULT).
 - [x] Loom models complete (D-096): two concurrent drains, a drain against an upgraded connection closing (which found a race, fixed), a sender against the close, with the snapshot, deferral slot, and in-flight cap.
 - [x] Kill-at-every-step restart testing (idea I-9, D-095): four kill points under load; nothing refused, nothing begun after the kill lost.
 - [x] The leak test (NFR-19, D-093): 100,000 connections opened and closed, the heap flat (0 bytes over the second half at 40,000).
 - [x] The adversarial review (0.7): seven findings, each fixed with a test that fails without it. Three affected released versions and shipped in 0.6.3 (D-088, GHSA-jcp7-qqq6-xw24); V-24 and the `AnyLocalPeer` warning (D-089); a reload's limit for streamed bodies (D-090); a time bound per WebSocket message (D-091).
 - [x] `docs/SECURITY.md` (the security model, defaults, a deployment checklist, what is not defended, testing, advisories) and a root `SECURITY.md` (reporting and supported versions).
-- Every fuzz target running with an out-of-repo corpus; every threat with its attack test; loom models complete; the leak test; kill-at-every-step restart testing (idea I-9); an adversarial review with every finding fixed test-first.
+- [x] Every fuzz target running with an out-of-repo corpus (CI's fuzz smoke, `RUNNER_TEMP`); every threat with its attack test except T-19, which waits for FastCGI; loom models complete; the leak test; kill-at-every-step restart testing (idea I-9); an adversarial review with every finding fixed test-first.
 
 ## v0.8.0 - Alpha
 Exit: a production site served for two weeks without a serve-net defect; `docs/ARCHITECTURE.md` draft; no API change needed by the first real wrapper that is not already made.
+- Moved from 0.7 (D-097). When fcgi-net is published: FastCGI on Linux and macOS first (`fastcgi`, `FastCgiListen`, `FastCgiIngress`, `Ingress::FastCgi`, `engine::FastCgi`, `ListenerSpec::fastcgi_descriptor_zero`, T-19, the `fastcgi_mapping` fuzz target, the T-19 attack test, `mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0). Windows waits for the decision on a Windows FastCGI deployment.
 - A real application wrapper built on serve-net's hooks; a custom-family prototype for a database wire protocol.
 
 ## v0.9.0 - Beta
