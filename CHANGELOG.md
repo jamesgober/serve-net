@@ -25,6 +25,9 @@
 
 ### Fixed
 
+- A reload that lowers `max_body` reaches a streamed body (`BodyPolicy::Stream`)
+  on an open connection at its next request, as it already did for buffered
+  bodies.
 - V-24 is enforced: `trust_scheme` or `trust_host` with a single-address
   header or PROXY v1, which carry neither, is refused at build
   (`RuleId::SchemeTrustWithoutSource`).

@@ -236,6 +236,12 @@ struct Request {
     head_reads: u16,
     admitted_at: Option<Instant>,
     bytes_in: u64,
+    /// The head's share of `bytes_in`.
+    head_bytes: u64,
+    /// The body limit of the profile as the tables stood at this head: a
+    /// reload reaches an open connection here, while the engine's own limit
+    /// is fixed when the connection opens.
+    max_body: u64,
     policy: BodyPolicy,
     discard_over: bool,
     status: Option<u16>,
@@ -952,6 +958,19 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                                         None
                                     }
                                 }
+                                BodyPolicy::Stream
+                                    if r.bytes_in.saturating_sub(r.head_bytes) > r.max_body =>
+                                {
+                                    self.end = Some(EndReason::ProtocolError);
+                                    let step = self.refuse(
+                                        io,
+                                        RefusalKind::TooLarge,
+                                        413,
+                                        None,
+                                        RequestEnd::Refused(RefusalKind::TooLarge),
+                                    );
+                                    return (input.len(), step);
+                                }
                                 BodyPolicy::Stream if self.state == State::ReadBody => {
                                     if self.wipe {
                                         crate::engine::wipe_bytes(&mut self.body);
@@ -1093,6 +1112,8 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             head_at: arrived,
             admitted_at: None,
             bytes_in: head_len,
+            head_bytes: head_len,
+            max_body: limits.max_body,
             policy: default_policy,
             discard_over: false,
             status: None,

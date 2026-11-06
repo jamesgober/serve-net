@@ -315,3 +315,58 @@ fn test_reload_notifies_and_reports() {
     );
     let _ = server.drain(Duration::from_secs(2));
 }
+
+/// Found in the 0.7 review: a streamed body (`BodyPolicy::Stream`) was
+/// checked only by the engine, whose limits are fixed when the connection
+/// opens, so a reload that lowered `max_body` never reached it.
+#[test]
+fn test_reload_limits_reach_a_streamed_body_on_an_open_connection() {
+    use serve_net::{
+        BodyPolicy, Envelope, HeadAction, HttpBody, HttpHead, HttpReply, HttpRequest, Outcome,
+    };
+    use std::sync::atomic::AtomicUsize;
+    struct Streamed(AtomicUsize);
+    impl serve_net::HttpService for Streamed {
+        fn head(&self, _h: &HttpHead<'_>, _env: &mut Envelope) -> HeadAction {
+            self.0.store(0, Ordering::Relaxed);
+            HeadAction::ProceedWith(BodyPolicy::Stream)
+        }
+        fn call(&self, req: &HttpRequest<'_>, _env: &Envelope, reply: &mut HttpReply) -> Outcome {
+            let HttpBody::Chunk { bytes, last } = req.body() else {
+                return Outcome::Done;
+            };
+            let total = self.0.fetch_add(bytes.len(), Ordering::Relaxed) + bytes.len();
+            if last {
+                reply.text(200, &format!("got {total}"));
+                Outcome::Done
+            } else {
+                Outcome::More
+            }
+        }
+    }
+    let a = free_addr();
+    let server = Server::builder()
+        .config(config(vec![ListenerSpec::tcp("web", a)]))
+        .serve(Streamed(AtomicUsize::new(0)))
+        .unwrap();
+    // 2,048 bytes in two chunks.
+    let mut chunked = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    for _ in 0..2 {
+        chunked.extend_from_slice(b"400\r\n");
+        chunked.extend_from_slice(&[b'x'; 1024]);
+        chunked.extend_from_slice(b"\r\n");
+    }
+    chunked.extend_from_slice(b"0\r\n\r\n");
+    let mut c = connect(a);
+    let before = exchange(&mut c, &chunked);
+    assert!(before.ends_with("got 2048"), "{before}");
+
+    let mut next = config(vec![ListenerSpec::tcp("web", a)]);
+    next.limits = Limits::new().max_body(1024);
+    server.reload(next).unwrap();
+
+    // The same keep-alive connection, the new limit.
+    let after = exchange(&mut c, &chunked);
+    assert!(after.starts_with("HTTP/1.1 413"), "{after}");
+    let _ = server.drain(Duration::from_secs(2));
+}
