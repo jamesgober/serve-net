@@ -1,5 +1,5 @@
 //! T-30: a restart through a shared listening socket refuses and resets
-//! nothing (Linux and macOS; Windows is open, see the module below). T-20 and
+//! nothing. T-20 and
 //! the head-read signal sit here too: both need a real server's view of a
 //! request.
 
@@ -96,9 +96,6 @@ fn test_panic_caught_500_and_done_called() {
     assert_eq!(ends[1], RequestEnd::Replied);
 }
 
-// Not on Windows yet: two servers on one socket pass on a large machine and
-// lose connections on a small one (dev/ROADMAP.md, Windows restart).
-#[cfg(unix)]
 mod restart {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
@@ -138,9 +135,18 @@ mod restart {
         (addr, first, second)
     }
 
+    /// A server on one handle of the shared socket. Every client here comes
+    /// from 127.0.0.1, and in a hand-off the incoming server takes the old
+    /// one's clients while it starts, so its per-source cap needs room above
+    /// the load: at the default 16 it refuses at its own cap on a slow host,
+    /// which looks like a hand-off reset (D-100).
     fn serve(handle: net_io::ListenerHandle, who: &'static str) -> serve_net::Running {
+        let room = net_io::Limits::builder()
+            .max_per_source(64, net_io::PrefixPolicy::DEFAULT)
+            .build()
+            .unwrap();
         Server::builder()
-            .listener(ListenerSpec::handed_off("web", handle))
+            .listener(ListenerSpec::handed_off("web", handle).transport_limits(room))
             .serve(serve_net::handler(move |_req, reply| {
                 reply.text(200, who);
             }))
@@ -261,7 +267,20 @@ mod restart {
                 (std::time::Instant::now(), new)
             }
         };
+        // Run until a request begun after the kill is served, not for a fixed
+        // time: under heavy load the clients' first requests after the kill
+        // can take longer than any short window.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         std::thread::sleep(Duration::from_millis(300));
+        while std::time::Instant::now() < deadline
+            && !log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(begun, r)| *begun > killed_at && r.is_ok())
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         stop.store(true, Ordering::Relaxed);
         for c in clients {
             c.join().unwrap();

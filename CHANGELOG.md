@@ -49,6 +49,10 @@ an adversarial review with every finding fixed.
 - V-24 is enforced: `trust_scheme` or `trust_host` with a single-address
   header or PROXY v1, which carry neither, is refused at build
   (`RuleId::SchemeTrustWithoutSource`).
+- Restarts on Windows (T-30): the restart tests run on Windows as well. The
+  resets once seen there were the new server's own per-source cap refusing
+  the old server's clients; `docs/DEPLOYMENT.md` now says to start the new
+  server with the old one's caps or more.
 
 ### Changed
 

@@ -135,7 +135,7 @@ A supervisor (or systemd, through a socket unit) keeps the listening socket open
 2. The new process reports ready.
 3. The old process calls `close_door`, then `drain(deadline)`, and exits.
 
-Nothing is refused or reset at any step, because the socket was never closed (tested on Linux and macOS; Windows follows with net-io 0.5). net-io's `send_listeners` and `recv_listeners` move sockets between processes on Unix, with credential checks.
+Nothing is refused or reset at any step, because the socket was never closed (tested on Linux, macOS, and Windows). While it starts, the new process takes the old one's clients as well as its own, so give it the same caps and workers as the old process, or more: a connection over its own caps (the per-source cap, 16 by default on the blocking driver, or the blocking pool's threads) is refused like any other, and through a restart that looks like a hand-off reset. net-io's `send_listeners` and `recv_listeners` move sockets between processes on Unix, with credential checks.
 
 ## Stopping
 
