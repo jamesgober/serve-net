@@ -312,6 +312,10 @@ mod restart {
     }
 
     #[test]
+    #[cfg_attr(
+        all(windows, serve_net_blocking_tests),
+        ignore = "net-io: on the Windows blocking pool a request begun after the old server's drop can hang (dev/ROADMAP.md)"
+    )]
     fn test_i9_kill_before_the_new_server_starts() {
         kill_during_handoff(KillAt::BeforeNew);
     }
