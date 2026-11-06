@@ -990,6 +990,12 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 }
             };
             if let Some(step) = step {
+                if self.state == State::Upgraded {
+                    // The 101 left: input the HTTP engine has not taken belongs
+                    // to the new protocol. net-io hands it back to `on_data`,
+                    // which routes the upgraded state (T-21).
+                    return (consumed, step);
+                }
                 match step {
                     Step::Read if self.state == State::AwaitHead => {
                         served += 1;

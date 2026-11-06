@@ -1060,3 +1060,57 @@ fn test_t15_mapped_v6_client_is_one_source_with_its_v4_form() {
     drop(held);
     let _ = server.drain(Duration::from_secs(2));
 }
+
+/// Found in the 0.7 review: a PROXY v2 SSL TLV marks the client https only
+/// when its `PP2_CLIENT_SSL` bit is set. A proxy that sends the TLV on every
+/// connection (HAProxy's `send-proxy-v2-ssl`) leaves the bit clear for plain
+/// clients, which must stay `http`.
+#[test]
+fn test_loopback_proxy_v2_ssl_tlv_needs_the_client_ssl_bit() {
+    use serve_net::{
+        Ingress, ListenerSpec, ProxySource, ProxyVersions, Scheme, Server, TrustedProxies,
+    };
+    let server = Server::builder()
+        .listener(
+            ListenerSpec::tcp("edge", "127.0.0.1:0").ingress(Ingress::Proxy(
+                ProxySource::proxy_protocol(ProxyVersions::V2, TrustedProxies::loopback())
+                    .trust_scheme(true),
+            )),
+        )
+        .serve(serve_net::handler(|req, reply| {
+            let https = req.client().scheme() == Scheme::Https;
+            reply.text(200, if https { "https" } else { "http" });
+        }))
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    for (client, want) in [
+        (0x00u8, "http"),
+        (0x01, "https"),
+        (0x05, "https"),
+        (0x04, "http"),
+    ] {
+        let mut header = [0u8; 128];
+        // PP2_TYPE_SSL: the client flags, then a 32-bit verify result.
+        let ssl = [client, 0, 0, 0, 0];
+        let n = net_io::encode_v2(
+            net_io::ProxyCommand::Proxy,
+            Some(SocketAddr::from(([198, 51, 100, 9], 40000))),
+            Some(SocketAddr::from(([127, 0, 0, 1], 80))),
+            &[net_io::Tlv {
+                kind: 0x20,
+                value: &ssl,
+            }],
+            false,
+            &mut header,
+        )
+        .unwrap();
+        let mut c = connect(addr);
+        c.write_all(&header[..n]).unwrap();
+        let a = exchange(&mut c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(
+            a.ends_with(&format!("\r\n\r\n{want}")),
+            "client flags {client:#x}: {a}"
+        );
+    }
+    let _ = server.drain(Duration::from_secs(2));
+}

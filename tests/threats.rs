@@ -419,3 +419,22 @@ fn test_t6_ten_thousand_pipelined_requests_are_fair_to_others() {
     writer.join().unwrap().unwrap();
     let _ = server.drain(Duration::from_secs(1));
 }
+
+/// T-17, found in the 0.7 review: with the RFC 7239 source and
+/// `MissingHeader::UsePeer`, a trusted peer that sends no `Forwarded` element
+/// gets the `Host` field and its own scheme, never `X-Forwarded-Host` or
+/// `X-Forwarded-Proto`, which an RFC 7239 proxy neither sets nor strips; and
+/// `head` and `call` agree.
+#[test]
+fn test_t17_rfc7239_without_an_element_ignores_the_x_fields() {
+    let request = b"GET / HTTP/1.1\r\nHost: real.example\r\nX-Forwarded-Host: evil.example\r\nX-Forwarded-Proto: https\r\n\r\n";
+    let site = Seen::default();
+    let proxy = behind(ForwardedSource::Forwarded).missing(serve_net::MissingHeader::UsePeer);
+    let reply = TestRequest::new(request)
+        .client(TRUSTED.into())
+        .behind(proxy)
+        .send(&site);
+    assert_eq!(reply.text(), "http real.example", "call");
+    let head = site.head.lock().unwrap().clone().unwrap();
+    assert_eq!(head, ("real.example".to_owned(), Scheme::Http), "head");
+}
