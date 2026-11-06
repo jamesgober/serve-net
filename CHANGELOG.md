@@ -19,7 +19,9 @@
   (`RuleId::AlpnWithoutTls`).
 - An end-to-end TLS test with a real engine (tls-net 0.5 on ring, a
   dev-dependency only) and the ALPN cases.
-- `docs/SECURITY.md` and a root `SECURITY.md`; attack tests for T-15 and T-18.
+- `docs/SECURITY.md` and a root `SECURITY.md`; attack tests for T-15, T-18,
+  T-32, T-33, and T-40; kill-at-every-step restart tests; the leak test; loom
+  models for the drain and the WebSocket sender.
 - `WsSender` (`WebSocketConn::sender`): send on an open WebSocket from any
   thread, through a queue bounded by the connection's output budget.
 - A drain closes open WebSockets with 1001 first.

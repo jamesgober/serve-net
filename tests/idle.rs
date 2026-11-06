@@ -193,3 +193,81 @@ fn test_hundred_thousand_connections_leak_nothing() {
     );
     let _ = server.drain(Duration::from_secs(2));
 }
+
+/// T-33: large replies on many connections at once. Buffers come from pools
+/// and go back to them; the live heap must not grow from one round to the
+/// next. net-io 0.6.0 charged its buffer budget anew on every flush of a
+/// reply larger than one buffer and never took it back: this would grow.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "moves about 1 GB over loopback"]
+fn test_t33_large_replies_on_many_connections_stay_bounded() {
+    static BIG: [u8; 256 * 1024] = [b'x'; 256 * 1024];
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .workers(Workers::reactor(2))
+        .keep_alive(KeepAlive::new().max_requests(u32::MAX))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.status(200).body_static(&BIG);
+        }))
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let mut conns: Vec<TcpStream> = (0..64)
+        .map(|_| {
+            let s = TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            s
+        })
+        .collect();
+    let mut round = || {
+        std::thread::scope(|scope| {
+            for s in conns.iter_mut() {
+                scope.spawn(move || {
+                    for _ in 0..8 {
+                        s.write_all(GET).unwrap();
+                        let mut got = 0usize;
+                        let mut head = Vec::new();
+                        let mut buf = vec![0u8; 64 * 1024];
+                        // Read the head, then the 256 KiB body.
+                        loop {
+                            let n = s.read(&mut buf).unwrap();
+                            assert!(n > 0, "closed");
+                            if head.len() < 4096 && got == 0 {
+                                head.extend_from_slice(&buf[..n]);
+                                if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    got = head.len() - (end + 4);
+                                }
+                            } else {
+                                got += n;
+                            }
+                            if got >= BIG.len() {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    };
+    let settle = || {
+        std::thread::sleep(Duration::from_millis(300));
+        LIVE.load(Ordering::Relaxed)
+    };
+    for _ in 0..2 {
+        round();
+    }
+    let warm = settle();
+    for _ in 0..3 {
+        round();
+    }
+    let after = settle();
+    let grew = after.saturating_sub(warm);
+    eprintln!("64 connections, 256 KiB replies: live heap {warm} -> {after} bytes (+{grew})");
+    // Pools may take a buffer or two more; growth with the rounds is a leak.
+    assert!(
+        grew < 1024 * 1024,
+        "{grew} bytes more after three more rounds"
+    );
+    drop(conns);
+    let _ = server.drain(Duration::from_secs(2));
+}

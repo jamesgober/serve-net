@@ -926,3 +926,22 @@ mod props {
         }
     }
 }
+
+#[test]
+fn test_t40_one_deadline_per_connection_however_many_requests() {
+    // T-40: a connection holds one exchange deadline on net-io's wheel, and
+    // each request replaces it a fixed number of times: a flood of requests
+    // on one connection never piles up timers.
+    let profile = Profile::new(ProfileId(0))
+        .keep_alive(crate::config::KeepAlive::new().max_requests(u32::MAX));
+    let (mut c, mut io) = conn(Counting::default(), profile);
+    c.on_open(&mut io, false);
+    let _ = c.on_data(&mut io, GET);
+    let base = io.deadline_sets;
+    for _ in 0..1_000 {
+        let _ = c.on_data(&mut io, GET);
+    }
+    let per_request = (io.deadline_sets - base) / 1_000;
+    assert!(per_request <= 4, "{per_request} deadline sets per request");
+    assert!(io.deadline.is_some(), "one deadline, armed");
+}

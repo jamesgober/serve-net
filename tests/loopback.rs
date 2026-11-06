@@ -1114,3 +1114,89 @@ fn test_loopback_proxy_v2_ssl_tlv_needs_the_client_ssl_bit() {
     }
     let _ = server.drain(Duration::from_secs(2));
 }
+
+/// The process's user plus system CPU time so far, in clock ticks (Linux),
+/// from `/proc/self/stat` opened beforehand: with every descriptor in use,
+/// opening it would fail.
+#[cfg(target_os = "linux")]
+fn own_cpu_ticks(file: &mut std::fs::File) -> u64 {
+    use std::io::Seek;
+    let mut stat = String::new();
+    file.rewind().unwrap();
+    file.read_to_string(&mut stat).unwrap();
+    let rest = stat.rsplit_once(')').unwrap().1;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap()
+}
+
+/// T-32: with every descriptor in use, accept fails with EMFILE. The accept
+/// loop backs off instead of spinning, and serving resumes once descriptors
+/// come free. The test runs itself again under `ulimit -n 128`, since the
+/// limit is per process.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_t32_descriptor_exhaustion_does_not_spin_the_accept_loop() {
+    const NAME: &str = "test_t32_descriptor_exhaustion_does_not_spin_the_accept_loop";
+    if std::env::var_os("SERVE_NET_T32_CHILD").is_none() {
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "ulimit -n 128 && exec \"$0\" --exact {NAME} --nocapture --test-threads 1"
+            ))
+            .arg(exe)
+            .env("SERVE_NET_T32_CHILD", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the exhausted child failed: {status}");
+        return;
+    }
+    use serve_net::{ListenerSpec, Server, Workers};
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .workers(Workers::reactor(1))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "ok");
+        }))
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let mut stat = std::fs::File::open("/proc/self/stat").unwrap();
+    // Fill the table: each connection costs the client a descriptor, and the
+    // server one more once it accepts.
+    let mut held = Vec::new();
+    while let Ok(s) = TcpStream::connect(addr) {
+        held.push(s);
+        if held.len() > 200 {
+            break;
+        }
+    }
+    assert!(held.len() < 200, "the limit did not bite");
+    std::thread::sleep(Duration::from_millis(500));
+    // A second of exhaustion: a spinning accept loop burns a whole core.
+    let before = own_cpu_ticks(&mut stat);
+    std::thread::sleep(Duration::from_secs(1));
+    let spent = own_cpu_ticks(&mut stat) - before;
+    assert!(spent < 30, "{spent} ticks of CPU in a second of exhaustion");
+    // Descriptors come free: serving resumes.
+    held.truncate(held.len() / 2);
+    let mut served = false;
+    for _ in 0..50 {
+        if let Ok(mut s) = TcpStream::connect(addr) {
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            if s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .is_ok()
+            {
+                let mut got = Vec::new();
+                let _ = s.read_to_end(&mut got);
+                if got.starts_with(b"HTTP/1.1 200") {
+                    served = true;
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(served, "nothing served after descriptors came free");
+    drop(held);
+    let _ = server.drain(Duration::from_secs(2));
+}
