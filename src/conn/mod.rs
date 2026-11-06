@@ -253,6 +253,9 @@ const OUT_INITIAL: usize = 1024;
 const OUT_RETAIN: usize = 16 * 1024;
 /// Body capacity kept between requests.
 const BODY_RETAIN: usize = 64 * 1024;
+/// A keep-alive connection quiet this long gives back its engine, reply, and
+/// body buffers (D-076, D-087): the next request allocates them again.
+pub(crate) const IDLE_TRIM_AFTER: Duration = Duration::from_secs(1);
 
 /// One connection.
 pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
@@ -289,6 +292,8 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     /// A streamed reply's head has left.
     reply_stream: bool,
     first_byte: Option<Instant>,
+    /// Back between requests with the trim timer set (`IDLE_TRIM_AFTER`).
+    trim_armed: bool,
     /// Reads that fed the current head so far.
     head_reads: u16,
     wipe: bool,
@@ -394,6 +399,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             body_open: false,
             reply_stream: false,
             first_byte: None,
+            trim_armed: false,
             head_reads: 0,
             wipe,
             draining_seen: false,
@@ -633,6 +639,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                     RequestEnd::TimedOut,
                 )
             }
+            (Timeout::Exchange, State::AwaitHead)
+                if self.trim_armed && self.first_byte.is_none() =>
+            {
+                self.trim_idle(io)
+            }
             (Timeout::Exchange, State::AwaitHead) => {
                 if self.first_byte.is_some() {
                     self.end = Some(EndReason::HeadTimeout);
@@ -837,10 +848,28 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             self.state = State::Closed;
             return Step::Close;
         }
-        // The engine keeps its buffer between requests: releasing it here would
-        // cost an allocation per keep-alive request (D-076).
-        io.set_exchange_deadline(None);
+        // The engine keeps its buffer between requests, so a busy connection
+        // allocates nothing; one that stays quiet for `IDLE_TRIM_AFTER` gives
+        // its buffers back (D-087). The phase first: it clears the deadline.
         io.set_phase(Phase::Idle);
+        io.set_exchange_deadline(Some(io.now() + IDLE_TRIM_AFTER));
+        self.trim_armed = true;
+        Step::Read
+    }
+
+    /// The trim timer fired with no byte of a new head: hands back what an
+    /// idle connection does not need. Wiped buffers were zeroed when cleared.
+    fn trim_idle<I: Io>(&mut self, io: &mut I) -> Step {
+        self.trim_armed = false;
+        let _ = self.engine.shrink_idle();
+        self.out.shrink(0);
+        self.body = Vec::new();
+        self.reply.parts = self.shared.family.new_parts();
+        // The deferral slot too: a wake only acts on a parked connection, and a
+        // token from an earlier request keeps its own reference to the old slot.
+        self.reply.link = None;
+        self.defer = None;
+        io.set_exchange_deadline(None);
         Step::Read
     }
 
@@ -861,6 +890,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                     // (the first request's started at accept).
                     let now = io.now();
                     self.first_byte = Some(now);
+                    self.trim_armed = false;
                     if self.seq > 0 {
                         io.set_phase(Phase::Receiving);
                         io.set_exchange_deadline(Some(now + self.limits().head_timeout));

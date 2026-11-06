@@ -104,7 +104,37 @@ fn test_get_replied_and_kept_alive() {
         (200, &b"/a"[..], false)
     );
     assert_eq!(io.phase, Phase::Idle);
-    assert_eq!(io.deadline, None);
+    // Idle: only the trim timer runs (D-087).
+    assert_eq!(io.deadline, Some(io.now + super::IDLE_TRIM_AFTER));
+}
+
+#[test]
+fn test_idle_trim_keeps_the_connection_and_frees_its_buffers() {
+    let (mut c, mut io) = conn(Counting::default(), Profile::new(ProfileId(0)));
+    c.on_open(&mut io, false);
+    let _ = c.on_data(&mut io, GET);
+    assert!(c.out.capacity() > 0, "a reply grew the output buffer");
+    io.advance(super::IDLE_TRIM_AFTER);
+    assert_eq!(c.on_timeout(&mut io, Timeout::Exchange), Step::Read);
+    assert_eq!(io.phase, Phase::Idle);
+    assert_eq!(io.deadline, None, "the trim does not re-arm");
+    assert_eq!(c.out.capacity(), 0);
+    assert_eq!(c.body.capacity(), 0);
+    // The next request is served as before.
+    io.written.clear();
+    let _ = c.on_data(&mut io, GET);
+    assert_eq!(replies(&io.written)[0].status, 200);
+}
+
+#[test]
+fn test_idle_trim_disarmed_by_the_next_head() {
+    let (mut c, mut io) = conn(Counting::default(), Profile::new(ProfileId(0)));
+    c.on_open(&mut io, false);
+    let _ = c.on_data(&mut io, GET);
+    let _ = c.on_data(&mut io, b"GET /2 HT");
+    // The head deadline replaced the trim timer: a timeout now is a 408.
+    assert_eq!(c.on_timeout(&mut io, Timeout::Exchange), Step::Close);
+    assert_eq!(replies(&io.written).last().unwrap().status, 408);
 }
 
 #[test]
@@ -223,7 +253,7 @@ fn test_later_request_head_deadline_from_first_byte() {
     let (mut c, mut io) = conn(Counting::default(), Profile::new(ProfileId(0)));
     c.on_open(&mut io, false);
     let _ = c.on_data(&mut io, GET);
-    assert_eq!(io.deadline, None);
+    assert_eq!(io.deadline, Some(io.now + super::IDLE_TRIM_AFTER));
     io.advance(Duration::from_secs(5));
     let _ = c.on_data(&mut io, b"GET /2 HT");
     assert_eq!(io.deadline, Some(io.now + Duration::from_secs(10)));

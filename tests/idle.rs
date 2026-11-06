@@ -39,7 +39,7 @@ const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 
 /// The most a connection may hold while idle, excluding kernel buffers. The
 /// target (NFR-3) is 4 KiB, due at 0.6; D-076 has where the rest goes.
-const MAX_BYTES_PER_IDLE: usize = 12 * 1024;
+const MAX_BYTES_PER_IDLE: usize = 4 * 1024;
 
 fn one_request(s: &mut TcpStream) {
     s.write_all(GET).unwrap();
@@ -92,7 +92,9 @@ fn test_ten_thousand_idle_connections_stay_bounded() {
         one_request(&mut s);
         held.push(s);
     }
-    std::thread::sleep(Duration::from_secs(1));
+    // Past the idle trim (one second of quiet), so what is measured is what
+    // an idle connection keeps.
+    std::thread::sleep(Duration::from_secs(2));
     let vec_bytes = held.capacity() * size_of::<TcpStream>();
     let used = LIVE.load(Ordering::Relaxed) - before - vec_bytes;
     let per = used / count;
