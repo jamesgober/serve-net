@@ -276,19 +276,39 @@ fn closed_within(stream: &mut TcpStream, limit: Duration) -> bool {
 /// drain ends at its deadline and kills the connection.
 #[test]
 fn test_t29_drain_deadline_kills_a_request_kept_open() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    /// Raises the flag when the head is in: the request is open from then on.
+    struct Opened(Arc<AtomicBool>);
+    impl HttpService for Opened {
+        fn head(&self, _h: &HttpHead<'_>, _env: &mut Envelope) -> HeadAction {
+            self.0.store(true, Ordering::Release);
+            HeadAction::Proceed
+        }
+        fn call(&self, _r: &HttpRequest<'_>, _env: &Envelope, reply: &mut HttpReply) -> Outcome {
+            reply.text(200, "ok");
+            Outcome::Done
+        }
+    }
+    let opened = Arc::new(AtomicBool::new(false));
     let server = Server::builder()
         .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
         .limits(Limits::new().request_timeout(Duration::from_secs(120)))
-        .serve(serve_net::handler(|_req, reply| {
-            reply.text(200, "ok");
-        }))
+        .serve(Opened(Arc::clone(&opened)))
         .unwrap();
     let addr = server.local_addr().unwrap();
     let mut c = connect(addr);
     c.write_all(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1000000\r\n\r\nabc")
         .unwrap();
-    // The head is in: the request is open and waiting for its body.
-    std::thread::sleep(Duration::from_millis(200));
+    // Wait for the head, not a fixed time: a loaded machine is slow to read it.
+    let waited = Instant::now();
+    while !opened.load(Ordering::Acquire) {
+        assert!(
+            waited.elapsed() < Duration::from_secs(30),
+            "the head was never read"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let start = Instant::now();
     let report = server.drain(Duration::from_millis(300));
     let took = start.elapsed();
