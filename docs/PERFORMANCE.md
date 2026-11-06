@@ -91,23 +91,24 @@ the 32-thread development host in a quiet window (CPUs 0-15 and 16-31: separate 
 caches), and the hosted runner as a second view. A run on two machines stays open in
 `docs/STABILITY-1.0.md`; it does not block 0.x.
 
-**First hosted-runner run** (GitHub `ubuntu-latest`, AMD EPYC 9V45, 4 vCPUs: 2 for the server, 2 for
-the generator; 5 rounds of 10 s, median):
+**Hosted-runner run** (GitHub `ubuntu-latest`, AMD EPYC 9V45, 4 vCPUs: 2 for the server, 2 for
+the generator; 5 rounds of 10 s, median; 2026-11-06). serve-net's per-source cap (256 connections
+from one address by default, a defence hyper does not have) is lifted for the run, since every
+benchmark connection comes from 127.0.0.1; no errors on either side.
 
 | Row | serve-net | hyper | serve-net against hyper |
 |---|---|---|---|
-| P-2 keep-alive, 256 connections | 233,371/s | 245,049/s | -5% |
-| P-3 pipelined 16, 256 connections | 1,780,635/s | 1,878,821/s | -5% |
-| P-4 churn, 64 connections | 38,062/s | 38,717/s | -2% |
+| P-2 keep-alive, 256 connections | 248,358/s | 252,690/s | -1.7% |
+| P-2 keep-alive, 1,000 connections | 219,107/s | 240,785/s | -9% |
+| P-3 pipelined 16, 256 connections | 1,856,846/s | 2,021,318/s | -8% |
+| P-4 churn, 64 connections | 41,111/s | 40,857/s | +0.6% |
 
-**Not met: serve-net is about 5% behind hyper, against a target of 20% ahead.** The runner's soft
-descriptor limit (1,024) also made the 1,000-connection row and part of the pipelined row measure
-net-io's hard cap rather than throughput: net-io keeps headroom under the limit and resets connections
-past it (the known low-ulimit issue), where hyper keeps none. The workflow now raises the limit for
-both servers. The pinned run on the development host waits for a quiet window: other work held the
-machine at full load through this pass. Closing the gap is the profile-led work already in the
-register: the request path (172 ns of serve-net's own work against 150 ns), then accept and connection
-setup for churn.
+**Not met: serve-net is level with hyper to 9% behind it, against a target of 20% ahead.** The gap
+grows with concurrency and pipelining, which points at per-request work on the worker rather than
+the transport: the request path (172 ns of serve-net's own work against 150 ns) and the reply's
+copy of a static body into the output buffer are the first two items of the pre-1.0 performance
+pass. The pinned run on the development host waits for a quiet window: other work held the machine
+at full load through 0.7. NFR-5 is a 1.0 blocker (`docs/STABILITY-1.0.md`).
 
 ## Not measured yet
 
