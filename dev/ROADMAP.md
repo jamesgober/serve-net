@@ -135,6 +135,7 @@ Exit: zero open findings; the 24 h soak clean (NFR-18); `docs/SECURITY.md` writt
 - Attack tests still to write: T-32 (descriptor exhaustion, Linux), T-33 (large replies on many connections), T-40 (one deadline per connection); T-19 waits for FastCGI. `RuleId::FastCgiTrust` and `RuleId::ForwardedOnDirect` are declared and never emitted: the first lands with FastCGI, the second cannot occur because `Ingress::Direct` carries no forwarded source, so it is documented as such or removed at the 0.9 API review.
 - [x] NFR-5 tooling (D-086): `compare/` against hyper, pinned on the development host and on a hosted runner; first hosted numbers in `docs/PERFORMANCE.md` (about 5% behind hyper, against 20% ahead). The pinned run waits for a quiet window.
 - The 24 h soak (`compare soak`, D-086): started 2026-11-06.
+- [x] `docs/SECURITY.md` (the security model, defaults, a deployment checklist, what is not defended, testing, advisories) and a root `SECURITY.md` (reporting and supported versions).
 - Every fuzz target running with an out-of-repo corpus; every threat with its attack test; loom models complete; the leak test; kill-at-every-step restart testing (idea I-9); an adversarial review with every finding fixed test-first.
 
 ## v0.8.0 - Alpha
