@@ -74,11 +74,34 @@ pub enum EngineChoice {
     /// HTTP/1.1 (http-net).
     #[default]
     Http1,
+    /// The engine the TLS handshake's ALPN result names: HTTP/1.1 for
+    /// `http/1.1` or no ALPN. `h2` needs the HTTP/2 engine, which is not
+    /// built yet, so a connection that negotiated it is closed with
+    /// `EndReason::NoEngine`; offer only `http/1.1` on the acceptor until
+    /// then. Only on TLS listeners (`RuleId::AlpnWithoutTls`).
+    Http1OrH2ByAlpn,
     /// A custom family given to `bind_family`; the ALPN ids it serves.
     Custom {
         /// The ALPN protocol ids offered on TLS listeners.
         alpn: &'static [&'static str],
     },
+}
+
+impl EngineChoice {
+    /// Whether a connection whose TLS handshake negotiated `alpn` (`None`:
+    /// no ALPN, or no TLS) has an engine under this choice. A `false` closes
+    /// the connection before any byte reaches an engine (`EndReason::NoEngine`).
+    pub(crate) fn admits(self, alpn: Option<&[u8]>) -> bool {
+        match (self, alpn) {
+            (_, None) => true,
+            (EngineChoice::Http1 | EngineChoice::Http1OrH2ByAlpn, Some(p)) => {
+                p == b"http/1.1" || p == b"http/1.0"
+            }
+            (EngineChoice::Custom { alpn: ids }, Some(p)) => {
+                ids.iter().any(|id| id.as_bytes() == p)
+            }
+        }
+    }
 }
 
 /// The answer to "connections on this listener use this engine, this lane,
@@ -274,6 +297,28 @@ mod tests {
         assert!(p.wipe_buffers);
         assert!(!p.critical);
         assert_eq!(p.engine, EngineChoice::Http1);
+    }
+
+    #[test]
+    fn test_engine_admits_by_alpn() {
+        for choice in [EngineChoice::Http1, EngineChoice::Http1OrH2ByAlpn] {
+            assert!(choice.admits(None));
+            assert!(choice.admits(Some(b"http/1.1")));
+            assert!(choice.admits(Some(b"http/1.0")));
+            // No HTTP/2 engine yet: h2 has nothing to run it.
+            assert!(!choice.admits(Some(b"h2")));
+            assert!(!choice.admits(Some(b"acme-tls/1")));
+            assert!(
+                !choice.admits(Some(b"HTTP/1.1")),
+                "ALPN ids are exact bytes"
+            );
+        }
+        let custom = EngineChoice::Custom {
+            alpn: &["pg", "x-db/2"],
+        };
+        assert!(custom.admits(None));
+        assert!(custom.admits(Some(b"x-db/2")));
+        assert!(!custom.admits(Some(b"http/1.1")));
     }
 
     #[test]

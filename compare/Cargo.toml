@@ -1,0 +1,23 @@
+# Throughput against other HTTP servers (NFR-5, P-2 to P-4). Never published,
+# and not part of the crate: the competitors are dependencies of this tool alone.
+[package]
+name = "serve-net-compare"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+serve-net = { path = ".." }
+mio = { version = "1", features = ["net", "os-poll"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+
+[profile.release]
+debug = false
+lto = "thin"
+codegen-units = 1

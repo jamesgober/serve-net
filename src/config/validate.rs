@@ -280,9 +280,12 @@ fn tls(l: &ListenerSpec, d: &Draft<'_>, f: &mut Findings) {
             "give the server one with ServerBuilder::tls",
         );
     }
-    let alpn = d.profiles.iter().find(|p| p.id == l.profile).is_some_and(
-        |p| matches!(p.engine, crate::config::EngineChoice::Custom { alpn } if !alpn.is_empty()),
-    );
+    let alpn = d.profiles.iter().find(|p| p.id == l.profile).is_some_and(|p| {
+        matches!(
+            p.engine,
+            crate::config::EngineChoice::Http1OrH2ByAlpn
+        ) || matches!(p.engine, crate::config::EngineChoice::Custom { alpn } if !alpn.is_empty())
+    });
     if alpn && !on_tls {
         f.error(
             RuleId::AlpnWithoutTls,

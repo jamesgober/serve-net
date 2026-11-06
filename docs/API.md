@@ -1248,7 +1248,7 @@ pub enum EngineChoice {
 }
 ```
 
-The engine a profile's connections start with, and the ALPN protocols offered on its TLS listeners. A profile without h2 never offers `h2`. An ALPN result with no compiled engine closes the connection (`EndReason::NoEngine`). ALPN choices on a listener without TLS are refused (`RuleId::AlpnWithoutTls`). P0 (`Http1`, `Custom`) `0.3.0`, P1 (`FastCgi`, `Http1OrH2ByAlpn`) `0.7.0`, Tier 2.
+The engine a profile's connections start with, chosen by the TLS handshake's ALPN result. The acceptor (tls-net, or any `net_io::TlsAcceptor`) decides what is offered; serve-net reads what was negotiated, after the handshake and before any byte reaches an engine. `Http1` and `Http1OrH2ByAlpn` run HTTP/1.1 for `http/1.1`, `http/1.0`, or no ALPN; `Custom` runs its family for no ALPN or one of its ids. An ALPN result with no compiled engine closes the connection (`EndReason::NoEngine`); until the HTTP/2 engine exists that includes `h2`, so offer only `http/1.1` on the acceptor. ALPN choices on a listener without TLS are refused (`RuleId::AlpnWithoutTls`). P0 (`Http1`, `Custom`) `0.3.0`, P1 (`FastCgi`, `Http1OrH2ByAlpn`) `0.7.0`, Tier 2.
 
 ---
 

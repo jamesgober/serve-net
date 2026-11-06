@@ -11,6 +11,22 @@
 
 ## [Unreleased]
 
+### Added
+
+- `EngineChoice::Http1OrH2ByAlpn`: the engine by the TLS handshake's ALPN
+  result. HTTP/1.1 for `http/1.1` or no ALPN; `h2` closes with
+  `EndReason::NoEngine` until the HTTP/2 engine exists. Only on TLS listeners
+  (`RuleId::AlpnWithoutTls`).
+- An end-to-end TLS test with a real engine (tls-net 0.5 on ring, a
+  dev-dependency only) and the ALPN cases.
+
+### Changed
+
+- A connection whose ALPN result names a protocol its profile has no engine for
+  is closed with `EndReason::NoEngine` before any byte reaches an engine. Before,
+  an `Http1` profile fed an HTTP/2 connection to the HTTP/1.1 parser, which
+  answered 400.
+
 ---
 
 ## [0.6.2] - 2026-11-04

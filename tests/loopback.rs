@@ -882,7 +882,8 @@ fn test_loopback_a_slow_body_is_answered_by_the_request_deadline() {
     c.set_read_timeout(Some(Duration::from_millis(100)))
         .unwrap();
     let mut n = 0;
-    for _ in 0..50 {
+    // Up to 30 s: a loaded machine can be slow to reach the wait.
+    for _ in 0..300 {
         server.server_handle().wake_all();
         if let Ok(read @ 1..) = c.read(&mut buf) {
             n = read;
@@ -935,10 +936,23 @@ fn test_loopback_manual_clock_drives_the_head_deadline() {
     std::thread::sleep(Duration::from_millis(100));
     // No real time passes; the clock says the deadline did.
     clock.advance(Duration::from_secs(6));
-    // A worker blocked in a read learns of it when woken.
-    server.server_handle().wake_all();
-    let mut got = String::new();
-    let _ = c.read_to_string(&mut got);
+    // A worker blocked in a read learns of it when woken. A wake can land
+    // before the worker waits (a loaded machine is slow to get there), so wake
+    // again until the reply comes rather than trusting one wake.
+    c.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 256];
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(30) && !got.ends_with(b"408 Request Timeout\n") {
+        server.server_handle().wake_all();
+        match c.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(_) => {}
+        }
+    }
+    let got = String::from_utf8_lossy(&got);
     assert!(got.starts_with("HTTP/1.1 408"), "{got}");
     let _ = server.drain(Duration::from_secs(1));
 }

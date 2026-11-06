@@ -16,8 +16,9 @@ use net_io::{
 
 use super::{Conn, Io, Phase, Shared, Step, Timeout};
 use crate::client::{ClientInfo, IngressKind, Scheme};
-use crate::config::ProxyKind;
+use crate::config::{EngineChoice, ProxyKind};
 use crate::engine::{Family, Service};
+use crate::error::EndReason;
 use crate::hooks::{Hooks, JobService, Observer};
 use crate::net::{ConnectionId, WorkerId};
 use crate::reply::{PostFail, Waker};
@@ -380,6 +381,20 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> Factory<F, S, H> {
             } else {
                 runtime.declared_scheme
             });
+        }
+        // net-io opens the session after the TLS handshake, so the ALPN
+        // result is known: a protocol with no engine closes the connection
+        // before any byte reaches one.
+        let engine = tables
+            .profiles
+            .compiled(runtime.profile)
+            .map_or(EngineChoice::Http1, |c| c.profile.engine);
+        let alpn = info.tls.as_ref().and_then(|t| t.alpn());
+        if !engine.admits(alpn) {
+            self.shared
+                .observer
+                .connection_ended(info.id, EndReason::NoEngine, 0);
+            return Err(RefusalCause::Session);
         }
         let profile = usize::from(runtime.profile.0);
         let profile_cap = tables.profile_caps.get(profile);
