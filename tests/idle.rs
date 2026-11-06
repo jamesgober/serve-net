@@ -113,3 +113,77 @@ fn test_ten_thousand_idle_connections_stay_bounded() {
     drop(held);
     let _ = server.drain(Duration::from_secs(5));
 }
+
+/// NFR-19, the leak test: 100,000 connections opened, answered, and closed
+/// (the server closes, so client ports are not held in TIME_WAIT); the heap
+/// comes back to where it was. A seat, an admission slot, a deferral slot, an
+/// observer entry, or a buffer that one connection kept would show as growth.
+/// Linux only: macOS and Windows have about 16,000 ephemeral ports.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "opens 100,000 connections"]
+fn test_hundred_thousand_connections_leak_nothing() {
+    const CLOSE: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    let count: usize = std::env::var("SERVE_NET_LEAK").map_or(100_000, |n| n.parse().unwrap());
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        // Two workers: their buffer pools fill in the warm-up, so what the
+        // halves measure is what connections keep, not pools still filling.
+        .workers(Workers::reactor(2))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "ok");
+        }))
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let round = |n: usize| {
+        for _ in 0..n {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            s.write_all(CLOSE).unwrap();
+            let mut got = Vec::new();
+            let _ = s.read_to_end(&mut got);
+            assert!(
+                got.starts_with(b"HTTP/1.1 200"),
+                "{:?}",
+                String::from_utf8_lossy(&got)
+            );
+        }
+    };
+    // Warm the pools and the per-worker caches, then measure.
+    round(5_000);
+    let settle = || {
+        let mut last = LIVE.load(Ordering::Relaxed);
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            let now = LIVE.load(Ordering::Relaxed);
+            if now == last && server.stats().transport.open == 0 {
+                break;
+            }
+            last = now;
+        }
+        LIVE.load(Ordering::Relaxed)
+    };
+    // Two equal halves: pools and caches may grow in the first, a leak grows
+    // in both, so the second half is what has to stay flat.
+    let before = settle();
+    let started = Instant::now();
+    round(count / 2);
+    let mid = settle();
+    round(count / 2);
+    let after = settle();
+    let first = mid.saturating_sub(before);
+    let second = after.saturating_sub(mid);
+    eprintln!(
+        "{count} connections in {:?}: live heap {before} -> {mid} -> {after} bytes (+{first}, then +{second})",
+        started.elapsed()
+    );
+    assert_eq!(server.stats().transport.open, 0);
+    // A byte per connection in the second half would be 50 KB at the default
+    // count: allow pool churn, nothing that scales with the count.
+    assert!(
+        second < 32 * 1024,
+        "{second} bytes more over the second {} connections",
+        count / 2
+    );
+    let _ = server.drain(Duration::from_secs(2));
+}
