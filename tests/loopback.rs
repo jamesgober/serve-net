@@ -1018,3 +1018,45 @@ fn test_detached_head_is_owned_and_redacts_credentials() {
     );
     assert_eq!(reply.text(), "/jobs");
 }
+
+/// T-15: IPv6 listeners are v6-only unless asked (net-io D-026). On one made
+/// dual-stack, an IPv4 client arrives as `::ffff:127.0.0.1`; it is reported
+/// as `127.0.0.1`, and the per-source cap counts it under that one address,
+/// so the mapped form dodges nothing.
+#[test]
+fn test_t15_mapped_v6_client_is_one_source_with_its_v4_form() {
+    use serve_net::{ListenerSpec, Server};
+    let Ok(server) = Server::builder()
+        .listener(
+            ListenerSpec::tcp("dual", "[::]:0")
+                .listen_options(net_io::ListenOptions::default().ipv6_only(false)),
+        )
+        .transport_limits(
+            net_io::Limits::builder()
+                .max_per_source(2, net_io::PrefixPolicy::DEFAULT)
+                .build()
+                .unwrap(),
+        )
+        .serve(serve_net::handler(|req, reply| {
+            let addr = req
+                .client()
+                .addr()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            reply.text(200, &addr);
+        }))
+    else {
+        // No IPv6 on this host: nothing to test.
+        return;
+    };
+    let port = server.local_addr().unwrap().port();
+    let v4 = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut held: Vec<TcpStream> = (0..2).map(|_| connect(v4)).collect();
+    for c in &mut held {
+        let a = exchange(c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(a.ends_with("\r\n\r\n127.0.0.1"), "{a}");
+    }
+    assert!(!served(v4), "a third connection from one source");
+    drop(held);
+    let _ = server.drain(Duration::from_secs(2));
+}
