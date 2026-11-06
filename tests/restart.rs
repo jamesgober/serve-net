@@ -191,4 +191,122 @@ mod restart {
         assert!(failed.is_empty(), "failed in the restart: {failed:?}");
         let _ = new.drain(Duration::from_secs(2));
     }
+
+    /// Where idea I-9 kills the old server in a hand-off.
+    #[derive(Clone, Copy, Debug)]
+    enum KillAt {
+        /// Before the new server exists: only the supervisor's handle holds
+        /// the socket, and connections wait in its backlog.
+        BeforeNew,
+        /// Right after the new server started.
+        AfterNew,
+        /// After the old server closed its door.
+        AfterDoor,
+        /// While the old server drains.
+        MidDrain,
+    }
+
+    /// Idea I-9: the old server dies at a step of the hand-off instead of
+    /// draining. The guarantee that holds then: no connection is refused
+    /// (the socket stays open through the new server's handle), only requests
+    /// already begun on the old server can fail, and every request begun after
+    /// the kill is served.
+    fn kill_during_handoff(at: KillAt) {
+        let (addr, first, second) = shared_socket();
+        let old = serve(first, "old");
+        let stop = Arc::new(AtomicBool::new(false));
+        let log: Arc<Mutex<Vec<(std::time::Instant, Result<(), String>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let clients: Vec<_> = (0..4)
+            .map(|_| {
+                let (stop, log) = (Arc::clone(&stop), Arc::clone(&log));
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let begun = std::time::Instant::now();
+                        let r = one_request(addr);
+                        log.lock().unwrap().push((begun, r));
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(100));
+        let (killed_at, new) = match at {
+            KillAt::BeforeNew => {
+                drop(old);
+                let killed = std::time::Instant::now();
+                std::thread::sleep(Duration::from_millis(50));
+                (killed, serve(second, "new"))
+            }
+            KillAt::AfterNew => {
+                let new = serve(second, "new");
+                drop(old);
+                (std::time::Instant::now(), new)
+            }
+            KillAt::AfterDoor => {
+                let new = serve(second, "new");
+                std::thread::sleep(Duration::from_millis(50));
+                old.close_door();
+                drop(old);
+                (std::time::Instant::now(), new)
+            }
+            KillAt::MidDrain => {
+                let new = serve(second, "new");
+                std::thread::sleep(Duration::from_millis(50));
+                old.close_door();
+                old.drain_handle().drain(Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(20));
+                drop(old);
+                (std::time::Instant::now(), new)
+            }
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        stop.store(true, Ordering::Relaxed);
+        for c in clients {
+            c.join().unwrap();
+        }
+        let log = log.lock().unwrap();
+        let refused: Vec<_> = log
+            .iter()
+            .filter_map(|(_, r)| r.as_ref().err())
+            // Refused: nobody held the socket. A reset of a connection the
+            // old server had taken when it died is an in-flight loss, which
+            // the check below allows only before the kill.
+            .filter(|e| e.starts_with("connect") && e.contains("refused"))
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "{at:?}: connections refused: {refused:?}"
+        );
+        let late: Vec<_> = log
+            .iter()
+            .filter(|(begun, r)| *begun > killed_at && r.is_err())
+            .collect();
+        assert!(late.is_empty(), "{at:?}: failed after the kill: {late:?}");
+        let served_after = log
+            .iter()
+            .filter(|(begun, r)| *begun > killed_at && r.is_ok())
+            .count();
+        assert!(served_after > 0, "{at:?}: nothing served after the kill");
+        let _ = new.drain(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_i9_kill_before_the_new_server_starts() {
+        kill_during_handoff(KillAt::BeforeNew);
+    }
+
+    #[test]
+    fn test_i9_kill_right_after_the_new_server_starts() {
+        kill_during_handoff(KillAt::AfterNew);
+    }
+
+    #[test]
+    fn test_i9_kill_after_the_door_closed() {
+        kill_during_handoff(KillAt::AfterDoor);
+    }
+
+    #[test]
+    fn test_i9_kill_mid_drain() {
+        kill_during_handoff(KillAt::MidDrain);
+    }
 }
