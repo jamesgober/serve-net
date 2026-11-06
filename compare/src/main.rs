@@ -59,11 +59,16 @@ fn main() {
         }
         Some("soak") => {
             let hours: f64 = args.get(1).and_then(|h| h.parse().ok()).unwrap_or(24.0);
-            soak(Duration::from_secs_f64(hours * 3600.0));
+            // A second port lets two soaks run side by side.
+            let port = args.get(2).and_then(|p| p.parse().ok()).unwrap_or(9_390);
+            soak(Duration::from_secs_f64(hours * 3600.0), port);
         }
         Some("table") | None => {
             let cpus = args.get(1).cloned();
-            let load_threads = args.get(2).and_then(|t| t.parse().ok()).unwrap_or_else(threads);
+            let load_threads = args
+                .get(2)
+                .and_then(|t| t.parse().ok())
+                .unwrap_or_else(threads);
             table(cpus.as_deref(), load_threads);
         }
         Some(other) => panic!("unknown command {other}"),
@@ -104,7 +109,10 @@ fn start(stack: &str, port: u16, cpus: Option<&str>) -> Child {
     let target: SocketAddr = addr.parse().unwrap();
     let start = Instant::now();
     while std::net::TcpStream::connect(target).is_err() {
-        assert!(start.elapsed() < Duration::from_secs(10), "{stack} did not start");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{stack} did not start"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     child
@@ -138,7 +146,13 @@ fn table(cpus: Option<&str>, load_threads: usize) {
             let mut errors = 0;
             for _ in 0..ROUNDS {
                 let before = cpu_ticks(child.id());
-                let m = load(addr, conns, depth, load_threads, Duration::from_secs(SECONDS));
+                let m = load(
+                    addr,
+                    conns,
+                    depth,
+                    load_threads,
+                    Duration::from_secs(SECONDS),
+                );
                 if let (Some(a), Some(b)) = (before, cpu_ticks(child.id())) {
                     // 100 ticks per second on Linux.
                     let secs = (b.saturating_sub(a)) as f64 / 100.0;
@@ -151,15 +165,27 @@ fn table(cpus: Option<&str>, load_threads: usize) {
             }
             let _ = child.kill();
             let _ = child.wait();
-            let cpu = if per_cpu.is_empty() { "n/a".into() } else { spread(&mut per_cpu) };
-            println!("| {row} | {stack} | {} | {cpu} | {errors} |", spread(&mut rates));
+            let cpu = if per_cpu.is_empty() {
+                "n/a".into()
+            } else {
+                spread(&mut per_cpu)
+            };
+            println!(
+                "| {row} | {stack} | {} | {cpu} | {errors} |",
+                spread(&mut rates)
+            );
         }
     }
 }
 
 fn spread(v: &mut [f64]) -> String {
     v.sort_by(f64::total_cmp);
-    format!("{:.0} ({:.0} to {:.0})", v[v.len() / 2], v[0], v[v.len() - 1])
+    format!(
+        "{:.0} ({:.0} to {:.0})",
+        v[v.len() / 2],
+        v[0],
+        v[v.len() - 1]
+    )
 }
 
 struct Measured {
@@ -257,7 +283,11 @@ fn drive(addr: SocketAddr, conns: usize, depth: usize, until: Instant) -> (u64, 
         match open(addr, depth) {
             Ok(mut c) => {
                 poll.registry()
-                    .register(&mut c.stream, Token(i), Interest::READABLE | Interest::WRITABLE)
+                    .register(
+                        &mut c.stream,
+                        Token(i),
+                        Interest::READABLE | Interest::WRITABLE,
+                    )
                     .expect("register");
                 slots.push(Some(c));
             }
@@ -346,7 +376,11 @@ fn drive(addr: SocketAddr, conns: usize, depth: usize, until: Instant) -> (u64, 
                     match open(addr, depth) {
                         Ok(mut c) => {
                             poll.registry()
-                                .register(&mut c.stream, Token(i), Interest::READABLE | Interest::WRITABLE)
+                                .register(
+                                    &mut c.stream,
+                                    Token(i),
+                                    Interest::READABLE | Interest::WRITABLE,
+                                )
                                 .expect("register");
                             slots[i] = Some(c);
                         }
@@ -413,7 +447,9 @@ fn hyper_server(addr: SocketAddr, workers: u16) {
 
             let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
             loop {
-                let Ok((stream, _)) = listener.accept().await else { continue };
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
                 let _ = stream.set_nodelay(true);
                 tokio::spawn(async move {
                     let service = service_fn(|_req: Request<Incoming>| async {
@@ -441,7 +477,8 @@ fn hyper_server(addr: SocketAddr, workers: u16) {
 fn soak_server(addr: SocketAddr) {
     use serve_net::{ListenerSpec, Server};
     static BIG: [u8; 256 * 1024] = [b'x'; 256 * 1024];
-    static RUNNING: std::sync::OnceLock<std::sync::Mutex<serve_net::Running>> = std::sync::OnceLock::new();
+    static RUNNING: std::sync::OnceLock<std::sync::Mutex<serve_net::Running>> =
+        std::sync::OnceLock::new();
     let running = Server::builder()
         .listener(ListenerSpec::tcp("soak", &addr.to_string()))
         .serve(serve_net::handler(|req, reply| match req.path() {
@@ -584,15 +621,17 @@ fn soak_round(addr: SocketAddr, kept: &mut Option<(std::net::TcpStream, u32)>) -
                     let n = s.read(&mut b).unwrap_or(0);
                     String::from_utf8_lossy(&b[..n.min(120)]).into_owned()
                 });
-                eprintln!("unexpected: {:?} -> {got:?}", String::from_utf8_lossy(&req[..req.len().min(40)]));
+                eprintln!(
+                    "unexpected: {:?} -> {got:?}",
+                    String::from_utf8_lossy(&req[..req.len().min(40)])
+                );
             }
         }
     }
     (done, bad, transient)
 }
 
-fn soak(time: Duration) {
-    let port = 9_390;
+fn soak(time: Duration, port: u16) {
     let mut child = start("soak", port, None);
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -601,7 +640,8 @@ fn soak(time: Duration) {
     let transient = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let workers: Vec<_> = (0..4)
         .map(|_| {
-            let (stop, done, bad, transient) = (stop.clone(), done.clone(), bad.clone(), transient.clone());
+            let (stop, done, bad, transient) =
+                (stop.clone(), done.clone(), bad.clone(), transient.clone());
             std::thread::spawn(move || {
                 use std::sync::atomic::Ordering::Relaxed;
                 let mut kept = None;
@@ -648,22 +688,18 @@ fn soak(time: Duration) {
             // Bounded means flat: more than 25% over the warm baseline, or 64
             // descriptors more, is growth.
             if rss > b_rss + b_rss / 4 || fds > b_fds + 64 {
-                failed = Some(format!("growth: rss {b_rss} to {rss} KiB, descriptors {b_fds} to {fds}"));
+                failed = Some(format!(
+                    "growth: rss {b_rss} to {rss} KiB, descriptors {b_fds} to {fds}"
+                ));
                 break;
             }
         }
         if bad.load(Relaxed) > 0 {
             if let Ok(mut s) = std::net::TcpStream::connect(addr) {
-                let _ = s.write_all(b"GET /stats HTTP/1.1
-Host: s
-Connection: close
-
-");
+                let _ = s.write_all(b"GET /stats HTTP/1.1\r\nHost: s\r\nConnection: close\r\n\r\n");
                 let mut t = String::new();
                 let _ = s.read_to_string(&mut t);
-                println!("server stats: {}", t.split("
-
-").nth(1).unwrap_or(""));
+                println!("server stats: {}", t.split("\r\n\r\n").nth(1).unwrap_or(""));
             }
             failed = Some(format!("{} unexpected answers", bad.load(Relaxed)));
             break;

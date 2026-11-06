@@ -135,7 +135,7 @@ Exit: zero open findings; the 24 h soak clean (NFR-18); `docs/SECURITY.md` writt
 - [x] Attack tests for T-15 (a dual-stack listener reports and caps `::ffff:127.0.0.1` as `127.0.0.1`; IPv6 listeners are v6-only unless asked) and T-18 (the default socket mode is `0o660`).
 - [x] Attack tests for T-32 (descriptor exhaustion: no accept spin, serving resumes; Linux, under `ulimit -n 128`), T-33 (64 connections of 256 KiB replies, the heap flat across rounds), T-40 (one deadline per connection, a fixed number of sets per request). Every threat now has an attack test except T-19, which waits for FastCGI. `RuleId::FastCgiTrust` lands with FastCGI; `RuleId::ForwardedOnDirect` cannot occur because `Ingress::Direct` carries no forwarded source, so it is documented as such or removed at the 0.9 API review.
 - [x] NFR-5 tooling (D-086): `compare/` against hyper, pinned on the development host and on a hosted runner; first hosted numbers in `docs/PERFORMANCE.md` (about 5% behind hyper, against 20% ahead). The pinned run waits for a quiet window.
-- [x] The 24 h soak (`compare soak`, D-086) on net-io 0.6.1: clean (SOAK_RESULT).
+- [x] The 24 h soak (`compare soak`, D-086) on net-io 0.6.2 (D-099): clean (SOAK_RESULT).
 - [x] Loom models complete (D-096): two concurrent drains, a drain against an upgraded connection closing (which found a race, fixed), a sender against the close, with the snapshot, deferral slot, and in-flight cap.
 - [x] Kill-at-every-step restart testing (idea I-9, D-095): four kill points under load; nothing refused, nothing begun after the kill lost.
 - [x] The leak test (NFR-19, D-093): 100,000 connections opened and closed, the heap flat (0 bytes over the second half at 40,000).

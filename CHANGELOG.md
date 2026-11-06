@@ -52,8 +52,11 @@ an adversarial review with every finding fixed.
 
 ### Changed
 
-- net-io 0.6.1. An idle keep-alive connection gives back its buffers after one
-  second of quiet: about 4 KB per idle connection, from about 9 KB.
+- net-io 0.6.2. An idle keep-alive connection gives back its buffers after one
+  second of quiet: about 4 KB per idle connection, from about 9 KB. A drain no
+  longer cuts a request that has already arrived, and on Windows a worker no
+  longer deadlocks at thread exit and the listen backlog is no longer capped
+  at 200.
 - A connection whose ALPN result names a protocol its profile has no engine for
   is closed with `EndReason::NoEngine` before any byte reaches an engine. Before,
   an `Http1` profile fed an HTTP/2 connection to the HTTP/1.1 parser, which
