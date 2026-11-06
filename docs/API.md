@@ -355,6 +355,7 @@ serve-net names a few net-io and http-net types in its own signatures. They are 
 | `TrustedProxies`, `Cidr` | net-io | `ProxySource`, `FastCgiIngress` |
 | `ControlLine`, `ControlState`, `SimpleControl`, `NoControl` | net-io | [the control line](#the-control-line) |
 | `Gate`, `AllowAll`, `EventSink`, `NoopSink`, `CloseReason` | net-io | `ServerBuilder::gate`, `ServerBuilder::events`, `EndReason::Transport` |
+| `GateTag` | net-io | `Envelope::gate_tag` |
 | `Method`, `Version` | http-net (feature `http1`) | `HttpHead::method`, `HttpHead::version` |
 | `net_io` | the crate | `ServerBuilder::transport_limits`, `ListenerSpec::listen_options`, hand-off |
 | `http_net` | the crate (feature `http1`) | `Limits::engine_limits` |
@@ -1110,6 +1111,7 @@ impl Envelope {
     pub fn seq(&self) -> RequestSeq;
     pub fn profile(&self) -> ProfileId;
     pub fn tag(&self) -> u8;                      // the profile's opaque tag
+    pub fn gate_tag(&self) -> GateTag;            // the gate's tag from Gate::admit; GateTag(0) with no gate; 0.7.0
     pub fn lane(&self) -> Lane;
     pub fn set_lane(&mut self, lane: Lane);       // honoured in head() only; later calls are ignored and reported
     pub fn client(&self) -> &ClientInfo;
@@ -1121,7 +1123,7 @@ impl Envelope {
 }
 ```
 
-The facts serve-net keeps about one request, passed to every hook and service call. `connection` plus `seq` identify a request within the process. `user_word` lets a wrapper link its own per-request record (for example the index of a slot taken in `Admit`) without serve-net knowing its type. `Send + Sync`, about 96 bytes [est.], stored in the connection record: no allocation. P0, Tier 2, `0.3.0`.
+The facts serve-net keeps about one request, passed to every hook and service call. `connection` plus `seq` identify a request within the process. `user_word` lets a wrapper link its own per-request record (for example the index of a slot taken in `Admit`) without serve-net knowing its type. `gate_tag` carries the tag the gate returned in `Gate::admit`, so a gate integration (bouncer-io) finds its own record for the connection without a map from connection id to tag. `Send + Sync`, 128 bytes on 64-bit targets (the gate tag is 8 of them), stored in the connection record: no allocation. P0, Tier 2, `0.3.0`.
 
 ```rust
 use serve_net::{Envelope, HeadAction, HttpHead, HttpReply, HttpRequest, HttpService, Lane, Outcome};

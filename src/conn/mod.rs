@@ -360,6 +360,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             seq: RequestSeq(0),
             profile: profile_id,
             tag,
+            gate: crate::net::GateTag(0),
             lane,
             lane_open: false,
             lane_late: false,
@@ -418,6 +419,10 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     }
 
     /// The facts net-io read from the connection's PROXY header.
+    pub(crate) fn set_gate_tag(&mut self, tag: crate::net::GateTag) {
+        self.env.gate = tag;
+    }
+
     pub(crate) fn set_proxy_facts(&mut self, facts: Option<Arc<net_io::ProxyFacts>>) {
         self.proxy_facts = facts;
     }

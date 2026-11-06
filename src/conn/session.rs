@@ -415,6 +415,7 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> Factory<F, S, H> {
             info.accepted_at,
             info.worker,
         );
+        conn.set_gate_tag(info.gate);
         if proxy_protocol.is_some() {
             conn.set_proxy_facts(info.proxy.clone());
         }

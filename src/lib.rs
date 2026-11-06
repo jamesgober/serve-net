@@ -85,8 +85,8 @@ pub use http::{
 pub use http_net::{Method, Version};
 pub use net::{
     AddrError, AllowAll, Cidr, CloseReason, ConnectionId, ControlLine, ControlState, DriverKind,
-    EventSink, Gate, Lane, NoControl, NoopSink, ProxyVersions, SimpleControl, TrustedProxies,
-    WorkerId,
+    EventSink, Gate, GateTag, Lane, NoControl, NoopSink, ProxyVersions, SimpleControl,
+    TrustedProxies, WorkerId,
 };
 pub use notify::{NoNotify, Notify, SystemdNotify, WatchdogPinger};
 pub use reload::{ReloadSummary, ServerConfig};

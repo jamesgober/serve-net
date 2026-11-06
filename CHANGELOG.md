@@ -36,6 +36,10 @@ an adversarial review with every finding fixed.
   it closes with 1008.
 - `RuleId::AnyLocalPeerForwarded`, a build warning for forwarded headers on a
   Unix socket open to any local peer.
+- `Envelope::gate_tag`: the `GateTag` the gate returned in `Gate::admit`, so a
+  gate integration needs no map from connection id to tag. 8 bytes per
+  connection (the envelope grows from 120 to 128 bytes on 64-bit targets).
+  `GateTag` is re-exported.
 
 ### Fixed
 

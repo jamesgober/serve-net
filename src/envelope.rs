@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::client::ClientInfo;
 use crate::config::ProfileId;
-use crate::net::{ConnectionId, Lane, WorkerId};
+use crate::net::{ConnectionId, GateTag, Lane, WorkerId};
 
 /// A request's number on its connection: 1 for the first, then counting up.
 /// With the connection id it identifies a request within the process. Not a
@@ -28,6 +28,7 @@ pub struct Envelope {
     pub(crate) seq: RequestSeq,
     pub(crate) profile: ProfileId,
     pub(crate) tag: u8,
+    pub(crate) gate: GateTag,
     pub(crate) lane: Lane,
     pub(crate) lane_open: bool,
     pub(crate) lane_late: bool,
@@ -61,6 +62,14 @@ impl Envelope {
     #[must_use]
     pub fn tag(&self) -> u8 {
         self.tag
+    }
+
+    /// The tag the gate gave the connection in `Gate::admit`: a gate's
+    /// own key for the connection, carried so an integration needs no map
+    /// from connection id to tag. `GateTag(0)` with no gate.
+    #[must_use]
+    pub fn gate_tag(&self) -> GateTag {
+        self.gate
     }
 
     /// The request's lane.
@@ -126,6 +135,7 @@ pub(crate) mod tests {
             seq: RequestSeq(1),
             profile: ProfileId(0),
             tag: 0,
+            gate: GateTag(0),
             lane: Lane(4),
             lane_open: true,
             lane_late: false,

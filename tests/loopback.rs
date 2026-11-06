@@ -368,6 +368,74 @@ fn test_loopback_gate_denial_writes_refusal_on_second_reply() {
     let _ = server.drain(Duration::from_secs(2));
 }
 
+/// Tags each connection with its accept count, plus a marker.
+struct Tagger(std::sync::atomic::AtomicU64);
+
+impl serve_net::Gate for Tagger {
+    type Ticket = ();
+    fn admit(
+        &self,
+        _info: &serve_net::net_io::ConnectionInfo,
+        _stage: serve_net::net_io::AdmitStage,
+    ) -> Result<serve_net::net_io::Admitted<()>, serve_net::net_io::Refusal> {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(serve_net::net_io::Admitted {
+            lane: serve_net::Lane(0),
+            ticket: (),
+            tag: serve_net::GateTag(0xA000 + n),
+        })
+    }
+    fn readmit(
+        &self,
+        _ticket: &mut (),
+        _info: &serve_net::net_io::ConnectionInfo,
+    ) -> Result<(), serve_net::net_io::Refusal> {
+        Ok(())
+    }
+    fn check(
+        &self,
+        _ticket: &mut (),
+        _write: &serve_net::net_io::WriteCheck,
+    ) -> Result<(), serve_net::net_io::Denial> {
+        Ok(())
+    }
+}
+
+struct EchoTag;
+
+impl serve_net::HttpService for EchoTag {
+    fn call(
+        &self,
+        _req: &serve_net::HttpRequest<'_>,
+        env: &serve_net::Envelope,
+        reply: &mut serve_net::HttpReply,
+    ) -> serve_net::Outcome {
+        reply.text(200, &format!("{:x}", env.gate_tag().0));
+        serve_net::Outcome::Done
+    }
+}
+
+#[test]
+fn test_loopback_gate_tag_reaches_the_envelope() {
+    use serve_net::{ListenerSpec, Server};
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .gate(Tagger(std::sync::atomic::AtomicU64::new(0)))
+        .serve(EchoTag)
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    // Each connection carries its own tag, on every request it makes.
+    let mut first = connect(addr);
+    let a = exchange(&mut first, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(a.ends_with("\r\n\r\na000"), "{a}");
+    let mut second = connect(addr);
+    let b = exchange(&mut second, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(b.ends_with("\r\n\r\na001"), "{b}");
+    let c = exchange(&mut first, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(c.ends_with("\r\n\r\na000"), "{c}");
+    let _ = server.drain(Duration::from_secs(2));
+}
+
 #[derive(Default)]
 struct Seen {
     accepted: std::sync::atomic::AtomicU32,
