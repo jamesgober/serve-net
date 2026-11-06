@@ -63,6 +63,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         Step::Close
     }
     pub(super) fn upgraded_closed(&mut self) {}
+    pub(super) fn upgraded_wake<I: Io>(&mut self, _io: &mut I, _token: u32) -> Step {
+        Step::Close
+    }
 }
 
 #[cfg(feature = "ws")]
@@ -117,7 +120,12 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         }
         // The engine switched; what followed the request is the new protocol's.
         let _ = self.engine.poll();
-        let mut link = WsLink::new(ws, max_pending, now);
+        let outbox = Arc::new(crate::ws::Outbox::new(
+            io.waker(),
+            self.connection,
+            max_pending,
+        ));
+        let mut link = WsLink::new(ws, max_pending, now, outbox);
         link.backlog
             .extend_from_slice(self.engine.remaining_input());
         self.ws = Some(Box::new(link));
@@ -208,6 +216,8 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let Some(mut link) = self.ws.take() else {
             return;
         };
+        self.shared.control.unregister_upgraded(self.connection);
+        link.outbox.close(self.wipe);
         if link.opened {
             link.service.closed(&self.env, link.code);
         }
@@ -237,6 +247,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             self.finish_request(RequestEnd::Upgraded);
             self.ws_open(io, link);
         }
+        Self::ws_take_outbox(link);
         if !self.ws_push(io, link) {
             return (0, Step::Write);
         }
@@ -259,6 +270,51 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         (consumed, Step::Read)
     }
 
+    /// Moves what `WsSender`s queued into ws-net, in order, while the output
+    /// budget has room; the rest waits for the next drive (a write finished).
+    fn ws_take_outbox(link: &mut WsLink) {
+        if link.conn.state() != ws_net::State::Open {
+            return;
+        }
+        let mut state = link.outbox.lock();
+        while let Some(next) = state.items.front() {
+            if link.conn.output().len().saturating_add(next.len()) > link.max_pending {
+                break;
+            }
+            let Some(item) = state.items.pop_front() else {
+                break;
+            };
+            state.bytes = state.bytes.saturating_sub(item.len());
+            let _ = match &item {
+                crate::ws::Queued::Text(t) => link.conn.send_text(t),
+                crate::ws::Queued::Binary(b) => link.conn.send_binary(b),
+            };
+        }
+    }
+
+    /// A wake for the upgraded connection: queued sends, or a drain began.
+    pub(super) fn upgraded_wake<I: Io>(&mut self, io: &mut I, token: u32) -> Step {
+        if token == crate::reply::WAKE_DRAIN {
+            if let Some(mut link) = self.ws.take() {
+                if link.conn.state() == ws_net::State::Open {
+                    self.ws_close(
+                        &mut link,
+                        ws_net::CloseCode::GOING_AWAY,
+                        "server shutting down",
+                    );
+                    self.end.get_or_insert(EndReason::Drained);
+                    link.finish = true;
+                    link.timer = io.now() + CLOSE_WAIT;
+                }
+                self.ws = Some(link);
+            }
+            let step = self.upgraded_data(io, &[]).1;
+            self.shared.control.said_goodbye(self.connection);
+            return step;
+        }
+        self.upgraded_data(io, &[]).1
+    }
+
     /// Waits for input in the idle phase (a drain or the idle timeout closes
     /// the connection there), with the link's deadline.
     fn ws_idle<I: Io>(io: &mut I, link: &WsLink) {
@@ -270,6 +326,10 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     /// timers, and `opened`.
     fn ws_open<I: Io>(&mut self, io: &mut I, link: &mut WsLink) {
         link.opened = true;
+        // A drain tells this connection, so it can send its 1001 (D-092).
+        self.shared
+            .control
+            .register_upgraded(self.connection, io.waker());
         let shared = Arc::clone(&self.shared);
         let conn = UpgradedConn {
             env: self.env.clone(),
@@ -291,6 +351,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let mut wc = WebSocketConn {
             conn: &mut link.conn,
             max_pending: link.max_pending,
+            outbox: &link.outbox,
         };
         let service = &*link.service;
         let panicked = if catch {
@@ -441,6 +502,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 scratch,
                 text: text_buf,
                 max_pending,
+                outbox,
                 ..
             } = &mut *link;
             let message = if text {
@@ -451,6 +513,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             let mut wc = WebSocketConn {
                 conn,
                 max_pending: *max_pending,
+                outbox,
             };
             let service = &**service;
             let env = &self.env;

@@ -99,7 +99,7 @@ pub use service::{
 pub use snapshot::{Snapshot, SnapshotReader};
 pub use stats::Stats;
 #[cfg(feature = "ws")]
-pub use ws::{WebSocketConn, WebSocketService, WebSocketTarget, WsMessage, WsSendError};
+pub use ws::{WebSocketConn, WebSocketService, WebSocketTarget, WsMessage, WsSendError, WsSender};
 
 /// http-net, for its engine limits and types.
 #[cfg(feature = "http1")]

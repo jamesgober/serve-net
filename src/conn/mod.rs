@@ -589,6 +589,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
 
     /// A completion for this connection arrived.
     pub(crate) fn on_wake<I: Io>(&mut self, io: &mut I, token: u32, value: u64) -> Step {
+        if self.state == State::Upgraded {
+            return self.upgraded_wake(io, token);
+        }
         let State::Parked { generation, until } = self.state else {
             return self.current_step();
         };

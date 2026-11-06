@@ -87,9 +87,164 @@ impl std::error::Error for WsSendError {}
 pub struct WebSocketConn<'a> {
     pub(crate) conn: &'a mut ws_net::Connection,
     pub(crate) max_pending: usize,
+    pub(crate) outbox: &'a Arc<Outbox>,
+}
+
+/// Sends on an open WebSocket from any thread: a handle from
+/// [`WebSocketConn::sender`].
+///
+/// Messages wait in a queue bounded by the connection's output budget
+/// (`max_pending_output`) and are written by the connection's worker, in
+/// order, after anything the service sent from its own calls. A full queue
+/// refuses with [`WsSendError::Full`]; a connection that closed refuses with
+/// [`WsSendError::Closed`]. Each message is copied once into the queue.
+#[derive(Clone)]
+pub struct WsSender {
+    outbox: Arc<Outbox>,
+}
+
+impl WsSender {
+    /// Queues a text message.
+    ///
+    /// # Errors
+    ///
+    /// [`WsSendError::Full`] when the queue holds the budget already,
+    /// [`WsSendError::Closed`] once the connection closed.
+    pub fn send_text(&self, text: &str) -> Result<(), WsSendError> {
+        self.outbox.push(Queued::Text(text.to_owned()))
+    }
+
+    /// Queues a binary message.
+    ///
+    /// # Errors
+    ///
+    /// As [`send_text`](Self::send_text).
+    pub fn send_binary(&self, bytes: &[u8]) -> Result<(), WsSendError> {
+        self.outbox.push(Queued::Binary(bytes.to_vec()))
+    }
+
+    /// Whether the connection closed: every send is refused from then on.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.outbox.lock().closed
+    }
+}
+
+impl fmt::Debug for WsSender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.outbox.lock();
+        f.debug_struct("WsSender")
+            .field("queued", &state.items.len())
+            .field("closed", &state.closed)
+            .finish()
+    }
+}
+
+/// A message waiting in an outbox.
+pub(crate) enum Queued {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+impl Queued {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Queued::Text(t) => t.len(),
+            Queued::Binary(b) => b.len(),
+        }
+    }
+}
+
+pub(crate) struct OutboxState {
+    pub(crate) items: std::collections::VecDeque<Queued>,
+    pub(crate) bytes: usize,
+    pub(crate) closed: bool,
+}
+
+/// The queue between `WsSender`s and the connection's worker.
+pub(crate) struct Outbox {
+    state: std::sync::Mutex<OutboxState>,
+    waker: Arc<dyn crate::reply::Waker>,
+    connection: crate::net::ConnectionId,
+    max_bytes: usize,
+}
+
+impl Outbox {
+    pub(crate) fn new(
+        waker: Arc<dyn crate::reply::Waker>,
+        connection: crate::net::ConnectionId,
+        max_bytes: usize,
+    ) -> Self {
+        Outbox {
+            state: std::sync::Mutex::new(OutboxState {
+                items: std::collections::VecDeque::new(),
+                bytes: 0,
+                closed: false,
+            }),
+            waker,
+            connection,
+            max_bytes,
+        }
+    }
+
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, OutboxState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn push(&self, message: Queued) -> Result<(), WsSendError> {
+        let len = message.len();
+        let mut state = self.lock();
+        if state.closed {
+            return Err(WsSendError::Closed);
+        }
+        if state.bytes.saturating_add(len) > self.max_bytes {
+            return Err(WsSendError::Full);
+        }
+        let first = state.items.is_empty();
+        state.items.push_back(message);
+        state.bytes += len;
+        drop(state);
+        // One wake per batch: the worker takes everything queued when it runs.
+        if first {
+            let _ = self.waker.post(self.connection, crate::reply::WAKE_PUSH, 0);
+        }
+        Ok(())
+    }
+
+    /// The connection closed: refuse from now on and drop what waits,
+    /// zeroed first under a wiping profile.
+    pub(crate) fn close(&self, wipe: bool) {
+        let mut state = self.lock();
+        state.closed = true;
+        if wipe {
+            for item in &mut state.items {
+                match item {
+                    Queued::Text(t) => {
+                        // A string's bytes, zeroed through its own buffer.
+                        let mut bytes = core::mem::take(t).into_bytes();
+                        crate::engine::wipe_bytes(&mut bytes);
+                    }
+                    Queued::Binary(b) => crate::engine::wipe_bytes(b),
+                }
+            }
+        }
+        state.items.clear();
+        state.bytes = 0;
+    }
 }
 
 impl WebSocketConn<'_> {
+    /// A handle that sends on this connection from any thread, for as long
+    /// as it stays open.
+    #[must_use]
+    pub fn sender(&self) -> WsSender {
+        WsSender {
+            outbox: Arc::clone(self.outbox),
+        }
+    }
+
     fn check(&mut self, len: usize) -> Result<(), WsSendError> {
         if self.conn.state() != ws_net::State::Open {
             return Err(WsSendError::Closed);
@@ -271,6 +426,8 @@ pub(crate) struct WsLink {
     pub(crate) timer: Instant,
     /// A ping went out at this time and no byte came back since.
     pub(crate) ping_at: Option<Instant>,
+    /// What `WsSender`s queued for this connection.
+    pub(crate) outbox: Arc<Outbox>,
     /// A message (or frame) is part-way in since this time.
     pub(crate) partial_since: Option<Instant>,
     pub(crate) message_timeout: Duration,
@@ -283,7 +440,12 @@ pub(crate) struct WsLink {
 }
 
 impl WsLink {
-    pub(crate) fn new(target: &WebSocketTarget, max_pending: usize, now: Instant) -> WsLink {
+    pub(crate) fn new(
+        target: &WebSocketTarget,
+        max_pending: usize,
+        now: Instant,
+        outbox: Arc<Outbox>,
+    ) -> WsLink {
         WsLink {
             conn: ws_net::Connection::server().with_limits(target.limits),
             service: Arc::clone(&target.service),
@@ -296,6 +458,7 @@ impl WsLink {
             last_input: now,
             timer: now + target.ping_interval,
             ping_at: None,
+            outbox,
             partial_since: None,
             message_timeout: target.message_timeout,
             code: None,

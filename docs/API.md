@@ -1685,12 +1685,23 @@ impl WebSocketConn<'_> {
     pub fn send_binary(&mut self, data: &[u8]) -> Result<(), WsSendError>;
     pub fn close(&mut self, code: u16, reason: &str) -> Result<(), WsSendError>;
     pub fn pending_output(&mut self) -> usize;
+    pub fn sender(&self) -> WsSender;                                // 0.7.0
+}
+
+#[derive(Clone)]
+pub struct WsSender { /* sends on the connection from any thread */ }  // 0.7.0
+impl WsSender {
+    pub fn send_text(&self, text: &str) -> Result<(), WsSendError>;
+    pub fn send_binary(&self, data: &[u8]) -> Result<(), WsSendError>;
+    pub fn is_closed(&self) -> bool;
 }
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WsSendError { Full, Closed, Invalid }
 ```
+
+`WsSender` (0.7.0) sends from any thread: messages wait in a queue bounded by the connection's output budget and are written by the connection's worker, in order, after what the service sent from its own calls. A full queue refuses with `Full`, a closed connection with `Closed`. Each message is copied once into the queue. A drain through `Running::drain` or `DrainHandle` wakes every open WebSocket, which closes with 1001 before net-io closes idle connections (the drain waits at most 250 ms for those goodbyes); a drain started only on the owner's own control line closes a quiet socket without one.
 
 `head` returns `HeadAction::Upgrade(target)`. The upgrade request then goes through admission and the checkpoints like any request (a declared body is refused with 413). serve-net checks the handshake through ws-net (`ServerHandshake::from_request`: method, version 13, the key, `Host`, `Origin`, the offered subprotocols) and answers an invalid one with 400 before anything else is written. An upgrade the client never offered, or a subprotocol it did not offer, is a service bug: 500, reported through `Observer::service_error`. Otherwise http-net writes the 101 with `sec-websocket-accept`, the upgrade request ends (`done` with `RequestEnd::Upgraded`, its admission released), `HttpService::upgraded` runs, the HTTP engine's buffers are released, and the bytes that arrived after the request go to ws-net, never to the HTTP parser (T-21). `Upgrade: h2c` never reaches this path: it is not an upgrade offer, and the request is served as HTTP/1.1. A 2xx to `CONNECT` is refused unless a profile allows tunnels (after `1.0.0`).
 

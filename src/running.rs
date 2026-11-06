@@ -10,9 +10,11 @@ use crate::client::IngressKind;
 use crate::config::{ListenerSource, ProfileId};
 use crate::error::ServeError;
 use crate::health::{Health, HealthState, ListenerInfo, ListenerState};
+use crate::net::ConnectionId;
 use crate::net::{ControlLine, ControlState};
 use crate::notify::Notifier;
 use crate::reload::{ReloadSummary, Reloader, ServerConfig};
+use crate::reply::Waker;
 use crate::stats::{Counters, Stats};
 
 /// The control line net-io reads: the owner's line merged with serve-net's
@@ -22,6 +24,11 @@ pub(crate) struct Merged<C: ControlLine> {
     owner: Arc<C>,
     epoch: AtomicU64,
     drain: Mutex<Option<Instant>>,
+    /// Upgraded connections, told when a drain begins: they wait in the idle
+    /// phase, where net-io's drain would close them without a goodbye.
+    upgraded: Mutex<std::collections::HashMap<ConnectionId, Arc<dyn Waker>>>,
+    /// Upgraded connections told of the drain that have not said goodbye yet.
+    goodbyes: Mutex<std::collections::HashSet<ConnectionId>>,
 }
 
 impl<C: ControlLine> Merged<C> {
@@ -30,7 +37,33 @@ impl<C: ControlLine> Merged<C> {
             owner,
             epoch: AtomicU64::new(0),
             drain: Mutex::new(None),
+            upgraded: Mutex::new(std::collections::HashMap::new()),
+            goodbyes: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// An upgraded connection sent its goodbye (or closed) after a drain wake.
+    pub(crate) fn said_goodbye(&self, connection: ConnectionId) {
+        self.goodbyes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&connection);
+    }
+
+    /// An upgraded connection hears about a drain through `waker`.
+    pub(crate) fn register_upgraded(&self, connection: ConnectionId, waker: Arc<dyn Waker>) {
+        self.upgraded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(connection, waker);
+    }
+
+    pub(crate) fn unregister_upgraded(&self, connection: ConnectionId) {
+        self.upgraded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&connection);
+        self.said_goodbye(connection);
     }
 
     fn own(&self) -> Option<Instant> {
@@ -72,6 +105,9 @@ pub(crate) trait DrainSwitch: Send + Sync + 'static {
     fn request(&self, deadline: Instant);
     /// Whether a drain was asked for, here or on the owner's line.
     fn is_draining(&self) -> bool;
+    /// Waits until every upgraded connection told of the drain has said
+    /// goodbye, or `until`: net-io's drain closes idle connections at once.
+    fn await_goodbyes(&self, until: Instant);
 }
 
 impl<C: ControlLine> DrainSwitch for Merged<C> {
@@ -84,6 +120,36 @@ impl<C: ControlLine> DrainSwitch for Merged<C> {
         *own = Some(next);
         drop(own);
         self.epoch.fetch_add(1, Ordering::AcqRel);
+        // Upgraded connections wait for input; wake each so it says goodbye
+        // (a WebSocket's 1001) before net-io's drain closes idle connections.
+        let upgraded: Vec<(ConnectionId, Arc<dyn Waker>)> = self
+            .upgraded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(id, w)| (*id, Arc::clone(w)))
+            .collect();
+        self.goodbyes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(upgraded.iter().map(|(id, _)| *id));
+        for (id, waker) in upgraded {
+            if waker.post(id, crate::reply::WAKE_DRAIN, 0).is_err() {
+                self.said_goodbye(id);
+            }
+        }
+    }
+
+    fn await_goodbyes(&self, until: Instant) {
+        while Instant::now() < until
+            && !self
+                .goodbyes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn is_draining(&self) -> bool {
@@ -199,6 +265,8 @@ const ACCEPT_SETTLE_TICK: Duration = Duration::from_millis(1);
 const ACCEPT_SETTLE_QUIET: u32 = 3;
 const ACCEPT_SETTLE_MAX: Duration = Duration::from_millis(50);
 /// The longest a drain waits for an accept thread to start it.
+/// The longest a drain waits for upgraded connections' goodbyes.
+const GOODBYE_MAX: Duration = Duration::from_millis(250);
 const DRAIN_START_MAX: Duration = Duration::from_millis(100);
 
 /// What a bound and a running server hold.
@@ -436,6 +504,11 @@ impl Running {
         inner.settle_accepts();
         // Replies in flight read the line live and carry the close signal.
         inner.switch.request(deadline);
+        // Upgraded connections say goodbye first (a WebSocket's 1001): at most
+        // 250 ms, never past the deadline (D-092).
+        inner
+            .switch
+            .await_goodbyes(deadline.min(Instant::now() + GOODBYE_MAX));
         inner.await_drain_start();
         let (counters, notifier) = (Arc::clone(&inner.counters), Arc::clone(&inner.notifier));
         let report = DrainReport::from_net(inner.into_server().shutdown(deadline), &counters);

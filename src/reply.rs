@@ -16,6 +16,10 @@ use crate::net::ConnectionId;
 
 /// The wake token serve-net uses for deferred replies.
 pub(crate) const WAKE_REPLY: u32 = 1;
+/// An upgraded connection's outbox has messages (`WsSender`).
+pub(crate) const WAKE_PUSH: u32 = 2;
+/// A drain began: an upgraded connection closes with its protocol's goodbye.
+pub(crate) const WAKE_DRAIN: u32 = 3;
 
 /// Why a wake could not be posted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

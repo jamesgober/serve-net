@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use serve_net::{
     Checkpoint, CheckpointAt, Envelope, Finished, HeadAction, HttpHead, HttpReply, HttpRequest,
     HttpService, ListenerSpec, Outcome, RequestEnd, Server, UpgradedConn, Verdict, WebSocketConn,
-    WebSocketService, WebSocketTarget, WsMessage, WsSendError,
+    WebSocketService, WebSocketTarget, WsMessage, WsSendError, WsSender,
 };
 use ws_net::{ClientHandshake, CloseCode, Connection, Event};
 
@@ -24,6 +24,8 @@ struct Seen {
     closed: Mutex<Vec<Option<u16>>>,
     ends: Mutex<Vec<RequestEnd>>,
     refused_full: AtomicU32,
+    /// The last opened connection's sender.
+    sender: Mutex<Option<WsSender>>,
 }
 
 /// Echoes every message; a few texts do something else.
@@ -32,6 +34,7 @@ struct Echo(Arc<Seen>);
 impl WebSocketService for Echo {
     fn opened(&self, _env: &Envelope, conn: &mut WebSocketConn<'_>) {
         self.0.opened.fetch_add(1, Ordering::SeqCst);
+        *self.0.sender.lock().unwrap() = Some(conn.sender());
         conn.send_text("hello").unwrap();
     }
 
@@ -138,7 +141,9 @@ impl Client {
         extra: &[u8],
     ) -> Result<(String, Client), String> {
         let mut s = TcpStream::connect(addr).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // Generous: a loaded machine is slow, and a test only waits this long
+        // when something is wrong.
+        s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
         let hs = ClientHandshake::with_nonce(*b"serve-net-nonce!").with_protocols(protocols);
         let mut req = Vec::new();
         hs.write_request("127.0.0.1", path, &mut req).unwrap();
@@ -413,9 +418,11 @@ fn test_ws_panic_closes_1011_and_the_server_lives() {
 #[test]
 fn test_ws_quiet_connection_is_pinged_then_closed() {
     let (seen, _server, addr) = start();
+    // The server's interval starts when the socket opens, so measure from
+    // before the open: `hello` may reach a loaded client late.
+    let started = Instant::now();
     let (_, mut c) = Client::open(addr, "/ws-quiet", &[], b"").unwrap();
     assert_eq!(c.next(), Some(Got::Text("hello".into())));
-    let started = Instant::now();
     // Our client does not answer pings on its own (it only queues the Pong).
     assert_eq!(c.next(), Some(Got::Ping));
     assert!(started.elapsed() >= Duration::from_millis(800));
@@ -455,10 +462,15 @@ fn test_ws_drain_closes_the_connection() {
     let (seen, server, addr) = start();
     let (_, mut c) = Client::open(addr, "/ws", &[], b"").unwrap();
     assert_eq!(c.next(), Some(Got::Text("hello".into())));
-    let report = server.drain(Duration::from_secs(5));
+    // A drain tells the socket first: 1001, then the close (D-092).
+    let drain = std::thread::spawn(move || server.drain(Duration::from_secs(5)));
+    assert_eq!(c.next(), Some(Got::Close(Some(1001))));
+    c.flush();
     assert_eq!(c.next(), None);
+    let report = drain.join().unwrap();
     assert_eq!(report.killed, 0, "{report:?}");
-    assert_eq!(*seen.closed.lock().unwrap(), vec![None]);
+    wait_for("closed", || !seen.closed.lock().unwrap().is_empty());
+    assert_eq!(*seen.closed.lock().unwrap(), vec![Some(1001)]);
 }
 
 #[test]
@@ -622,4 +634,60 @@ fn test_ws_message_trickled_past_its_time_closes_1008() {
     assert_eq!(got, Some(Got::Close(Some(1008))));
     assert!(took < Duration::from_secs(5), "closed after {took:?}");
     let _ = trickle.join();
+}
+
+/// D-079, D-092: a service sends on an open socket from another thread
+/// through `WsSender`, with no message from the client to answer.
+#[test]
+fn test_ws_sender_pushes_from_another_thread() {
+    let (seen, _server, addr) = start();
+    let (_, mut c) = Client::open(addr, "/ws", &[], b"").unwrap();
+    assert_eq!(c.next(), Some(Got::Text("hello".into())));
+    let sender = seen
+        .sender
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("opened kept a sender");
+    let pusher = std::thread::spawn(move || {
+        for i in 0..3 {
+            sender.send_text(&format!("push {i}")).unwrap();
+        }
+        sender
+    });
+    let sender = pusher.join().unwrap();
+    for i in 0..3 {
+        assert_eq!(c.next(), Some(Got::Text(format!("push {i}"))));
+    }
+    // The client closes: the sender refuses from then on.
+    c.conn.close(CloseCode::NORMAL, "done").unwrap();
+    c.flush();
+    let _ = c.next();
+    wait_for("the sender sees the close", || sender.is_closed());
+    assert_eq!(sender.send_text("late"), Err(WsSendError::Closed));
+}
+
+/// The sender's queue is bounded by the connection's output budget: a client
+/// that does not read fills it, and sends are refused, not buffered without
+/// end.
+#[test]
+fn test_ws_sender_queue_is_bounded() {
+    let (seen, _server, addr) = start();
+    let (_, mut c) = Client::open(addr, "/ws-tight", &[], b"").unwrap();
+    assert_eq!(c.next(), Some(Got::Text("hello".into())));
+    let sender = seen.sender.lock().unwrap().clone().unwrap();
+    let big = vec![b'x'; 16 * 1024];
+    let mut full = false;
+    // Far more than socket buffers, ws-net's output, and the queue can hold.
+    for _ in 0..10_000 {
+        match sender.send_binary(&big) {
+            Ok(()) => {}
+            Err(WsSendError::Full) => {
+                full = true;
+                break;
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    assert!(full, "the queue never filled");
 }
