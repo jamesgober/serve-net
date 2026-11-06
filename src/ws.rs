@@ -22,6 +22,8 @@ pub const DEFAULT_MAX_FRAME: u64 = 64 * 1024;
 pub const DEFAULT_MAX_MESSAGE: u64 = 1024 * 1024;
 /// How long a quiet connection waits before serve-net pings it, by default.
 pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
+/// How long one message may take, first byte to last (`WebSocketTarget::message_timeout`).
+pub const DEFAULT_MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The conversation after a WebSocket upgrade, called on the worker.
 ///
@@ -164,6 +166,7 @@ pub struct WebSocketTarget {
     pub(crate) profile: Option<ProfileId>,
     pub(crate) max_pending: Option<usize>,
     pub(crate) ping_interval: Duration,
+    pub(crate) message_timeout: Duration,
 }
 
 impl WebSocketTarget {
@@ -185,6 +188,7 @@ impl WebSocketTarget {
             profile: None,
             max_pending: None,
             ping_interval: DEFAULT_PING_INTERVAL,
+            message_timeout: DEFAULT_MESSAGE_TIMEOUT,
         }
     }
 
@@ -224,6 +228,15 @@ impl WebSocketTarget {
         self.ping_interval = interval.max(Duration::from_secs(1));
         self
     }
+
+    /// How long one message may take from its first byte to its last; past
+    /// it the connection closes with 1008. A client that trickles a message
+    /// would otherwise hold up to `max_message` of buffer for as long as it
+    /// likes. At least 1 s; 30 s by default.
+    pub fn message_timeout(mut self, timeout: Duration) -> Self {
+        self.message_timeout = timeout.max(Duration::from_secs(1));
+        self
+    }
 }
 
 impl fmt::Debug for WebSocketTarget {
@@ -258,6 +271,9 @@ pub(crate) struct WsLink {
     pub(crate) timer: Instant,
     /// A ping went out at this time and no byte came back since.
     pub(crate) ping_at: Option<Instant>,
+    /// A message (or frame) is part-way in since this time.
+    pub(crate) partial_since: Option<Instant>,
+    pub(crate) message_timeout: Duration,
     /// The close code of the handshake, for `closed`.
     pub(crate) code: Option<u16>,
     /// `opened` ran, so `closed` is owed.
@@ -280,6 +296,8 @@ impl WsLink {
             last_input: now,
             timer: now + target.ping_interval,
             ping_at: None,
+            partial_since: None,
+            message_timeout: target.message_timeout,
             code: None,
             opened: false,
             finish: false,
@@ -288,6 +306,13 @@ impl WsLink {
 }
 
 impl WsLink {
+    /// The next deadline: `base`, or the end of the current message's time
+    /// if that comes first.
+    pub(crate) fn deadline(&self, base: Instant) -> Instant {
+        self.partial_since
+            .map_or(base, |since| base.min(since + self.message_timeout))
+    }
+
     /// Empties the message copies, zeroing them first under a wiping
     /// profile, and keeps at most `retain` bytes of each.
     pub(crate) fn clear_message(&mut self, wipe: bool, retain: usize) {

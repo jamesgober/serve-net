@@ -1666,6 +1666,7 @@ impl WebSocketTarget {
     pub fn profile(self, id: ProfileId) -> Self;                  // whose max_pending_output applies after the switch
     pub fn max_pending_output(self, bytes: usize) -> Self;
     pub fn ping_interval(self, interval: Duration) -> Self;       // at least 1 s
+    pub fn message_timeout(self, timeout: Duration) -> Self;      // 0.7.0: first byte to last, at least 1 s, 30 s by default; past it 1008
 }
 
 pub trait WebSocketService: Send + Sync + 'static {

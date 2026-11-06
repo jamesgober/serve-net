@@ -20,6 +20,8 @@
 - An end-to-end TLS test with a real engine (tls-net 0.5 on ring, a
   dev-dependency only) and the ALPN cases.
 - `docs/SECURITY.md` and a root `SECURITY.md`; attack tests for T-15 and T-18.
+- `WebSocketTarget::message_timeout` (30 s by default): a message trickled past
+  it closes with 1008.
 - `RuleId::AnyLocalPeerForwarded`, a build warning for forwarded headers on a
   Unix socket open to any local peer.
 

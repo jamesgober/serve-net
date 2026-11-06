@@ -82,6 +82,9 @@ impl HttpService for App {
                     .into(),
             ),
             "/ws-tight" => HeadAction::Upgrade(target.max_pending_output(64 * 1024).into()),
+            "/ws-slowmsg" => {
+                HeadAction::Upgrade(target.message_timeout(Duration::from_secs(1)).into())
+            }
             // A service bug: an upgrade the request never offered.
             "/bug" => HeadAction::Upgrade(target.into()),
             _ => HeadAction::Proceed,
@@ -582,4 +585,41 @@ fn test_ws_input_past_the_engine_buffer_is_never_parsed_as_http() {
         );
         assert!(!text.contains("served"), "behind={behind}: {text}");
     }
+}
+
+/// Found in the 0.7 review: any byte refreshed the quiet timer, so a client
+/// could keep one message part-way for ever, holding up to the message limit
+/// of buffer. A message now has `message_timeout` from its first byte to its
+/// last; past it the connection closes with 1008.
+#[test]
+fn test_ws_message_trickled_past_its_time_closes_1008() {
+    let (_seen, _server, addr) = start();
+    let (_, mut c) = Client::open(addr, "/ws-slowmsg", &[], b"").unwrap();
+    assert_eq!(c.next(), Some(Got::Text("hello".into())));
+    // A text frame without FIN, then one byte of continuation every 300 ms:
+    // the connection is never quiet, the message never ends.
+    let mut w = c.s.try_clone().unwrap();
+    let started = Instant::now();
+    let trickle = std::thread::spawn(move || {
+        if w.write_all(&[0x01, 0x81, 0, 0, 0, 0, b'a']).is_err() {
+            return;
+        }
+        for _ in 0..30 {
+            std::thread::sleep(Duration::from_millis(300));
+            if w.write_all(&[0x00, 0x81, 0, 0, 0, 0, b'b']).is_err() {
+                return;
+            }
+        }
+    });
+    let mut got = None;
+    while let Some(g) = c.next() {
+        if matches!(g, Got::Close(_)) {
+            got = Some(g);
+            break;
+        }
+    }
+    let took = started.elapsed();
+    assert_eq!(got, Some(Got::Close(Some(1008))));
+    assert!(took < Duration::from_secs(5), "closed after {took:?}");
+    let _ = trickle.join();
 }

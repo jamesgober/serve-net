@@ -157,11 +157,31 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         };
         let now = io.now();
         let due = link.last_input + link.interval;
+        let slow = link
+            .partial_since
+            .is_some_and(|since| now >= since + link.message_timeout);
         let step = if link.finish || link.conn.state() != ws_net::State::Open {
             self.end.get_or_insert(EndReason::ClientClose);
             Step::Close
+        } else if slow {
+            // A message trickled past its time: 1008, then the close wait.
+            self.ws_close(
+                &mut link,
+                ws_net::CloseCode::POLICY_VIOLATION,
+                "message too slow",
+            );
+            self.end = Some(EndReason::RequestTimeout);
+            link.finish = true;
+            link.partial_since = None;
+            link.timer = now + CLOSE_WAIT;
+            if self.ws_push(io, &mut link) {
+                Self::ws_idle(io, &link);
+                Step::Read
+            } else {
+                Step::Write
+            }
         } else if now < due {
-            link.timer = due;
+            link.timer = link.deadline(due);
             Self::ws_idle(io, &link);
             Step::Read
         } else if link.ping_at.is_some() {
@@ -310,11 +330,13 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             }
             let text = match link.conn.poll() {
                 Ok(ws_net::Event::Text(t)) => {
+                    link.partial_since = None;
                     link.text.clear();
                     link.text.push_str(t);
                     true
                 }
                 Ok(ws_net::Event::Binary(b)) => {
+                    link.partial_since = None;
                     link.scratch.clear();
                     link.scratch.extend_from_slice(b);
                     false
@@ -330,6 +352,12 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                     break;
                 }
                 Ok(ws_net::Event::NeedInput) => {
+                    if fed > 0 && link.partial_since.is_none() {
+                        // Bytes in and no message out: one is part-way.
+                        let now = io.now();
+                        link.partial_since = Some(now);
+                        link.timer = link.deadline(link.timer);
+                    }
                     if fed == 0 {
                         break;
                     }
