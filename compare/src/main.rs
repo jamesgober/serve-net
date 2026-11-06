@@ -376,10 +376,12 @@ fn serve_net_server(addr: SocketAddr, workers: u16) {
         .keep_alive(KeepAlive::new().max_requests(u32::MAX))
         // Every benchmark connection comes from 127.0.0.1, and net-io caps a
         // source at 256 connections by default, a defence hyper does not
-        // have: lifted here so both serve the same connections.
+        // have: lifted here (to the server's own cap) so both serve the same
+        // connections.
+        .limits(serve_net::Limits::new().max_connections(4_000))
         .transport_limits(
             serve_net::net_io::Limits::builder()
-                .max_per_source(1_000_000, serve_net::net_io::PrefixPolicy::DEFAULT)
+                .max_per_source(4_000, serve_net::net_io::PrefixPolicy::DEFAULT)
                 .build()
                 .expect("transport limits"),
         )

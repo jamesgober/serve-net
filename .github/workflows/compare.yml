@@ -32,6 +32,8 @@ jobs:
       - name: Run
         working-directory: compare
         run: |
+          # A failed run must fail the job, not vanish behind `tee`.
+          set -o pipefail
           # The runner's soft descriptor limit is 1,024; 1,000 connections
           # plus headroom need more, for both servers alike.
           ulimit -n 65536 || ulimit -n "$(ulimit -Hn)"
