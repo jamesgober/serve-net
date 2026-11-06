@@ -20,6 +20,14 @@
 - An end-to-end TLS test with a real engine (tls-net 0.5 on ring, a
   dev-dependency only) and the ALPN cases.
 - `docs/SECURITY.md` and a root `SECURITY.md`; attack tests for T-15 and T-18.
+- `RuleId::AnyLocalPeerForwarded`, a build warning for forwarded headers on a
+  Unix socket open to any local peer.
+
+### Fixed
+
+- V-24 is enforced: `trust_scheme` or `trust_host` with a single-address
+  header or PROXY v1, which carry neither, is refused at build
+  (`RuleId::SchemeTrustWithoutSource`).
 
 ### Changed
 

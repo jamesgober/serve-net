@@ -2347,7 +2347,7 @@ pub enum RuleId {
     PublicBind, ForwardedOnDirect, FastCgiTrust, TrustWildcard, TrustTooBroad, TwoClientSources,
     TrustEmpty, TrustParse, WorldWritableSocket, PeerCredentialsUnavailable, DuplicateName, BadName,
     ProfileIdReserved, ProfileGap, UnknownProfile, DeadlineOrder, DeadlineRange, ZeroCap, DuplicateBind,
-    DriverUnavailable, ReloadWorkers, DrainRange, AlpnWithoutTls, TlsOnFastCgi, SchemeTrustWithoutSource,
+    DriverUnavailable, ReloadWorkers, DrainRange, AlpnWithoutTls, TlsOnFastCgi, SchemeTrustWithoutSource, AnyLocalPeerForwarded,
     AddressResolve, TlsWithoutAcceptor, BadHeaderName, IngressNeedsHttp, ReserveOverflow, TooMany,
     // warnings
     DeclaredSchemeHttp, MinRateOff, PanicCatchInAbortBuild, OffloadOnBlocking, ShortIdleBehindProxy,
@@ -2378,7 +2378,8 @@ impl RuleId { pub const fn as_str(self) -> &'static str; }   // stable snake_cas
 | `ReloadListener` | a reload that changes PROXY trust or TLS on a listener that keeps its socket (`0.4.0`) | a new listener name, or restart |
 | `DrainRange` | a drain deadline of 0 or above 1 h | none |
 | `AlpnWithoutTls`, `TlsOnFastCgi`, `TlsWithoutAcceptor` | ALPN without TLS; TLS on FastCGI; TLS with no acceptor | none |
-| `SchemeTrustWithoutSource` | `trust_scheme` or `trust_host` where no source can carry them | none |
+| `SchemeTrustWithoutSource` | `trust_scheme` or `trust_host` where no source can carry them (a single-address header, PROXY v1) | none |
+| `AnyLocalPeerForwarded` (warning, 0.7.0) | forwarded headers believed on a Unix socket open to any local peer: only the socket file's mode guards them | not an error |
 | `AddressResolve` | an address that resolved to nothing | none |
 | `BadHeaderName` | a `SingleAddress` field name that is not a token | none |
 | `IngressNeedsHttp` | forwarded headers or FastCGI on a listener whose profile serves a custom family | none |
