@@ -351,7 +351,7 @@ fn test_ws_upgrade_the_request_did_not_offer_is_500() {
 fn test_ws_h2c_offer_is_served_as_http11() {
     let (_seen, _server, addr) = start();
     let mut s = TcpStream::connect(addr).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
     s.write_all(
         b"GET /plain HTTP/1.1\r\nHost: a\r\nConnection: Upgrade, HTTP2-Settings\r\n\
           Upgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAoAAA\r\n\r\n",

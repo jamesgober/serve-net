@@ -39,7 +39,13 @@ const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 
 /// The most a connection may hold while idle, excluding kernel buffers. The
 /// target (NFR-3) is 4 KiB, due at 0.6; D-076 has where the rest goes.
+/// NFR-3's 4 KiB. On Windows net-io's completion-port bookkeeping adds about
+/// 150 bytes a connection that serve-net cannot shed: 4.25 KiB there, in the
+/// register until it closes (D-094).
+#[cfg(not(windows))]
 const MAX_BYTES_PER_IDLE: usize = 4 * 1024;
+#[cfg(windows)]
+const MAX_BYTES_PER_IDLE: usize = 4 * 1024 + 256;
 
 fn one_request(s: &mut TcpStream) {
     s.write_all(GET).unwrap();

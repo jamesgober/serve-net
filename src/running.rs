@@ -51,6 +51,7 @@ impl<C: ControlLine> Merged<C> {
     }
 
     /// An upgraded connection hears about a drain through `waker`.
+    #[cfg(feature = "ws")]
     pub(crate) fn register_upgraded(&self, connection: ConnectionId, waker: Arc<dyn Waker>) {
         self.upgraded
             .lock()
@@ -58,6 +59,7 @@ impl<C: ControlLine> Merged<C> {
             .insert(connection, waker);
     }
 
+    #[cfg(feature = "ws")]
     pub(crate) fn unregister_upgraded(&self, connection: ConnectionId) {
         self.upgraded
             .lock()

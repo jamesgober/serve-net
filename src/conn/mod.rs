@@ -236,12 +236,11 @@ struct Request {
     head_reads: u16,
     admitted_at: Option<Instant>,
     bytes_in: u64,
-    /// The head's share of `bytes_in`.
-    head_bytes: u64,
-    /// The body limit of the profile as the tables stood at this head: a
-    /// reload reaches an open connection here, while the engine's own limit
-    /// is fixed when the connection opens.
-    max_body: u64,
+    /// `bytes_in` past which a streamed body is refused: the head plus the
+    /// profile's body limit as the tables stood at this head. A reload
+    /// reaches an open connection here; the engine's own limit is fixed when
+    /// the connection opens.
+    bytes_in_limit: u64,
     policy: BodyPolicy,
     discard_over: bool,
     status: Option<u16>,
@@ -309,7 +308,9 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     proxy_facts: Option<Arc<net_io::ProxyFacts>>,
     /// The upgrade the service asked for in `head`, made once the request
     /// passed admission and the checkpoints.
-    upgrade: Option<UpgradeTarget>,
+    /// Boxed: a connection that never upgrades keeps 8 bytes, not the
+    /// target's 104 (D-076, NFR-3).
+    upgrade: Option<Box<UpgradeTarget>>,
     /// The WebSocket after a switch.
     #[cfg(feature = "ws")]
     ws: Option<Box<crate::ws::WsLink>>,
@@ -961,9 +962,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                                         None
                                     }
                                 }
-                                BodyPolicy::Stream
-                                    if r.bytes_in.saturating_sub(r.head_bytes) > r.max_body =>
-                                {
+                                BodyPolicy::Stream if r.bytes_in > r.bytes_in_limit => {
                                     self.end = Some(EndReason::ProtocolError);
                                     let step = self.refuse(
                                         io,
@@ -1115,8 +1114,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             head_at: arrived,
             admitted_at: None,
             bytes_in: head_len,
-            head_bytes: head_len,
-            max_body: limits.max_body,
+            bytes_in_limit: head_len.saturating_add(limits.max_body),
             policy: default_policy,
             discard_over: false,
             status: None,
@@ -1127,7 +1125,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             HeadAction::ProceedWith(p) => p,
             HeadAction::Upgrade(target) => {
                 // The upgrade request carries no body: a declared one is 413.
-                self.upgrade = Some(target);
+                self.upgrade = Some(Box::new(target));
                 BodyPolicy::Buffer { max: 0 }
             }
             HeadAction::Refuse {
@@ -1254,7 +1252,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             Verdict::Kill => return self.kill(),
         }
         if let Some(target) = self.upgrade.take() {
-            return self.switch(io, target);
+            return self.switch(io, *target);
         }
         // A deferral gets the next generation; the slot is made once per
         // connection, and the reply keeps its link between calls (the reply
