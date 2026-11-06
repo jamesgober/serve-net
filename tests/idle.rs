@@ -249,8 +249,10 @@ fn test_t33_large_replies_on_many_connections_stay_bounded() {
             }
         });
     };
+    // Past the idle trim (one second), so both measurements see connections
+    // that gave their reply buffers back.
     let settle = || {
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_secs(2));
         LIVE.load(Ordering::Relaxed)
     };
     for _ in 0..2 {

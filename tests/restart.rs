@@ -192,6 +192,9 @@ mod restart {
         let _ = new.drain(Duration::from_secs(2));
     }
 
+    /// One request: when it began, and how it ended.
+    type Attempt = (std::time::Instant, Result<(), String>);
+
     /// Where idea I-9 kills the old server in a hand-off.
     #[derive(Clone, Copy, Debug)]
     enum KillAt {
@@ -215,8 +218,7 @@ mod restart {
         let (addr, first, second) = shared_socket();
         let old = serve(first, "old");
         let stop = Arc::new(AtomicBool::new(false));
-        let log: Arc<Mutex<Vec<(std::time::Instant, Result<(), String>)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let log: Arc<Mutex<Vec<Attempt>>> = Arc::new(Mutex::new(Vec::new()));
         let clients: Vec<_> = (0..4)
             .map(|_| {
                 let (stop, log) = (Arc::clone(&stop), Arc::clone(&log));
