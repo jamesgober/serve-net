@@ -148,6 +148,7 @@ Exit: zero open findings; the 24 h soak clean (NFR-18); `docs/SECURITY.md` writt
 Exit: a production site served for two weeks without a serve-net defect; `docs/ARCHITECTURE.md` draft; no API change needed by the first real wrapper that is not already made.
 - Moved from 0.7 (D-097). When fcgi-net is published: FastCGI on Linux and macOS first (`fastcgi`, `FastCgiListen`, `FastCgiIngress`, `Ingress::FastCgi`, `engine::FastCgi`, `ListenerSpec::fastcgi_descriptor_zero`, T-19, the `fastcgi_mapping` fuzz target, the T-19 attack test, `mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0). Windows waits for the decision on a Windows FastCGI deployment.
 - A real application wrapper built on serve-net's hooks; a custom-family prototype for a database wire protocol.
+- Adopt net-io 0.8: the drain grace for a connection that has not sent its first byte (its D-189, `Limits::first_request_grace`), `Session::on_drain`, `ListenerSpec::workers`, and the linger after a reply sent while idle (its D-192), which makes D-102's `set_phase(Sending)` redundant; keep it (harmless) unless the tests show a reason. Rerun `tests/restart.rs` and the soft-cap loopback test on it.
 
 ## v0.9.0 - Beta
 Exit: no API change across two beta releases; every document complete.
