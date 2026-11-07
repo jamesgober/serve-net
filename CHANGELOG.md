@@ -13,6 +13,66 @@
 
 ---
 
+## [0.7.0] - 2026-11-07
+
+Hardening: TLS with ALPN, the idle trim, WebSocket push, a 24-hour soak, and
+an adversarial review with every finding fixed.
+
+### Added
+
+- `EngineChoice::Http1OrH2ByAlpn`: the engine by the TLS handshake's ALPN
+  result. HTTP/1.1 for `http/1.1` or no ALPN; `h2` closes with
+  `EndReason::NoEngine` until the HTTP/2 engine exists. Only on TLS listeners
+  (`RuleId::AlpnWithoutTls`).
+- An end-to-end TLS test with a real engine (tls-net 0.5 on ring, a
+  dev-dependency only) and the ALPN cases.
+- `docs/SECURITY.md` and a root `SECURITY.md`; attack tests for T-15, T-18,
+  T-32, T-33, and T-40; kill-at-every-step restart tests; the leak test; loom
+  models for the drain and the WebSocket sender.
+- `WsSender` (`WebSocketConn::sender`): send on an open WebSocket from any
+  thread, through a queue bounded by the connection's output budget.
+- A drain closes open WebSockets with 1001 first.
+- `WebSocketTarget::message_timeout` (30 s by default): a message trickled past
+  it closes with 1008.
+- `RuleId::AnyLocalPeerForwarded`, a build warning for forwarded headers on a
+  Unix socket open to any local peer.
+- `Envelope::gate_tag`: the `GateTag` the gate returned in `Gate::admit`, so a
+  gate integration needs no map from connection id to tag. 8 bytes per
+  connection (the envelope grows from 120 to 128 bytes on 64-bit targets).
+  `GateTag` is re-exported.
+
+### Fixed
+
+- A reload that lowers `max_body` reaches a streamed body (`BodyPolicy::Stream`)
+  on an open connection at its next request, as it already did for buffered
+  bodies.
+- V-24 is enforced: `trust_scheme` or `trust_host` with a single-address
+  header or PROXY v1, which carry neither, is refused at build
+  (`RuleId::SchemeTrustWithoutSource`).
+- Restarts on Windows (T-30): the restart tests run on Windows as well. The
+  resets once seen there were the new server's own per-source cap refusing
+  the old server's clients; `docs/DEPLOYMENT.md` now says to start the new
+  server with the old one's caps or more.
+
+### Changed
+
+- net-io 0.6.2. An idle keep-alive connection gives back its buffers after one
+  second of quiet: about 4 KB per idle connection, from about 9 KB. A drain no
+  longer cuts a request that has already arrived, and on Windows a worker no
+  longer deadlocks at thread exit and the listen backlog is no longer capped
+  at 200.
+- A connection whose ALPN result names a protocol its profile has no engine for
+  is closed with `EndReason::NoEngine` before any byte reaches an engine. Before,
+  an `Http1` profile fed an HTTP/2 connection to the HTTP/1.1 parser, which
+  answered 400.
+
+### Moved
+
+- To 0.8.0: FastCGI (with T-19 and the `fastcgi_mapping` fuzz target), which
+  waits for fcgi-net.
+
+---
+
 ## [0.6.3] - 2026-11-06
 
 Three findings of an adversarial review, each fixed with a regression test.
@@ -328,7 +388,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.6.3...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/serve-net/compare/v0.6.3...v0.7.0
 [0.6.3]: https://github.com/jamesgober/serve-net/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/jamesgober/serve-net/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/jamesgober/serve-net/compare/v0.6.0...v0.6.1

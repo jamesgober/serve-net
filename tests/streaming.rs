@@ -433,3 +433,33 @@ fn test_stream_reply_finishes_through_a_drain() {
     let report = drained.join().unwrap();
     assert_eq!(report.killed, 0, "{report:?}");
 }
+
+/// Found in the 0.7 review: under `BodyPolicy::Stream` only the engine
+/// checked the size, with limits fixed when the connection opened, so a
+/// reload that lowered `max_body` never reached an open connection. serve-net
+/// now counts the pieces against the profile's limit as the tables stood at
+/// the head.
+#[test]
+fn test_stream_body_over_the_profile_limit_is_refused_413() {
+    use serve_net::testing::TestConnection;
+    use serve_net::{Limits, Profile, ProfileId};
+    let service = Arc::new(Upload::default());
+    let profile = Profile::new(ProfileId(0)).limits(Limits::new().max_body(10));
+    let mut conn = TestConnection::with_profile(Held(Arc::clone(&service)), profile);
+    let replies = conn.send(
+        b"POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n01234\r\n8\r\n01234567\r\n0\r\n\r\n",
+    );
+    assert_eq!(replies.last().map(|r| r.status), Some(413), "{replies:?}");
+    assert!(!conn.is_open());
+    let seen: usize = service
+        .pieces
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|p| p.0.len())
+        .sum();
+    assert!(
+        seen <= 10,
+        "the service saw {seen} bytes past a 10-byte limit"
+    );
+}

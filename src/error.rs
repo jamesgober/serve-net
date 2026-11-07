@@ -69,6 +69,9 @@ pub enum RuleId {
     TlsOnFastCgi,
     /// `trust_scheme` or `trust_host` with no source that can carry them.
     SchemeTrustWithoutSource,
+    /// Forwarded headers believed on a Unix socket open to any local peer
+    /// (a warning: only the socket file's mode guards them).
+    AnyLocalPeerForwarded,
     /// A listener address that resolved to nothing.
     AddressResolve,
     /// A TLS listener with no TLS acceptor.
@@ -131,6 +134,7 @@ impl RuleId {
             RuleId::AlpnWithoutTls => "alpn_without_tls",
             RuleId::TlsOnFastCgi => "tls_on_fastcgi",
             RuleId::SchemeTrustWithoutSource => "scheme_trust_without_source",
+            RuleId::AnyLocalPeerForwarded => "any_local_peer_forwarded",
             RuleId::AddressResolve => "address_resolve",
             RuleId::TlsWithoutAcceptor => "tls_without_acceptor",
             RuleId::BadHeaderName => "bad_header_name",

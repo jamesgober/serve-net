@@ -236,6 +236,11 @@ struct Request {
     head_reads: u16,
     admitted_at: Option<Instant>,
     bytes_in: u64,
+    /// `bytes_in` past which a streamed body is refused: the head plus the
+    /// profile's body limit as the tables stood at this head. A reload
+    /// reaches an open connection here; the engine's own limit is fixed when
+    /// the connection opens.
+    bytes_in_limit: u64,
     policy: BodyPolicy,
     discard_over: bool,
     status: Option<u16>,
@@ -253,6 +258,9 @@ const OUT_INITIAL: usize = 1024;
 const OUT_RETAIN: usize = 16 * 1024;
 /// Body capacity kept between requests.
 const BODY_RETAIN: usize = 64 * 1024;
+/// A keep-alive connection quiet this long gives back its engine, reply, and
+/// body buffers (D-076, D-087): the next request allocates them again.
+pub(crate) const IDLE_TRIM_AFTER: Duration = Duration::from_secs(1);
 
 /// One connection.
 pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
@@ -289,6 +297,8 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     /// A streamed reply's head has left.
     reply_stream: bool,
     first_byte: Option<Instant>,
+    /// Back between requests with the trim timer set (`IDLE_TRIM_AFTER`).
+    trim_armed: bool,
     /// Reads that fed the current head so far.
     head_reads: u16,
     wipe: bool,
@@ -298,7 +308,9 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     proxy_facts: Option<Arc<net_io::ProxyFacts>>,
     /// The upgrade the service asked for in `head`, made once the request
     /// passed admission and the checkpoints.
-    upgrade: Option<UpgradeTarget>,
+    /// Boxed: a connection that never upgrades keeps 8 bytes, not the
+    /// target's 104 (D-076, NFR-3).
+    upgrade: Option<Box<UpgradeTarget>>,
     /// The WebSocket after a switch.
     #[cfg(feature = "ws")]
     ws: Option<Box<crate::ws::WsLink>>,
@@ -348,6 +360,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             seq: RequestSeq(0),
             profile: profile_id,
             tag,
+            gate: crate::net::GateTag(0),
             lane,
             lane_open: false,
             lane_late: false,
@@ -394,6 +407,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             body_open: false,
             reply_stream: false,
             first_byte: None,
+            trim_armed: false,
             head_reads: 0,
             wipe,
             draining_seen: false,
@@ -405,6 +419,10 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     }
 
     /// The facts net-io read from the connection's PROXY header.
+    pub(crate) fn set_gate_tag(&mut self, tag: crate::net::GateTag) {
+        self.env.gate = tag;
+    }
+
     pub(crate) fn set_proxy_facts(&mut self, facts: Option<Arc<net_io::ProxyFacts>>) {
         self.proxy_facts = facts;
     }
@@ -577,6 +595,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
 
     /// A completion for this connection arrived.
     pub(crate) fn on_wake<I: Io>(&mut self, io: &mut I, token: u32, value: u64) -> Step {
+        if self.state == State::Upgraded {
+            return self.upgraded_wake(io, token);
+        }
         let State::Parked { generation, until } = self.state else {
             return self.current_step();
         };
@@ -632,6 +653,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                     None,
                     RequestEnd::TimedOut,
                 )
+            }
+            (Timeout::Exchange, State::AwaitHead)
+                if self.trim_armed && self.first_byte.is_none() =>
+            {
+                self.trim_idle(io)
             }
             (Timeout::Exchange, State::AwaitHead) => {
                 if self.first_byte.is_some() {
@@ -837,10 +863,28 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             self.state = State::Closed;
             return Step::Close;
         }
-        // The engine keeps its buffer between requests: releasing it here would
-        // cost an allocation per keep-alive request (D-076).
-        io.set_exchange_deadline(None);
+        // The engine keeps its buffer between requests, so a busy connection
+        // allocates nothing; one that stays quiet for `IDLE_TRIM_AFTER` gives
+        // its buffers back (D-087). The phase first: it clears the deadline.
         io.set_phase(Phase::Idle);
+        io.set_exchange_deadline(Some(io.now() + IDLE_TRIM_AFTER));
+        self.trim_armed = true;
+        Step::Read
+    }
+
+    /// The trim timer fired with no byte of a new head: hands back what an
+    /// idle connection does not need. Wiped buffers were zeroed when cleared.
+    fn trim_idle<I: Io>(&mut self, io: &mut I) -> Step {
+        self.trim_armed = false;
+        let _ = self.engine.shrink_idle();
+        self.out.shrink(0);
+        self.body = Vec::new();
+        self.reply.parts = self.shared.family.new_parts();
+        // The deferral slot too: a wake only acts on a parked connection, and a
+        // token from an earlier request keeps its own reference to the old slot.
+        self.reply.link = None;
+        self.defer = None;
+        io.set_exchange_deadline(None);
         Step::Read
     }
 
@@ -861,6 +905,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                     // (the first request's started at accept).
                     let now = io.now();
                     self.first_byte = Some(now);
+                    self.trim_armed = false;
                     if self.seq > 0 {
                         io.set_phase(Phase::Receiving);
                         io.set_exchange_deadline(Some(now + self.limits().head_timeout));
@@ -921,6 +966,17 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                                     } else {
                                         None
                                     }
+                                }
+                                BodyPolicy::Stream if r.bytes_in > r.bytes_in_limit => {
+                                    self.end = Some(EndReason::ProtocolError);
+                                    let step = self.refuse(
+                                        io,
+                                        RefusalKind::TooLarge,
+                                        413,
+                                        None,
+                                        RequestEnd::Refused(RefusalKind::TooLarge),
+                                    );
+                                    return (input.len(), step);
                                 }
                                 BodyPolicy::Stream if self.state == State::ReadBody => {
                                     if self.wipe {
@@ -1063,6 +1119,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             head_at: arrived,
             admitted_at: None,
             bytes_in: head_len,
+            bytes_in_limit: head_len.saturating_add(limits.max_body),
             policy: default_policy,
             discard_over: false,
             status: None,
@@ -1073,7 +1130,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             HeadAction::ProceedWith(p) => p,
             HeadAction::Upgrade(target) => {
                 // The upgrade request carries no body: a declared one is 413.
-                self.upgrade = Some(target);
+                self.upgrade = Some(Box::new(target));
                 BodyPolicy::Buffer { max: 0 }
             }
             HeadAction::Refuse {
@@ -1200,7 +1257,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             Verdict::Kill => return self.kill(),
         }
         if let Some(target) = self.upgrade.take() {
-            return self.switch(io, target);
+            return self.switch(io, *target);
         }
         // A deferral gets the next generation; the slot is made once per
         // connection, and the reply keeps its link between calls (the reply

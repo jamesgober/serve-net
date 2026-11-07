@@ -1,7 +1,7 @@
 # serve-net - API Reference
 
 > Reference for every public item in `serve-net`, with signatures, behaviour, errors, costs, and examples.
-> **Current release: `0.6.3`.** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
+> **Current release: `0.7.0`.** This document is the contract for `0.3.0` to `1.0.0`. Each item carries the version that ships it; an item marked with a later version than the current release is specified here and not yet in the crate. Names and signatures do not change after `0.2.0` without a decision-log entry in [`../dev/PLAN.md`](../dev/PLAN.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -149,7 +149,7 @@ Every cost is a target on reference hardware. Numbers marked **[est.]** are esti
 |---|---|---|---|
 | (none) | always | the server, listeners, ingress, profiles, limits, hooks, snapshots, the engine and family traits | `0.3.0` |
 | `http1` | on | the HTTP family over http-net: `HttpService`, `HttpRequest`, `HttpReply`, `engine::Http1`, the Tier 1 functions `http` and `http_behind_proxy`, `testing` | `0.3.0` |
-| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.7.0` |
+| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.8.0` |
 | `ws` | off | WebSocket upgrades over ws-net: `UpgradeTarget::WebSocket`, `WebSocketTarget`, `WebSocketService`, `WebSocketConn`, `WsMessage`, `WsSendError`, the `ws_net` re-export (implies `http1`) | `0.6.0` |
 | `h2` | off | HTTP/2 over h2-net: `engine::H2`, ALPN `h2` | after `1.0.0`, or earlier as a minor version when h2-net reaches its 0.3 |
 
@@ -308,7 +308,7 @@ A FastCGI responder for Apache (`mod_fcgid`, `mod_proxy_fcgi`) or nginx (`fastcg
 
 | Grade | Tier | Version | Feature |
 |---|---|---|---|
-| P1 | 1 | `0.7.0` | `fastcgi` |
+| P1 | 1 | `0.8.0` | `fastcgi` |
 
 Errors: `ServeError::Inherited` ("descriptor 0 is not a listening socket: the process was not started by a FastCGI process manager; use FastCgiListen::Tcp or Unix"), `ServeError::Bind`, `ServeError::Config` (`PublicBind`). `DescriptorZero` and `Unix` are Unix only (mod_fcgid on Windows uses named pipes, after `1.0.0`).
 
@@ -355,6 +355,7 @@ serve-net names a few net-io and http-net types in its own signatures. They are 
 | `TrustedProxies`, `Cidr` | net-io | `ProxySource`, `FastCgiIngress` |
 | `ControlLine`, `ControlState`, `SimpleControl`, `NoControl` | net-io | [the control line](#the-control-line) |
 | `Gate`, `AllowAll`, `EventSink`, `NoopSink`, `CloseReason` | net-io | `ServerBuilder::gate`, `ServerBuilder::events`, `EndReason::Transport` |
+| `GateTag` | net-io | `Envelope::gate_tag` |
 | `Method`, `Version` | http-net (feature `http1`) | `HttpHead::method`, `HttpHead::version` |
 | `net_io` | the crate | `ServerBuilder::transport_limits`, `ListenerSpec::listen_options`, hand-off |
 | `http_net` | the crate (feature `http1`) | `Limits::engine_limits` |
@@ -785,7 +786,7 @@ impl ListenerSpec {
     pub fn tcp<A: ToSocketAddrs>(name: &str, addr: A) -> Self;
     pub fn unix(name: &str, path: impl Into<PathBuf>) -> Self;                     // P1, 0.4.0
     pub fn inherited(name: &str) -> Self;                                           // P1, 0.4.0
-    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.7.0, Unix
+    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.8.0, Unix
     pub fn handed_off(name: &str, listener: net_io::ListenerHandle) -> Self;        // P0, 0.4.0
 }
 ```
@@ -911,7 +912,7 @@ pub enum Ingress {
     DirectTls,                                  // P0, 0.4.0: the same over TLS (net-io's TLS seam)
     Proxy(ProxySource),                         // behind a reverse proxy or load balancer
     Unix(UnixPeerTrust, Option<ProxySource>),   // P1, 0.4.0: None means the local peer is the client
-    FastCgi(FastCgiIngress),                    // P1, 0.7.0, feature fastcgi
+    FastCgi(FastCgiIngress),                    // P1, 0.8.0, feature fastcgi
 }
 impl Default for Ingress;   // Direct
 ```
@@ -928,7 +929,7 @@ How clients reach a listener, and therefore where the real client comes from. Ex
 
 | Grade | Tier | Version |
 |---|---|---|
-| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`); `0.7.0` (`FastCgi`) |
+| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`); `0.8.0` (`FastCgi`) |
 
 Errors (at `build`): `ForwardedOnDirect`, `TwoClientSources`, `PublicBind`, `TrustEmpty`, `TrustWildcard`, `TrustTooBroad`, `FastCgiTrust`, `TlsOnFastCgi`, `TlsWithoutAcceptor`, `PeerCredentialsUnavailable`.
 
@@ -1034,7 +1035,7 @@ impl FastCgiIngress {
 }
 ```
 
-The FastCGI ingress options. `REMOTE_ADDR` is believed only because only trusted front ends can connect (rule `FastCgiTrust` refuses an empty list on TCP). P1, Tier 2, `0.7.0`, feature `fastcgi`.
+The FastCGI ingress options. `REMOTE_ADDR` is believed only because only trusted front ends can connect (rule `FastCgiTrust` refuses an empty list on TCP). P1, Tier 2, `0.8.0`, feature `fastcgi`.
 
 ---
 
@@ -1110,6 +1111,7 @@ impl Envelope {
     pub fn seq(&self) -> RequestSeq;
     pub fn profile(&self) -> ProfileId;
     pub fn tag(&self) -> u8;                      // the profile's opaque tag
+    pub fn gate_tag(&self) -> GateTag;            // the gate's tag from Gate::admit; GateTag(0) with no gate; 0.7.0
     pub fn lane(&self) -> Lane;
     pub fn set_lane(&mut self, lane: Lane);       // honoured in head() only; later calls are ignored and reported
     pub fn client(&self) -> &ClientInfo;
@@ -1121,7 +1123,7 @@ impl Envelope {
 }
 ```
 
-The facts serve-net keeps about one request, passed to every hook and service call. `connection` plus `seq` identify a request within the process. `user_word` lets a wrapper link its own per-request record (for example the index of a slot taken in `Admit`) without serve-net knowing its type. `Send + Sync`, about 96 bytes [est.], stored in the connection record: no allocation. P0, Tier 2, `0.3.0`.
+The facts serve-net keeps about one request, passed to every hook and service call. `connection` plus `seq` identify a request within the process. `user_word` lets a wrapper link its own per-request record (for example the index of a slot taken in `Admit`) without serve-net knowing its type. `gate_tag` carries the tag the gate returned in `Gate::admit`, so a gate integration (bouncer-io) finds its own record for the connection without a map from connection id to tag. `Send + Sync`, 128 bytes on 64-bit targets (the gate tag is 8 of them), stored in the connection record: no allocation. P0, Tier 2, `0.3.0`.
 
 ```rust
 use serve_net::{Envelope, HeadAction, HttpHead, HttpReply, HttpRequest, HttpService, Lane, Outcome};
@@ -1242,13 +1244,13 @@ The compiled, immutable table, published through a [`Snapshot`](#snapshot) so a 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EngineChoice {
     #[default] Http1,
-    FastCgi,                                       // P1, 0.7.0
+    FastCgi,                                       // P1, 0.8.0
     Http1OrH2ByAlpn,                               // P1, 0.7.0 (h2 with feature h2)
     Custom { alpn: &'static [&'static str] },      // a family given to bind_family; ALPN ids it serves
 }
 ```
 
-The engine a profile's connections start with, and the ALPN protocols offered on its TLS listeners. A profile without h2 never offers `h2`. An ALPN result with no compiled engine closes the connection (`EndReason::NoEngine`). ALPN choices on a listener without TLS are refused (`RuleId::AlpnWithoutTls`). P0 (`Http1`, `Custom`) `0.3.0`, P1 (`FastCgi`, `Http1OrH2ByAlpn`) `0.7.0`, Tier 2.
+The engine a profile's connections start with, chosen by the TLS handshake's ALPN result. The acceptor (tls-net, or any `net_io::TlsAcceptor`) decides what is offered; serve-net reads what was negotiated, after the handshake and before any byte reaches an engine. `Http1` and `Http1OrH2ByAlpn` run HTTP/1.1 for `http/1.1`, `http/1.0`, or no ALPN; `Custom` runs its family for no ALPN or one of its ids. An ALPN result with no compiled engine closes the connection (`EndReason::NoEngine`); until the HTTP/2 engine exists that includes `h2`, so offer only `http/1.1` on the acceptor. ALPN choices on a listener without TLS are refused (`RuleId::AlpnWithoutTls`). P0 (`Http1`, `Custom`) `0.3.0`, P1 (`Http1OrH2ByAlpn` `0.7.0`, `FastCgi` `0.8.0`), Tier 2.
 
 ---
 
@@ -1666,6 +1668,7 @@ impl WebSocketTarget {
     pub fn profile(self, id: ProfileId) -> Self;                  // whose max_pending_output applies after the switch
     pub fn max_pending_output(self, bytes: usize) -> Self;
     pub fn ping_interval(self, interval: Duration) -> Self;       // at least 1 s
+    pub fn message_timeout(self, timeout: Duration) -> Self;      // 0.7.0: first byte to last, at least 1 s, 30 s by default; past it 1008
 }
 
 pub trait WebSocketService: Send + Sync + 'static {
@@ -1684,12 +1687,23 @@ impl WebSocketConn<'_> {
     pub fn send_binary(&mut self, data: &[u8]) -> Result<(), WsSendError>;
     pub fn close(&mut self, code: u16, reason: &str) -> Result<(), WsSendError>;
     pub fn pending_output(&mut self) -> usize;
+    pub fn sender(&self) -> WsSender;                                // 0.7.0
+}
+
+#[derive(Clone)]
+pub struct WsSender { /* sends on the connection from any thread */ }  // 0.7.0
+impl WsSender {
+    pub fn send_text(&self, text: &str) -> Result<(), WsSendError>;
+    pub fn send_binary(&self, data: &[u8]) -> Result<(), WsSendError>;
+    pub fn is_closed(&self) -> bool;
 }
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WsSendError { Full, Closed, Invalid }
 ```
+
+`WsSender` (0.7.0) sends from any thread: messages wait in a queue bounded by the connection's output budget and are written by the connection's worker, in order, after what the service sent from its own calls. A full queue refuses with `Full`, a closed connection with `Closed`. Each message is copied once into the queue. A drain through `Running::drain` or `DrainHandle` wakes every open WebSocket, which closes with 1001 before net-io closes idle connections (the drain waits at most 250 ms for those goodbyes); a drain started only on the owner's own control line closes a quiet socket without one.
 
 `head` returns `HeadAction::Upgrade(target)`. The upgrade request then goes through admission and the checkpoints like any request (a declared body is refused with 413). serve-net checks the handshake through ws-net (`ServerHandshake::from_request`: method, version 13, the key, `Host`, `Origin`, the offered subprotocols) and answers an invalid one with 400 before anything else is written. An upgrade the client never offered, or a subprotocol it did not offer, is a service bug: 500, reported through `Observer::service_error`. Otherwise http-net writes the 101 with `sec-websocket-accept`, the upgrade request ends (`done` with `RequestEnd::Upgraded`, its admission released), `HttpService::upgraded` runs, the HTTP engine's buffers are released, and the bytes that arrived after the request go to ws-net, never to the HTTP parser (T-21). `Upgrade: h2c` never reaches this path: it is not an upgrade offer, and the request is served as HTTP/1.1. A 2xx to `CONNECT` is refused unless a profile allows tunnels (after `1.0.0`).
 
@@ -2347,7 +2361,7 @@ pub enum RuleId {
     PublicBind, ForwardedOnDirect, FastCgiTrust, TrustWildcard, TrustTooBroad, TwoClientSources,
     TrustEmpty, TrustParse, WorldWritableSocket, PeerCredentialsUnavailable, DuplicateName, BadName,
     ProfileIdReserved, ProfileGap, UnknownProfile, DeadlineOrder, DeadlineRange, ZeroCap, DuplicateBind,
-    DriverUnavailable, ReloadWorkers, DrainRange, AlpnWithoutTls, TlsOnFastCgi, SchemeTrustWithoutSource,
+    DriverUnavailable, ReloadWorkers, DrainRange, AlpnWithoutTls, TlsOnFastCgi, SchemeTrustWithoutSource, AnyLocalPeerForwarded,
     AddressResolve, TlsWithoutAcceptor, BadHeaderName, IngressNeedsHttp, ReserveOverflow, TooMany,
     // warnings
     DeclaredSchemeHttp, MinRateOff, PanicCatchInAbortBuild, OffloadOnBlocking, ShortIdleBehindProxy,
@@ -2378,7 +2392,8 @@ impl RuleId { pub const fn as_str(self) -> &'static str; }   // stable snake_cas
 | `ReloadListener` | a reload that changes PROXY trust or TLS on a listener that keeps its socket (`0.4.0`) | a new listener name, or restart |
 | `DrainRange` | a drain deadline of 0 or above 1 h | none |
 | `AlpnWithoutTls`, `TlsOnFastCgi`, `TlsWithoutAcceptor` | ALPN without TLS; TLS on FastCGI; TLS with no acceptor | none |
-| `SchemeTrustWithoutSource` | `trust_scheme` or `trust_host` where no source can carry them | none |
+| `SchemeTrustWithoutSource` | `trust_scheme` or `trust_host` where no source can carry them (a single-address header, PROXY v1) | none |
+| `AnyLocalPeerForwarded` (warning, 0.7.0) | forwarded headers believed on a Unix socket open to any local peer: only the socket file's mode guards them | not an error |
 | `AddressResolve` | an address that resolved to nothing | none |
 | `BadHeaderName` | a `SingleAddress` field name that is not a token | none |
 | `IngressNeedsHttp` | forwarded headers or FastCGI on a listener whose profile serves a custom family | none |
@@ -2607,7 +2622,7 @@ The HTTP/1.1 engine: an adapter over `http_net::ServerConn` with the profile's `
 
 ### `engine::FastCgi`
 
-The FastCGI responder: an adapter over fcgi-net. One request at a time per connection; answers `FCGI_GET_VALUES`; an `FCGI_ABORT_REQUEST` ends the request with `RequestEnd::PeerGone` and cancels a pending `ReplyToken`. P1, Tier 3, `0.7.0`, feature `fastcgi`.
+The FastCGI responder: an adapter over fcgi-net. One request at a time per connection; answers `FCGI_GET_VALUES`; an `FCGI_ABORT_REQUEST` ends the request with `RequestEnd::PeerGone` and cancels a pending `ReplyToken`. P1, Tier 3, `0.8.0`, feature `fastcgi`.
 
 ### `engine::WebSocket`
 

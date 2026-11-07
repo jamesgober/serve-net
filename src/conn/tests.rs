@@ -104,7 +104,37 @@ fn test_get_replied_and_kept_alive() {
         (200, &b"/a"[..], false)
     );
     assert_eq!(io.phase, Phase::Idle);
-    assert_eq!(io.deadline, None);
+    // Idle: only the trim timer runs (D-087).
+    assert_eq!(io.deadline, Some(io.now + super::IDLE_TRIM_AFTER));
+}
+
+#[test]
+fn test_idle_trim_keeps_the_connection_and_frees_its_buffers() {
+    let (mut c, mut io) = conn(Counting::default(), Profile::new(ProfileId(0)));
+    c.on_open(&mut io, false);
+    let _ = c.on_data(&mut io, GET);
+    assert!(c.out.capacity() > 0, "a reply grew the output buffer");
+    io.advance(super::IDLE_TRIM_AFTER);
+    assert_eq!(c.on_timeout(&mut io, Timeout::Exchange), Step::Read);
+    assert_eq!(io.phase, Phase::Idle);
+    assert_eq!(io.deadline, None, "the trim does not re-arm");
+    assert_eq!(c.out.capacity(), 0);
+    assert_eq!(c.body.capacity(), 0);
+    // The next request is served as before.
+    io.written.clear();
+    let _ = c.on_data(&mut io, GET);
+    assert_eq!(replies(&io.written)[0].status, 200);
+}
+
+#[test]
+fn test_idle_trim_disarmed_by_the_next_head() {
+    let (mut c, mut io) = conn(Counting::default(), Profile::new(ProfileId(0)));
+    c.on_open(&mut io, false);
+    let _ = c.on_data(&mut io, GET);
+    let _ = c.on_data(&mut io, b"GET /2 HT");
+    // The head deadline replaced the trim timer: a timeout now is a 408.
+    assert_eq!(c.on_timeout(&mut io, Timeout::Exchange), Step::Close);
+    assert_eq!(replies(&io.written).last().unwrap().status, 408);
 }
 
 #[test]
@@ -223,7 +253,7 @@ fn test_later_request_head_deadline_from_first_byte() {
     let (mut c, mut io) = conn(Counting::default(), Profile::new(ProfileId(0)));
     c.on_open(&mut io, false);
     let _ = c.on_data(&mut io, GET);
-    assert_eq!(io.deadline, None);
+    assert_eq!(io.deadline, Some(io.now + super::IDLE_TRIM_AFTER));
     io.advance(Duration::from_secs(5));
     let _ = c.on_data(&mut io, b"GET /2 HT");
     assert_eq!(io.deadline, Some(io.now + Duration::from_secs(10)));
@@ -895,4 +925,23 @@ mod props {
             prop_assert!(replies <= heads * 2 + 1, "{} replies for {} heads", replies, heads);
         }
     }
+}
+
+#[test]
+fn test_t40_one_deadline_per_connection_however_many_requests() {
+    // T-40: a connection holds one exchange deadline on net-io's wheel, and
+    // each request replaces it a fixed number of times: a flood of requests
+    // on one connection never piles up timers.
+    let profile = Profile::new(ProfileId(0))
+        .keep_alive(crate::config::KeepAlive::new().max_requests(u32::MAX));
+    let (mut c, mut io) = conn(Counting::default(), profile);
+    c.on_open(&mut io, false);
+    let _ = c.on_data(&mut io, GET);
+    let base = io.deadline_sets;
+    for _ in 0..1_000 {
+        let _ = c.on_data(&mut io, GET);
+    }
+    let per_request = (io.deadline_sets - base) / 1_000;
+    assert!(per_request <= 4, "{per_request} deadline sets per request");
+    assert!(io.deadline.is_some(), "one deadline, armed");
 }

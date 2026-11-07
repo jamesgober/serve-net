@@ -145,7 +145,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run the loom models
-        run: cargo test --lib --release loom_tests
+        run: cargo test --lib --release --all-features loom_tests
 
   systemd:
     name: systemd (notify-reload, watchdog)

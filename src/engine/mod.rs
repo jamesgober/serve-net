@@ -241,6 +241,12 @@ impl OutBuf {
         self.bytes.clear();
     }
 
+    /// The bytes it can hold without growing (tests).
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+
     /// Releases capacity above `retain` bytes.
     pub(crate) fn shrink(&mut self, retain: usize) {
         if self.bytes.capacity() > retain {

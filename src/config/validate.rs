@@ -280,9 +280,12 @@ fn tls(l: &ListenerSpec, d: &Draft<'_>, f: &mut Findings) {
             "give the server one with ServerBuilder::tls",
         );
     }
-    let alpn = d.profiles.iter().find(|p| p.id == l.profile).is_some_and(
-        |p| matches!(p.engine, crate::config::EngineChoice::Custom { alpn } if !alpn.is_empty()),
-    );
+    let alpn = d.profiles.iter().find(|p| p.id == l.profile).is_some_and(|p| {
+        matches!(
+            p.engine,
+            crate::config::EngineChoice::Http1OrH2ByAlpn
+        ) || matches!(p.engine, crate::config::EngineChoice::Custom { alpn } if !alpn.is_empty())
+    });
     if alpn && !on_tls {
         f.error(
             RuleId::AlpnWithoutTls,
@@ -320,6 +323,13 @@ fn unix(l: &ListenerSpec, f: &mut Findings) {
             subject(),
             "the socket file is writable by others, so any local user can connect",
             "use a mode such as 0o660 with a group, or call allow_world_writable with the reason",
+        );
+    }
+    if let Ingress::Unix(crate::config::UnixPeerTrust::AnyLocalPeer, Some(_)) = &l.ingress {
+        f.warn(
+            RuleId::AnyLocalPeerForwarded,
+            subject(),
+            "forwarded headers are believed from any local process that can open the socket; only the socket file's mode guards them",
         );
     }
     if let Ingress::Unix(trust, _) = &l.ingress {
@@ -374,6 +384,19 @@ fn trust(l: &ListenerSpec, f: &mut Findings) {
             subject(),
             "max_hops is outside 1 to 64",
             "use max_hops between 1 and 64 (default 16)",
+        );
+    }
+    let carries_nothing =
+        matches!(
+            p.kind,
+            ProxyKind::Headers(ForwardedSource::SingleAddress(_))
+        ) || matches!(p.kind, ProxyKind::ProxyProtocol(net_io::ProxyVersions::V1));
+    if carries_nothing && (p.trust_scheme || p.trust_host) {
+        f.error(
+            RuleId::SchemeTrustWithoutSource,
+            subject(),
+            "trust_scheme or trust_host is on, but this source carries no scheme or host (a single-address header, or PROXY v1)",
+            "turn them off, or use X-Forwarded-For, Forwarded, or PROXY v2",
         );
     }
     if let ProxyKind::Headers(ForwardedSource::SingleAddress(name)) = p.kind {
@@ -1018,5 +1041,57 @@ mod tests {
         let b = rules(&run(&ls, &[]));
         assert_eq!(a, b);
         assert!(a.len() >= 4);
+    }
+
+    #[test]
+    fn test_build_scheme_trust_without_a_source_refused() {
+        use crate::config::ProxySource;
+        use net_io::TrustedProxies;
+        let single = ProxySource::headers(
+            ForwardedSource::SingleAddress("x-real-ip"),
+            TrustedProxies::loopback(),
+        );
+        let v1 = ProxySource::proxy_protocol(net_io::ProxyVersions::V1, TrustedProxies::loopback());
+        let v2 = ProxySource::proxy_protocol(net_io::ProxyVersions::V2, TrustedProxies::loopback());
+        for (source, refused) in [
+            (single.clone().trust_scheme(true), true),
+            (single.clone().trust_host(true), true),
+            (single, false),
+            (v1.clone().trust_scheme(true), true),
+            (v1, false),
+            (v2.trust_scheme(true).trust_host(true), false),
+        ] {
+            let spec =
+                ListenerSpec::tcp("p", "127.0.0.1:0").ingress(Ingress::Proxy(source.clone()));
+            let r = crate::Server::builder().listener(spec).build();
+            let has = matches!(&r, Err(e) if e.has(RuleId::SchemeTrustWithoutSource));
+            assert_eq!(has, refused, "{source:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_any_local_peer_with_forwarded_headers_warns() {
+        use crate::config::{ProxySource, UnixPeerTrust};
+        use net_io::TrustedProxies;
+        let path =
+            std::env::temp_dir().join(format!("serve-net-v-alp-{}.sock", std::process::id()));
+        let spec = ListenerSpec::unix("u", &path).ingress(Ingress::Unix(
+            UnixPeerTrust::AnyLocalPeer,
+            Some(ProxySource::forwarded_for(TrustedProxies::loopback())),
+        ));
+        let server = crate::Server::builder()
+            .listener(spec)
+            .build()
+            .expect("a warning, not an error");
+        assert!(
+            server
+                .warnings()
+                .iter()
+                .any(|w| w.rule == RuleId::AnyLocalPeerForwarded),
+            "{:?}",
+            server.warnings()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -80,12 +80,35 @@ pending, so a timer callback pins 16 KiB to free 6 KiB. The trim lands when net-
 
 ## Throughput against other servers (P-2 to P-4, NFR-5)
 
-**Not measured.** The target is at least 20% above hyper 1.x with hyper-util on tokio, on plaintext
-keep-alive, pipelined, and connection-churn workloads, with the method in `dev/PLAN.md` section 10.2:
-server and load generator on separate machines (or NUMA nodes), a coordinated-omission-corrected load
-generator, 30 s warm-up, 60 s measure, five runs. A single shared development machine cannot give
-those numbers, and same-box numbers would mostly measure the load generator. This needs reference
-hardware: two machines on one switch, or one two-socket host.
+The target is at least 20% above hyper 1.x with hyper-util on tokio, on plaintext keep-alive,
+pipelined, and connection-churn workloads. `compare/` (unpublished, its own workspace) runs both
+servers in processes of their own against one closed-loop load generator on `mio`. Both answer `200`,
+`content-type: text/plain`, and the 11-byte body `hello world`, keep connections alive, and time out a
+slow head; the generator counts every non-`200` and every dropped connection as an error.
+
+The runs that count (D-086): the server pinned to one set of cores and the generator to another, on
+the 32-thread development host in a quiet window (CPUs 0-15 and 16-31: separate cores and separate L3
+caches), and the hosted runner as a second view. A run on two machines stays open in
+`docs/STABILITY-1.0.md`; it does not block 0.x.
+
+**Hosted-runner run** (GitHub `ubuntu-latest`, AMD EPYC 9V45, 4 vCPUs: 2 for the server, 2 for
+the generator; 5 rounds of 10 s, median; 2026-11-06). serve-net's per-source cap (256 connections
+from one address by default, a defence hyper does not have) is lifted for the run, since every
+benchmark connection comes from 127.0.0.1; no errors on either side.
+
+| Row | serve-net | hyper | serve-net against hyper |
+|---|---|---|---|
+| P-2 keep-alive, 256 connections | 248,358/s | 252,690/s | -1.7% |
+| P-2 keep-alive, 1,000 connections | 219,107/s | 240,785/s | -9% |
+| P-3 pipelined 16, 256 connections | 1,856,846/s | 2,021,318/s | -8% |
+| P-4 churn, 64 connections | 41,111/s | 40,857/s | +0.6% |
+
+**Not met: serve-net is level with hyper to 9% behind it, against a target of 20% ahead.** The gap
+grows with concurrency and pipelining, which points at per-request work on the worker rather than
+the transport: the request path (172 ns of serve-net's own work against 150 ns) and the reply's
+copy of a static body into the output buffer are the first two items of the pre-1.0 performance
+pass. The pinned run on the development host waits for a quiet window: other work held the machine
+at full load through 0.7. NFR-5 is a 1.0 blocker (`docs/STABILITY-1.0.md`).
 
 ## Not measured yet
 

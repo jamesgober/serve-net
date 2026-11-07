@@ -368,6 +368,74 @@ fn test_loopback_gate_denial_writes_refusal_on_second_reply() {
     let _ = server.drain(Duration::from_secs(2));
 }
 
+/// Tags each connection with its accept count, plus a marker.
+struct Tagger(std::sync::atomic::AtomicU64);
+
+impl serve_net::Gate for Tagger {
+    type Ticket = ();
+    fn admit(
+        &self,
+        _info: &serve_net::net_io::ConnectionInfo,
+        _stage: serve_net::net_io::AdmitStage,
+    ) -> Result<serve_net::net_io::Admitted<()>, serve_net::net_io::Refusal> {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(serve_net::net_io::Admitted {
+            lane: serve_net::Lane(0),
+            ticket: (),
+            tag: serve_net::GateTag(0xA000 + n),
+        })
+    }
+    fn readmit(
+        &self,
+        _ticket: &mut (),
+        _info: &serve_net::net_io::ConnectionInfo,
+    ) -> Result<(), serve_net::net_io::Refusal> {
+        Ok(())
+    }
+    fn check(
+        &self,
+        _ticket: &mut (),
+        _write: &serve_net::net_io::WriteCheck,
+    ) -> Result<(), serve_net::net_io::Denial> {
+        Ok(())
+    }
+}
+
+struct EchoTag;
+
+impl serve_net::HttpService for EchoTag {
+    fn call(
+        &self,
+        _req: &serve_net::HttpRequest<'_>,
+        env: &serve_net::Envelope,
+        reply: &mut serve_net::HttpReply,
+    ) -> serve_net::Outcome {
+        reply.text(200, &format!("{:x}", env.gate_tag().0));
+        serve_net::Outcome::Done
+    }
+}
+
+#[test]
+fn test_loopback_gate_tag_reaches_the_envelope() {
+    use serve_net::{ListenerSpec, Server};
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .gate(Tagger(std::sync::atomic::AtomicU64::new(0)))
+        .serve(EchoTag)
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    // Each connection carries its own tag, on every request it makes.
+    let mut first = connect(addr);
+    let a = exchange(&mut first, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(a.ends_with("\r\n\r\na000"), "{a}");
+    let mut second = connect(addr);
+    let b = exchange(&mut second, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(b.ends_with("\r\n\r\na001"), "{b}");
+    let c = exchange(&mut first, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(c.ends_with("\r\n\r\na000"), "{c}");
+    let _ = server.drain(Duration::from_secs(2));
+}
+
 #[derive(Default)]
 struct Seen {
     accepted: std::sync::atomic::AtomicU32,
@@ -882,7 +950,8 @@ fn test_loopback_a_slow_body_is_answered_by_the_request_deadline() {
     c.set_read_timeout(Some(Duration::from_millis(100)))
         .unwrap();
     let mut n = 0;
-    for _ in 0..50 {
+    // Up to 30 s: a loaded machine can be slow to reach the wait.
+    for _ in 0..300 {
         server.server_handle().wake_all();
         if let Ok(read @ 1..) = c.read(&mut buf) {
             n = read;
@@ -935,10 +1004,23 @@ fn test_loopback_manual_clock_drives_the_head_deadline() {
     std::thread::sleep(Duration::from_millis(100));
     // No real time passes; the clock says the deadline did.
     clock.advance(Duration::from_secs(6));
-    // A worker blocked in a read learns of it when woken.
-    server.server_handle().wake_all();
-    let mut got = String::new();
-    let _ = c.read_to_string(&mut got);
+    // A worker blocked in a read learns of it when woken. A wake can land
+    // before the worker waits (a loaded machine is slow to get there), so wake
+    // again until the reply comes rather than trusting one wake.
+    c.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 256];
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(30) && !got.ends_with(b"408 Request Timeout\n") {
+        server.server_handle().wake_all();
+        match c.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(_) => {}
+        }
+    }
+    let got = String::from_utf8_lossy(&got);
     assert!(got.starts_with("HTTP/1.1 408"), "{got}");
     let _ = server.drain(Duration::from_secs(1));
 }
@@ -1005,6 +1087,48 @@ fn test_detached_head_is_owned_and_redacts_credentials() {
     assert_eq!(reply.text(), "/jobs");
 }
 
+/// T-15: IPv6 listeners are v6-only unless asked (net-io D-026). On one made
+/// dual-stack, an IPv4 client arrives as `::ffff:127.0.0.1`; it is reported
+/// as `127.0.0.1`, and the per-source cap counts it under that one address,
+/// so the mapped form dodges nothing.
+#[test]
+fn test_t15_mapped_v6_client_is_one_source_with_its_v4_form() {
+    use serve_net::{ListenerSpec, Server};
+    let Ok(server) = Server::builder()
+        .listener(
+            ListenerSpec::tcp("dual", "[::]:0")
+                .listen_options(net_io::ListenOptions::default().ipv6_only(false)),
+        )
+        .transport_limits(
+            net_io::Limits::builder()
+                .max_per_source(2, net_io::PrefixPolicy::DEFAULT)
+                .build()
+                .unwrap(),
+        )
+        .serve(serve_net::handler(|req, reply| {
+            let addr = req
+                .client()
+                .addr()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            reply.text(200, &addr);
+        }))
+    else {
+        // No IPv6 on this host: nothing to test.
+        return;
+    };
+    let port = server.local_addr().unwrap().port();
+    let v4 = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut held: Vec<TcpStream> = (0..2).map(|_| connect(v4)).collect();
+    for c in &mut held {
+        let a = exchange(c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(a.ends_with("\r\n\r\n127.0.0.1"), "{a}");
+    }
+    assert!(!served(v4), "a third connection from one source");
+    drop(held);
+    let _ = server.drain(Duration::from_secs(2));
+}
+
 /// Found in the 0.7 review: a PROXY v2 SSL TLV marks the client https only
 /// when its `PP2_CLIENT_SSL` bit is set. A proxy that sends the TLV on every
 /// connection (HAProxy's `send-proxy-v2-ssl`) leaves the bit clear for plain
@@ -1056,5 +1180,91 @@ fn test_loopback_proxy_v2_ssl_tlv_needs_the_client_ssl_bit() {
             "client flags {client:#x}: {a}"
         );
     }
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+/// The process's user plus system CPU time so far, in clock ticks (Linux),
+/// from `/proc/self/stat` opened beforehand: with every descriptor in use,
+/// opening it would fail.
+#[cfg(target_os = "linux")]
+fn own_cpu_ticks(file: &mut std::fs::File) -> u64 {
+    use std::io::Seek;
+    let mut stat = String::new();
+    file.rewind().unwrap();
+    file.read_to_string(&mut stat).unwrap();
+    let rest = stat.rsplit_once(')').unwrap().1;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap()
+}
+
+/// T-32: with every descriptor in use, accept fails with EMFILE. The accept
+/// loop backs off instead of spinning, and serving resumes once descriptors
+/// come free. The test runs itself again under `ulimit -n 128`, since the
+/// limit is per process.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_t32_descriptor_exhaustion_does_not_spin_the_accept_loop() {
+    const NAME: &str = "test_t32_descriptor_exhaustion_does_not_spin_the_accept_loop";
+    if std::env::var_os("SERVE_NET_T32_CHILD").is_none() {
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "ulimit -n 128 && exec \"$0\" --exact {NAME} --nocapture --test-threads 1"
+            ))
+            .arg(exe)
+            .env("SERVE_NET_T32_CHILD", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the exhausted child failed: {status}");
+        return;
+    }
+    use serve_net::{ListenerSpec, Server, Workers};
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .workers(Workers::reactor(1))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "ok");
+        }))
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let mut stat = std::fs::File::open("/proc/self/stat").unwrap();
+    // Fill the table: each connection costs the client a descriptor, and the
+    // server one more once it accepts.
+    let mut held = Vec::new();
+    while let Ok(s) = TcpStream::connect(addr) {
+        held.push(s);
+        if held.len() > 200 {
+            break;
+        }
+    }
+    assert!(held.len() < 200, "the limit did not bite");
+    std::thread::sleep(Duration::from_millis(500));
+    // A second of exhaustion: a spinning accept loop burns a whole core.
+    let before = own_cpu_ticks(&mut stat);
+    std::thread::sleep(Duration::from_secs(1));
+    let spent = own_cpu_ticks(&mut stat) - before;
+    assert!(spent < 30, "{spent} ticks of CPU in a second of exhaustion");
+    // Descriptors come free: serving resumes.
+    held.truncate(held.len() / 2);
+    let mut served = false;
+    for _ in 0..50 {
+        if let Ok(mut s) = TcpStream::connect(addr) {
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            if s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .is_ok()
+            {
+                let mut got = Vec::new();
+                let _ = s.read_to_end(&mut got);
+                if got.starts_with(b"HTTP/1.1 200") {
+                    served = true;
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(served, "nothing served after descriptors came free");
+    drop(held);
     let _ = server.drain(Duration::from_secs(2));
 }

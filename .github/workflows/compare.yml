@@ -1,0 +1,45 @@
+name: Compare
+
+# serve-net against hyper with hyper-util on tokio (NFR-5). A hosted runner is
+# a small shared machine, so these numbers show direction, not the target:
+# docs/PERFORMANCE.md says which runs count.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "compare/**"
+      - ".github/workflows/compare.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  compare:
+    name: Throughput against hyper (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compare
+      - name: Build
+        working-directory: compare
+        run: cargo build --release
+      # Half the vCPUs for the server, the other half for the load generator.
+      - name: Run
+        working-directory: compare
+        run: |
+          # A failed run must fail the job, not vanish behind `tee`.
+          set -o pipefail
+          # The runner's soft descriptor limit is 1,024; 1,000 connections
+          # plus headroom need more, for both servers alike.
+          ulimit -n 65536 || ulimit -n "$(ulimit -Hn)"
+          ulimit -n
+          n=$(nproc)
+          half=$((n / 2))
+          lscpu | grep -E "Model name|^CPU\(s\)"
+          taskset -c "$half-$((n - 1))" target/release/serve-net-compare table "0-$((half - 1))" "$half" | tee "$RUNNER_TEMP/compare.md"
+          cat "$RUNNER_TEMP/compare.md" >> "$GITHUB_STEP_SUMMARY"

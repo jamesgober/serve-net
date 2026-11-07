@@ -154,3 +154,14 @@ fn test_unix_handed_off_socket_keeps_its_file_and_peer_check() {
     assert!(a.ends_with(&format!("uid=Some({uid})")), "{a}");
     let _ = server.drain(Duration::from_secs(2));
 }
+
+/// T-18: with no mode given, the socket file is `0o660`: no other local user
+/// can connect to it.
+#[test]
+fn test_t18_default_socket_mode_keeps_other_users_out() {
+    let (server, path) = start("t18-mode", Ingress::Unix(UnixPeerTrust::SameUser, None));
+    let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+    assert_eq!(mode, 0o660, "socket mode {mode:o}");
+    assert_eq!(mode & 0o007, 0, "others can reach the socket");
+    let _ = server.drain(Duration::from_secs(1));
+}

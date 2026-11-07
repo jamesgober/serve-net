@@ -8,7 +8,7 @@
 //!
 //! ## Status
 //!
-//! `0.6.3`: HTTP/1.1 over net-io's reactor (or its blocking pool), directly,
+//! `0.7.0`: HTTP/1.1 over net-io's reactor (or its blocking pool), directly,
 //! over TLS, behind a reverse proxy, or on a Unix socket, with WebSocket
 //! upgrades (feature `ws`), streaming bodies, an offload pool, live reload, and restarts that drop nothing. The public API is locked in `docs/API.md`, and the design behind
 //! it in `dev/PLAN.md` (both in the
@@ -85,8 +85,8 @@ pub use http::{
 pub use http_net::{Method, Version};
 pub use net::{
     AddrError, AllowAll, Cidr, CloseReason, ConnectionId, ControlLine, ControlState, DriverKind,
-    EventSink, Gate, Lane, NoControl, NoopSink, ProxyVersions, SimpleControl, TrustedProxies,
-    WorkerId,
+    EventSink, Gate, GateTag, Lane, NoControl, NoopSink, ProxyVersions, SimpleControl,
+    TrustedProxies, WorkerId,
 };
 pub use notify::{NoNotify, Notify, SystemdNotify, WatchdogPinger};
 pub use reload::{ReloadSummary, ServerConfig};
@@ -99,7 +99,7 @@ pub use service::{
 pub use snapshot::{Snapshot, SnapshotReader};
 pub use stats::Stats;
 #[cfg(feature = "ws")]
-pub use ws::{WebSocketConn, WebSocketService, WebSocketTarget, WsMessage, WsSendError};
+pub use ws::{WebSocketConn, WebSocketService, WebSocketTarget, WsMessage, WsSendError, WsSender};
 
 /// http-net, for its engine limits and types.
 #[cfg(feature = "http1")]

@@ -1,5 +1,5 @@
 //! T-30: a restart through a shared listening socket refuses and resets
-//! nothing (Linux and macOS; Windows is open, see the module below). T-20 and
+//! nothing. T-20 and
 //! the head-read signal sit here too: both need a real server's view of a
 //! request.
 
@@ -96,9 +96,6 @@ fn test_panic_caught_500_and_done_called() {
     assert_eq!(ends[1], RequestEnd::Replied);
 }
 
-// Not on Windows yet: two servers on one socket pass on a large machine and
-// lose connections on a small one (dev/ROADMAP.md, Windows restart).
-#[cfg(unix)]
 mod restart {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
@@ -110,10 +107,25 @@ mod restart {
 
     const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
 
+    /// A connect that timed out. With four clients each holding at most one
+    /// connection the backlog cannot fill, so an unanswered handshake is the
+    /// host's, not the server's: Windows loopback drops a connect whose port
+    /// pair is still in TIME_WAIT from an earlier request (net-io R-44). Not
+    /// counted as a loss; a refusal or a reset still is.
+    const HOST_TIMEOUT: &str = "connect timed out";
+
     /// One request on a new connection; a whole 200, or what went wrong.
     fn one_request(addr: SocketAddr) -> Result<(), String> {
-        let mut s = TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
-        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut s = TcpStream::connect(addr).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                format!("{HOST_TIMEOUT}: {e}")
+            } else {
+                format!("connect: {e}")
+            }
+        })?;
+        // Long enough for a loaded start: a request begun while the new
+        // server starts waits in the backlog until its door opens.
+        let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
         s.write_all(GET).map_err(|e| format!("write: {e}"))?;
         let mut got = Vec::new();
         match s.read_to_end(&mut got) {
@@ -138,9 +150,26 @@ mod restart {
         (addr, first, second)
     }
 
+    /// A server on one handle of the shared socket. Every client here comes
+    /// from 127.0.0.1, and in a hand-off the incoming server takes the old
+    /// one's clients while it starts, so its per-source cap needs room above
+    /// the load: at the default 16 it refuses at its own cap on a slow host,
+    /// which looks like a hand-off reset. The blocking pool is 64 threads, not
+    /// 256: on a starved core 300 threads took 11 s to start, longer than the
+    /// clients waited in the backlog (D-100).
     fn serve(handle: net_io::ListenerHandle, who: &'static str) -> serve_net::Running {
+        let room = net_io::Limits::builder()
+            .max_per_source(64, net_io::PrefixPolicy::DEFAULT)
+            .build()
+            .unwrap();
+        let workers = if cfg!(serve_net_blocking_tests) {
+            serve_net::Workers::blocking(64)
+        } else {
+            serve_net::Workers::auto()
+        };
         Server::builder()
-            .listener(ListenerSpec::handed_off("web", handle))
+            .workers(workers)
+            .listener(ListenerSpec::handed_off("web", handle).transport_limits(room))
             .serve(serve_net::handler(move |_req, reply| {
                 reply.text(200, who);
             }))
@@ -163,6 +192,7 @@ mod restart {
                     while !stop.load(Ordering::Relaxed) {
                         match one_request(addr) {
                             Ok(()) => served.fetch_add(1, Ordering::Relaxed),
+                            Err(e) if e.starts_with(HOST_TIMEOUT) => 0,
                             Err(e) => {
                                 failed.lock().unwrap().push(e);
                                 0
@@ -190,5 +220,140 @@ mod restart {
         let failed = failed.lock().unwrap();
         assert!(failed.is_empty(), "failed in the restart: {failed:?}");
         let _ = new.drain(Duration::from_secs(2));
+    }
+
+    /// One request: when it began, and how it ended.
+    type Attempt = (std::time::Instant, Result<(), String>);
+
+    /// Where idea I-9 kills the old server in a hand-off.
+    #[derive(Clone, Copy, Debug)]
+    enum KillAt {
+        /// Before the new server exists: only the supervisor's handle holds
+        /// the socket, and connections wait in its backlog.
+        BeforeNew,
+        /// Right after the new server started.
+        AfterNew,
+        /// After the old server closed its door.
+        AfterDoor,
+        /// While the old server drains.
+        MidDrain,
+    }
+
+    /// Idea I-9: the old server dies at a step of the hand-off instead of
+    /// draining. The guarantee that holds then: no connection is refused
+    /// (the socket stays open through the new server's handle), only requests
+    /// already begun on the old server can fail, and every request begun after
+    /// the kill is served.
+    fn kill_during_handoff(at: KillAt) {
+        let (addr, first, second) = shared_socket();
+        let old = serve(first, "old");
+        let stop = Arc::new(AtomicBool::new(false));
+        let log: Arc<Mutex<Vec<Attempt>>> = Arc::new(Mutex::new(Vec::new()));
+        let clients: Vec<_> = (0..4)
+            .map(|_| {
+                let (stop, log) = (Arc::clone(&stop), Arc::clone(&log));
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let begun = std::time::Instant::now();
+                        let r = one_request(addr);
+                        log.lock().unwrap().push((begun, r));
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(100));
+        let (killed_at, new) = match at {
+            KillAt::BeforeNew => {
+                drop(old);
+                let killed = std::time::Instant::now();
+                std::thread::sleep(Duration::from_millis(50));
+                (killed, serve(second, "new"))
+            }
+            KillAt::AfterNew => {
+                let new = serve(second, "new");
+                drop(old);
+                (std::time::Instant::now(), new)
+            }
+            KillAt::AfterDoor => {
+                let new = serve(second, "new");
+                std::thread::sleep(Duration::from_millis(50));
+                old.close_door();
+                drop(old);
+                (std::time::Instant::now(), new)
+            }
+            KillAt::MidDrain => {
+                let new = serve(second, "new");
+                std::thread::sleep(Duration::from_millis(50));
+                old.close_door();
+                old.drain_handle().drain(Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(20));
+                drop(old);
+                (std::time::Instant::now(), new)
+            }
+        };
+        // Run until a request begun after the kill is served, not for a fixed
+        // time: under heavy load the clients' first requests after the kill
+        // can take longer than any short window.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        std::thread::sleep(Duration::from_millis(300));
+        while std::time::Instant::now() < deadline
+            && !log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(begun, r)| *begun > killed_at && r.is_ok())
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for c in clients {
+            c.join().unwrap();
+        }
+        let log = log.lock().unwrap();
+        let refused: Vec<_> = log
+            .iter()
+            .filter_map(|(_, r)| r.as_ref().err())
+            // Refused: nobody held the socket. A reset of a connection the
+            // old server had taken when it died is an in-flight loss, which
+            // the check below allows only before the kill.
+            .filter(|e| e.starts_with("connect") && e.contains("refused"))
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "{at:?}: connections refused: {refused:?}"
+        );
+        let late: Vec<_> = log
+            .iter()
+            .filter(|(begun, r)| {
+                *begun > killed_at && r.as_ref().is_err_and(|e| !e.starts_with(HOST_TIMEOUT))
+            })
+            .collect();
+        assert!(late.is_empty(), "{at:?}: failed after the kill: {late:?}");
+        let served_after = log
+            .iter()
+            .filter(|(begun, r)| *begun > killed_at && r.is_ok())
+            .count();
+        assert!(served_after > 0, "{at:?}: nothing served after the kill");
+        let _ = new.drain(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_i9_kill_before_the_new_server_starts() {
+        kill_during_handoff(KillAt::BeforeNew);
+    }
+
+    #[test]
+    fn test_i9_kill_right_after_the_new_server_starts() {
+        kill_during_handoff(KillAt::AfterNew);
+    }
+
+    #[test]
+    fn test_i9_kill_after_the_door_closed() {
+        kill_during_handoff(KillAt::AfterDoor);
+    }
+
+    #[test]
+    fn test_i9_kill_mid_drain() {
+        kill_during_handoff(KillAt::MidDrain);
     }
 }

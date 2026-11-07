@@ -3,6 +3,6 @@
 
 pub use net_io::{
     AddrError, AllowAll, Cidr, CloseReason, ConnectionId, ControlLine, ControlState, DriverKind,
-    EventSink, Gate, Lane, NoControl, NoopSink, ProxyVersions, SimpleControl, TrustedProxies,
-    WorkerId, normalize,
+    EventSink, Gate, GateTag, Lane, NoControl, NoopSink, ProxyVersions, SimpleControl,
+    TrustedProxies, WorkerId, normalize,
 };

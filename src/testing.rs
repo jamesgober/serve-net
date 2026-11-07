@@ -479,6 +479,8 @@ pub(crate) struct SimIo {
     /// Bytes `push` accepts before reporting the output full; `None` = unlimited.
     pub(crate) budget: Option<usize>,
     pub(crate) deadline: Option<Instant>,
+    /// How many times the machine set the exchange deadline (T-40).
+    pub(crate) deadline_sets: u64,
     pub(crate) phase: Phase,
     pub(crate) draining: bool,
     pub(crate) pressure: f32,
@@ -516,6 +518,7 @@ impl SimIo {
             written: Vec::with_capacity(16 * 1024),
             budget: None,
             deadline: None,
+            deadline_sets: 0,
             phase: Phase::Idle,
             draining: false,
             pressure: 0.0,
@@ -551,6 +554,7 @@ impl Io for SimIo {
     }
     fn set_exchange_deadline(&mut self, at: Option<Instant>) {
         self.deadline = at;
+        self.deadline_sets += 1;
     }
     fn set_phase(&mut self, phase: Phase) {
         self.phase = phase;

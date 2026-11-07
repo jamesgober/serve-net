@@ -48,11 +48,11 @@ A restart hands the listening socket to the new process, and neither drops a con
 | | Linux | macOS | Windows |
 |---|---|---|---|
 | `ListenerSpec::inherited` (systemd sockets) | yes | no | no |
-| `ListenerSpec::handed_off` | yes | yes | yes, without the zero-loss promise |
+| `ListenerSpec::handed_off` | yes | yes | yes |
 
-- The promise that a restart refuses and resets nothing is tested on Linux and macOS. On Windows two
-  servers on one socket lost connections on small machines in testing, so it is not made there yet: plan
-  a Windows restart around a front end that retries.
+- The promise that a restart refuses and resets nothing is tested on all three. It needs room on the
+  new server: its own caps refuse the old server's clients like any other, so start it with the same
+  caps and workers as the old one, or more. The resets once seen on small Windows machines were that.
 - `Running::drain` waits about 3 ms before draining so that connections accepted as the door closes are
   served and not reset. With every accept thread dead it waits at most 150 ms.
 - `Running::reload` removing a listener closes that socket at once. Connections accepted in that
