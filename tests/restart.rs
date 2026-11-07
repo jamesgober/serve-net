@@ -110,7 +110,9 @@ mod restart {
     /// One request on a new connection; a whole 200, or what went wrong.
     fn one_request(addr: SocketAddr) -> Result<(), String> {
         let mut s = TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
-        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+        // Long enough for a loaded start: a request begun while the new
+        // server starts waits in the backlog until its door opens.
+        let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
         s.write_all(GET).map_err(|e| format!("write: {e}"))?;
         let mut got = Vec::new();
         match s.read_to_end(&mut got) {
@@ -139,13 +141,21 @@ mod restart {
     /// from 127.0.0.1, and in a hand-off the incoming server takes the old
     /// one's clients while it starts, so its per-source cap needs room above
     /// the load: at the default 16 it refuses at its own cap on a slow host,
-    /// which looks like a hand-off reset (D-100).
+    /// which looks like a hand-off reset. The blocking pool is 64 threads, not
+    /// 256: on a starved core 300 threads took 11 s to start, longer than the
+    /// clients waited in the backlog (D-100).
     fn serve(handle: net_io::ListenerHandle, who: &'static str) -> serve_net::Running {
         let room = net_io::Limits::builder()
             .max_per_source(64, net_io::PrefixPolicy::DEFAULT)
             .build()
             .unwrap();
+        let workers = if cfg!(serve_net_blocking_tests) {
+            serve_net::Workers::blocking(64)
+        } else {
+            serve_net::Workers::auto()
+        };
         Server::builder()
+            .workers(workers)
             .listener(ListenerSpec::handed_off("web", handle).transport_limits(room))
             .serve(serve_net::handler(move |_req, reply| {
                 reply.text(200, who);
@@ -312,37 +322,21 @@ mod restart {
     }
 
     #[test]
-    #[cfg_attr(
-        all(windows, serve_net_blocking_tests),
-        ignore = "net-io: a kill on the Windows blocking pool can hang or time out a request begun after it (dev/ROADMAP.md)"
-    )]
     fn test_i9_kill_before_the_new_server_starts() {
         kill_during_handoff(KillAt::BeforeNew);
     }
 
     #[test]
-    #[cfg_attr(
-        all(windows, serve_net_blocking_tests),
-        ignore = "net-io: a kill on the Windows blocking pool can hang or time out a request begun after it (dev/ROADMAP.md)"
-    )]
     fn test_i9_kill_right_after_the_new_server_starts() {
         kill_during_handoff(KillAt::AfterNew);
     }
 
     #[test]
-    #[cfg_attr(
-        all(windows, serve_net_blocking_tests),
-        ignore = "net-io: a kill on the Windows blocking pool can hang or time out a request begun after it (dev/ROADMAP.md)"
-    )]
     fn test_i9_kill_after_the_door_closed() {
         kill_during_handoff(KillAt::AfterDoor);
     }
 
     #[test]
-    #[cfg_attr(
-        all(windows, serve_net_blocking_tests),
-        ignore = "net-io: a kill on the Windows blocking pool can hang or time out a request begun after it (dev/ROADMAP.md)"
-    )]
     fn test_i9_kill_mid_drain() {
         kill_during_handoff(KillAt::MidDrain);
     }
