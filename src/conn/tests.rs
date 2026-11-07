@@ -784,6 +784,9 @@ fn test_capacity_refusal_without_read() {
     let text = String::from_utf8_lossy(&io.written).into_owned();
     assert!(text.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
     assert!(text.contains("retry-after: 1"));
+    // Not idle: net-io closes an idle connection without its linger, and the
+    // request still on its way then draws a reset that can destroy the 503.
+    assert_eq!(io.phase, Phase::Sending);
 }
 
 #[test]

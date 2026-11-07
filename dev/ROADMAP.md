@@ -142,6 +142,7 @@ Exit: zero open findings; the 24 h soak clean (NFR-18); `docs/SECURITY.md` writt
 - [x] The adversarial review (0.7): seven findings, each fixed with a test that fails without it. Three affected released versions and shipped in 0.6.3 (D-088, GHSA-jcp7-qqq6-xw24); V-24 and the `AnyLocalPeer` warning (D-089); a reload's limit for streamed bodies (D-090); a time bound per WebSocket message (D-091).
 - [x] `docs/SECURITY.md` (the security model, defaults, a deployment checklist, what is not defended, testing, advisories) and a root `SECURITY.md` (reporting and supported versions).
 - [x] Every fuzz target running with an out-of-repo corpus (CI's fuzz smoke, `RUNNER_TEMP`); every threat with its attack test except T-19, which waits for FastCGI; loom models complete; the leak test; kill-at-every-step restart testing (idea I-9); an adversarial review with every finding fixed test-first.
+- 0.7.1 (D-102): the busy refusal at the soft cap closed without the linger and drew a reset (Windows: an aborted connection instead of the 503); found by main CI after 0.7.0, fixed with a test that fails without it.
 
 ## v0.8.0 - Alpha
 Exit: a production site served for two weeks without a serve-net defect; `docs/ARCHITECTURE.md` draft; no API change needed by the first real wrapper that is not already made.
