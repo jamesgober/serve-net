@@ -148,6 +148,8 @@ Exit: zero open findings; the 24 h soak clean (NFR-18); `docs/SECURITY.md` writt
 Exit: a production site served for two weeks without a serve-net defect; `docs/ARCHITECTURE.md` draft; no API change needed by the first real wrapper that is not already made.
 - Moved from 0.7 (D-097). When fcgi-net is published: FastCGI on Linux and macOS first (`fastcgi`, `FastCgiListen`, `FastCgiIngress`, `Ingress::FastCgi`, `engine::FastCgi`, `ListenerSpec::fastcgi_descriptor_zero`, T-19, the `fastcgi_mapping` fuzz target, the T-19 attack test, `mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0). Windows waits for the decision on a Windows FastCGI deployment.
 - A real application wrapper built on serve-net's hooks; a custom-family prototype for a database wire protocol.
+- [x] ws-net 0.8 and tls-net 0.6 (D-104); ws-net's buffers wiped under a wiping profile.
+- [x] WebSocket upgrades same-origin by default (D-103, T-41): `WebSocketTarget::origins`, `RefusalKind::CrossOrigin`, `Family::upgrade_allowed`.
 - Adopt net-io 0.8: the drain grace for a connection that has not sent its first byte (its D-189, `Limits::first_request_grace`), `Session::on_drain`, `ListenerSpec::workers`, and the linger after a reply sent while idle (its D-192), which makes D-102's `set_phase(Sending)` redundant; keep it (harmless) unless the tests show a reason. Rerun `tests/restart.rs` and the soft-cap loopback test on it.
 
 ## v0.9.0 - Beta
@@ -188,7 +190,7 @@ Exit: every item in the register below is closed or carried into `docs/STABILITY
 | Closed in 0.7 (D-100): T-30 on Windows. net-io traced the lost requests to the new server refusing at its own caps (the per-source cap of 16 on the blocking driver) while it took over the old server's clients on a slow host; two servers on one socket in one process are supported | CI, 0.4 and 0.5; known issue in the 0.5.0 release notes | `tests/restart.rs` runs on every system with per-source room of 64; `docs/DEPLOYMENT.md` says to start the new server with the old one's caps or more |
 | `dedicated_workers` on the reactor keeps connection seats, not workers: a flood on another profile still shares the dedicated profile's worker threads | D-074, 0.5 | a worker set per profile from net-io (asked), or document the seat as the guarantee |
 | Closed in 0.7 (D-092): a WebSocket service sends from any thread through `WsSender`, and a drain through `Running::drain` or `DrainHandle` closes open sockets with 1001; a drain started only on the owner's control line still closes a quiet socket without one | D-079 | decide at the 0.9 review whether the owner's line needs a notice hook |
-| ws-net keeps message and input buffers that a wiping profile does not zero | D-079 | ws-net to offer a wipe (asked); until then document it next to `wipe_buffers` |
+| Closed in 0.8 (D-104): ws-net kept message and input buffers that a wiping profile did not zero; ws-net's `Connection::wipe` now runs when an upgraded connection ends | D-079 | done |
 | A gate denial of the 101 closes the connection instead of answering 403 | D-079 | mark the 101 as a reply start (`begin_reply`) and give the upgraded state the HTTP refusal until the 101 leaves |
 | `UpgradeTarget::Custom` from the locked text is not built | D-079 | build it with the first custom family that upgrades, or drop it from the API |
 | WebSocket idle memory and per-message cost are estimates | D-079 | measure in the 0.6 performance pass beside the 10,000 idle test |

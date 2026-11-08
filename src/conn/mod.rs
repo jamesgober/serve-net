@@ -1062,6 +1062,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let compiled = tables.profiles.compiled(self.env.profile);
         // Everything that borrows the engine's head happens in this block, so
         // the borrow ends before any refusal is written.
+        let mut upgrade_refused = None;
         let viewed = {
             let listener = tables.listeners.get(self.listener).and_then(Option::as_ref);
             let cx = HeadContext {
@@ -1090,6 +1091,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                         shared.observer.request_head(&self.env);
                         let action = shared.service.head(&head, &mut self.env);
                         self.env.lane_open = false;
+                        // An upgrade is judged on the head view, where the
+                        // trusted authority is known (a WebSocket origin).
+                        if let HeadAction::Upgrade(ref target) = action {
+                            upgrade_refused = shared.family.upgrade_allowed(&head, target).err();
+                        }
                         Ok(action)
                     }
                 }),
@@ -1129,6 +1135,16 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             HeadAction::Proceed => default_policy,
             HeadAction::ProceedWith(p) => p,
             HeadAction::Upgrade(target) => {
+                if let Some(e) = upgrade_refused {
+                    self.end = Some(EndReason::Refused);
+                    return Some(self.refuse(
+                        io,
+                        e.kind,
+                        e.status,
+                        None,
+                        RequestEnd::Refused(e.kind),
+                    ));
+                }
                 // The upgrade request carries no body: a declared one is 413.
                 self.upgrade = Some(Box::new(target));
                 BodyPolicy::Buffer { max: 0 }

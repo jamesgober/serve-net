@@ -1181,7 +1181,7 @@ impl Profile {
 
 The answer to "connections on this listener use this engine, this lane, this budget, these limits". A single-service program has one profile (created with defaults if none is added), or two (a public and an admin listener with a smaller budget, a more important lane, and `critical(true)`).
 
-`wipe_buffers` zeroes the used part of every serve-net buffer when it returns to a pool and turns on http-net's request wipe, so credentials in one request never linger into another; it matches net-io's own default. Cost about 50-100 ns per 2 KiB [est.]; turn it off only for traffic that never carries secrets. P0, Tier 2, `0.3.0`.
+`wipe_buffers` zeroes the used part of every serve-net buffer when it returns to a pool and turns on http-net's request wipe, so credentials in one request never linger into another; since 0.8.0 it also zeroes ws-net's input, message, and output buffers when an upgraded connection ends; it matches net-io's own default. Cost about 50-100 ns per 2 KiB [est.]; turn it off only for traffic that never carries secrets. P0, Tier 2, `0.3.0`.
 
 ```rust
 use serve_net::{Budget, Lane, Limits, Profile, ProfileId};
@@ -1659,7 +1659,7 @@ impl UpgradedConn {
 // feature ws
 #[derive(Clone)]
 #[must_use]
-pub struct WebSocketTarget { /* the service, budgets, subprotocol, pacing */ }
+pub struct WebSocketTarget { /* the service, budgets, subprotocol, pacing, origin policy */ }
 impl WebSocketTarget {
     pub fn new<S: WebSocketService>(service: S) -> Self;          // 64 KiB frames, 1 MiB messages, ping after 30 s
     pub fn shared(service: Arc<dyn WebSocketService>) -> Self;    // one reference count per upgrade
@@ -1669,6 +1669,7 @@ impl WebSocketTarget {
     pub fn max_pending_output(self, bytes: usize) -> Self;
     pub fn ping_interval(self, interval: Duration) -> Self;       // at least 1 s
     pub fn message_timeout(self, timeout: Duration) -> Self;      // 0.7.0: first byte to last, at least 1 s, 30 s by default; past it 1008
+    pub fn origins(self, policy: ws_net::OriginPolicy) -> Self;   // 0.8.0: same-origin by default; a disallowed Origin is 403
 }
 
 pub trait WebSocketService: Send + Sync + 'static {
@@ -1705,7 +1706,7 @@ pub enum WsSendError { Full, Closed, Invalid }
 
 `WsSender` (0.7.0) sends from any thread: messages wait in a queue bounded by the connection's output budget and are written by the connection's worker, in order, after what the service sent from its own calls. A full queue refuses with `Full`, a closed connection with `Closed`. Each message is copied once into the queue. A drain through `Running::drain` or `DrainHandle` wakes every open WebSocket, which closes with 1001 before net-io closes idle connections (the drain waits at most 250 ms for those goodbyes); a drain started only on the owner's own control line closes a quiet socket without one.
 
-`head` returns `HeadAction::Upgrade(target)`. The upgrade request then goes through admission and the checkpoints like any request (a declared body is refused with 413). serve-net checks the handshake through ws-net (`ServerHandshake::from_request`: method, version 13, the key, `Host`, `Origin`, the offered subprotocols) and answers an invalid one with 400 before anything else is written. An upgrade the client never offered, or a subprotocol it did not offer, is a service bug: 500, reported through `Observer::service_error`. Otherwise http-net writes the 101 with `sec-websocket-accept`, the upgrade request ends (`done` with `RequestEnd::Upgraded`, its admission released), `HttpService::upgraded` runs, the HTTP engine's buffers are released, and the bytes that arrived after the request go to ws-net, never to the HTTP parser (T-21). `Upgrade: h2c` never reaches this path: it is not an upgrade offer, and the request is served as HTTP/1.1. A 2xx to `CONNECT` is refused unless a profile allows tunnels (after `1.0.0`).
+`head` returns `HeadAction::Upgrade(target)`. The upgrade request then goes through admission and the checkpoints like any request (a declared body is refused with 413). serve-net checks the handshake through ws-net (`ServerHandshake::from_request`: method, version 13, the key, `Host`, the form of `Origin`, the offered subprotocols) and answers an invalid one with 400 before anything else is written. Before admission, the target's origin policy (0.8.0, `WebSocketTarget::origins`, ws-net's `OriginPolicy`) judges the page that asked: by default its `Origin` must name the request's authority (the trusted proxy's with `trust_host` on, else the `Host` field), and a request with no `Origin` (not a browser) is accepted. A disallowed page is answered 403 (`RefusalKind::CrossOrigin`) and nothing is switched; more than one `Origin` field is 400. A browser sends its cookies with an upgrade from any site, so this is the defence against cross-site WebSocket hijacking (T-41). Cost: one scan of the head's fields and two small parses per upgrade, about 100 ns [est.]; no allocation for the default, and an allowlist is shared by every clone of its target. An upgrade the client never offered, or a subprotocol it did not offer, is a service bug: 500, reported through `Observer::service_error`. Otherwise http-net writes the 101 with `sec-websocket-accept`, the upgrade request ends (`done` with `RequestEnd::Upgraded`, its admission released), `HttpService::upgraded` runs, the HTTP engine's buffers are released, and the bytes that arrived after the request go to ws-net, never to the HTTP parser (T-21). `Upgrade: h2c` never reaches this path: it is not an upgrade offer, and the request is served as HTTP/1.1. A 2xx to `CONNECT` is refused unless a profile allows tunnels (after `1.0.0`).
 
 After the switch the target's `WebSocketService` is called on the worker: `opened` once, `message` once per complete message (text validated as UTF-8, fragments joined), `closed` exactly once. Before each message the connection passes the checks a request passes before its service call: the control line (draining or stopping closes with 1001, lockdown or a shed lane with 1013) and `Checkpoint` at `BeforeDispatch` (a denial closes with 1008, a kill aborts), so a session revoked while the socket is open stops at the next message. A protocol violation closes with ws-net's code (1002, 1007, 1009); a caught panic (`catch_service_panics`) with 1011. Pings are answered by ws-net. A connection quiet for `ping_interval` is pinged, and one that sends nothing for another interval is closed. A close handshake the service starts waits 5 s for the client's Close.
 
@@ -2503,7 +2504,7 @@ pub struct Refusal { pub kind: RefusalKind, pub status: u16, pub retry_after: Op
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RefusalKind { Malformed, TooLarge, HeadTimeout, BodyTimeout, ReplyTimeout, Busy, Draining, Denied, Ingress, Internal }
+pub enum RefusalKind { Malformed, TooLarge, HeadTimeout, BodyTimeout, ReplyTimeout, Busy, Draining, Denied, Ingress, Service, Internal, CrossOrigin }  // CrossOrigin 0.8.0
 impl RefusalKind { pub const fn as_str(self) -> &'static str; }
 ```
 
@@ -2549,6 +2550,8 @@ pub trait Family: Send + Sync + 'static {
         unix_secs: u64, out: &mut OutBuf) -> Result<u16, EngineError>;  // default: 500
     fn next_stream_part(&self, parts: &mut Self::Parts, wipe: bool);
     fn detach(&self, request: &Self::Request<'_>) -> Option<Box<dyn DetachedRequest<Self>>> where Self: Sized { None }
+    fn upgrade_allowed(&self, head: &Self::Head<'_>, target: &UpgradeTarget)
+        -> Result<(), EngineError> { Ok(()) }                          // 0.8.0: judged on the head view before admission; Err is the refusal
     fn upgrade(&self, engine: &mut Self::Engine, target: &UpgradeTarget, unix_secs: u64, out: &mut OutBuf)
         -> Result<(), EngineError>;                                     // check the handshake, write the switch; default: 500
 }

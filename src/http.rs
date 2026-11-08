@@ -888,6 +888,18 @@ impl Family for HttpFamily {
         encode(engine, parts, false, unix_secs, out).map(|(status, _)| status)
     }
 
+    fn upgrade_allowed(
+        &self,
+        head: &HttpHead<'_>,
+        target: &UpgradeTarget,
+    ) -> Result<(), EngineError> {
+        let _ = &head;
+        match *target {
+            #[cfg(feature = "ws")]
+            UpgradeTarget::WebSocket(ref t) => crate::ws::origin_allowed(head, t),
+        }
+    }
+
     fn upgrade(
         &self,
         engine: &mut Http1,

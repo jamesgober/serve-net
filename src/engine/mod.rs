@@ -138,6 +138,9 @@ pub enum RefusalKind {
     Service,
     /// A service bug (an invalid reply, a dropped token, a panic).
     Internal,
+    /// An upgrade from a web page the target's origin policy does not allow
+    /// (cross-site WebSocket hijacking).
+    CrossOrigin,
 }
 
 impl RefusalKind {
@@ -156,6 +159,7 @@ impl RefusalKind {
             RefusalKind::Ingress => "ingress",
             RefusalKind::Service => "service",
             RefusalKind::Internal => "internal",
+            RefusalKind::CrossOrigin => "cross_origin",
         }
     }
 }
@@ -386,6 +390,18 @@ pub trait Family: Send + Sync + 'static {
     {
         let _ = request;
         None
+    }
+    /// Whether an upgrade the service asked for in `head` may go ahead,
+    /// judged on the head view (where the trusted authority is known),
+    /// before admission. An `Err` is written as the refusal and the
+    /// connection closes; nothing is switched. The default allows it.
+    fn upgrade_allowed(
+        &self,
+        head: &Self::Head<'_>,
+        target: &UpgradeTarget,
+    ) -> Result<(), EngineError> {
+        let _ = (head, target);
+        Ok(())
     }
     /// Checks the handshake of an upgrade the service asked for and writes
     /// the switch response. After it the engine reports

@@ -11,6 +11,31 @@
 
 ## [Unreleased]
 
+### Added
+
+- `WebSocketTarget::origins`: which web pages may open a WebSocket, checked
+  before admission. Same-origin by default; a page on another origin is
+  answered 403 (`RefusalKind::CrossOrigin`), so a browser's cookies no longer
+  let another site's page talk to a WebSocket service as its visitor
+  (cross-site WebSocket hijacking). The page is compared with the request's
+  authority as serve-net resolves it, the trusted proxy's with `trust_host`
+  on. A request with no `Origin` (not a browser) is accepted.
+- `Family::upgrade_allowed`, a provided method that judges an upgrade on the
+  head view; the default allows it.
+
+### Changed
+
+- ws-net 0.8 (from 0.2): its fixes since 0.2 reach serve-net's WebSocket
+  connections, among them an allocation failure answered with 1011 instead of
+  aborting the process. `ws_net` types are part of serve-net's API, so code
+  that names them moves to ws-net 0.8 too.
+- The TLS tests use tls-net 0.6.
+
+### Fixed
+
+- A wiping profile now zeroes ws-net's own input, message, and output
+  buffers when an upgraded connection ends, not only serve-net's copies.
+
 ---
 
 ## [0.7.1] - 2026-11-07

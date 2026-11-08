@@ -316,8 +316,8 @@ impl fmt::Debug for WebSocketConn<'_> {
     }
 }
 
-/// Where a WebSocket upgrade goes: the service, ws-net's budgets, and the
-/// subprotocol.
+/// Where a WebSocket upgrade goes: the service, ws-net's budgets, the
+/// subprotocol, and which web pages may connect.
 #[derive(Clone)]
 #[must_use]
 pub struct WebSocketTarget {
@@ -328,11 +328,14 @@ pub struct WebSocketTarget {
     pub(crate) max_pending: Option<usize>,
     pub(crate) ping_interval: Duration,
     pub(crate) message_timeout: Duration,
+    /// `None` is the same-origin rule, which costs no allocation.
+    pub(crate) origins: Option<Arc<ws_net::OriginPolicy>>,
 }
 
 impl WebSocketTarget {
     /// A target for `service`, with 64 KiB frames, 1 MiB messages, no
-    /// subprotocol, the connection's profile, and a ping after 30 s of quiet.
+    /// subprotocol, the connection's profile, a ping after 30 s of quiet, and
+    /// the same-origin rule.
     pub fn new<S: WebSocketService>(service: S) -> Self {
         Self::shared(Arc::new(service))
     }
@@ -350,6 +353,7 @@ impl WebSocketTarget {
             max_pending: None,
             ping_interval: DEFAULT_PING_INTERVAL,
             message_timeout: DEFAULT_MESSAGE_TIMEOUT,
+            origins: None,
         }
     }
 
@@ -398,6 +402,29 @@ impl WebSocketTarget {
         self.message_timeout = timeout.max(Duration::from_secs(1));
         self
     }
+
+    /// Which web pages may open the connection, checked against the
+    /// request's `Origin` before the 101; one that may not is answered 403
+    /// (`RefusalKind::CrossOrigin`) and nothing is switched. A browser sends
+    /// its cookies and HTTP credentials with an upgrade from any site, so
+    /// without this check any page could talk to the service as its visitor
+    /// (cross-site WebSocket hijacking).
+    ///
+    /// The default is [`ws_net::OriginPolicy::same_origin`]: the page's host
+    /// and port must be the request's authority (the trusted proxy's with
+    /// `trust_host` on, else the `Host` field), and a request with no
+    /// `Origin` (not a browser) is accepted. Use
+    /// [`OriginPolicy::allow`](ws_net::OriginPolicy::allow) for pages on
+    /// other origins, and [`any_origin`](ws_net::OriginPolicy::any_origin)
+    /// only for an endpoint that uses no ambient credentials.
+    ///
+    /// The policy is shared by every clone of the target: build the target
+    /// once and clone it per upgrade to keep an allowlist free of
+    /// allocation.
+    pub fn origins(mut self, policy: ws_net::OriginPolicy) -> Self {
+        self.origins = Some(Arc::new(policy));
+        self
+    }
 }
 
 impl fmt::Debug for WebSocketTarget {
@@ -408,6 +435,7 @@ impl fmt::Debug for WebSocketTarget {
             .field("profile", &self.profile)
             .field("max_pending", &self.max_pending)
             .field("ping_interval", &self.ping_interval)
+            .field("origins", &self.origins)
             .finish_non_exhaustive()
     }
 }
@@ -501,6 +529,55 @@ impl WsLink {
             self.text = String::new();
         }
     }
+
+    /// Lets go of the connection's buffers when it ends: the message copies,
+    /// the backlog, and, under a wiping profile, ws-net's own input, message,
+    /// and output buffers, each zeroed first.
+    pub(crate) fn release(&mut self, wipe: bool) {
+        self.clear_message(wipe, 0);
+        if wipe {
+            crate::engine::wipe_bytes(&mut self.backlog);
+            self.conn.wipe();
+        }
+    }
+}
+
+/// Whether the target's origin policy lets this page connect: the head's
+/// `Origin` against its authority. More than one `Origin` field is 400, as
+/// ws-net's handshake check would answer; a disallowed one is 403.
+pub(crate) fn origin_allowed(
+    head: &crate::http::HttpHead<'_>,
+    target: &WebSocketTarget,
+) -> Result<(), EngineError> {
+    let mut origins = head
+        .headers()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("origin"));
+    let origin = match (origins.next(), origins.next()) {
+        (None, _) => None,
+        (Some((_, v)), None) => Some(core::str::from_utf8(v).map_err(|_| EngineError {
+            kind: RefusalKind::Malformed,
+            status: 400,
+        })?),
+        (Some(_), Some(_)) => {
+            return Err(EngineError {
+                kind: RefusalKind::Malformed,
+                status: 400,
+            });
+        }
+    };
+    let host = head.authority().unwrap_or("");
+    let permits = match &target.origins {
+        None => ws_net::OriginPolicy::same_origin().permits(origin, host),
+        Some(policy) => policy.permits(origin, host),
+    };
+    if permits {
+        Ok(())
+    } else {
+        Err(EngineError {
+            kind: RefusalKind::CrossOrigin,
+            status: 403,
+        })
+    }
 }
 
 /// Checks the handshake and writes the 101 through http-net, so the HTTP
@@ -558,4 +635,56 @@ pub(crate) fn switch_http1(
         return Err(internal);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::ConnectionId;
+    use crate::reply::{PostFail, Waker};
+
+    struct Quiet;
+    impl WebSocketService for Quiet {
+        fn message(&self, _e: &Envelope, _m: WsMessage<'_>, _c: &mut WebSocketConn<'_>) {}
+    }
+    impl Waker for Quiet {
+        fn post(&self, _c: ConnectionId, _t: u32, _v: u64) -> Result<(), PostFail> {
+            Ok(())
+        }
+    }
+
+    fn link() -> WsLink {
+        let target = WebSocketTarget::new(Quiet);
+        let outbox = Arc::new(Outbox::new(
+            Arc::new(Quiet),
+            ConnectionId::new(1).unwrap(),
+            1 << 16,
+        ));
+        let mut link = WsLink::new(&target, 1 << 16, Instant::now(), outbox);
+        // A masked binary frame of three bytes, read in, and a send queued.
+        let _ = link
+            .conn
+            .feed(&[0x82, 0x83, 1, 2, 3, 4, 7 ^ 1, 7 ^ 2, 7 ^ 3]);
+        assert!(matches!(link.conn.poll(), Ok(ws_net::Event::Binary(_))));
+        link.conn.send_text("secret").unwrap();
+        link
+    }
+
+    #[test]
+    fn test_release_wipes_ws_net_buffers_under_a_wiping_profile() {
+        let mut link = link();
+        assert!(!link.conn.output().is_empty());
+        link.release(true);
+        // ws-net's wipe empties its output and ends the connection.
+        assert!(link.conn.output().is_empty());
+        assert_eq!(link.conn.state(), ws_net::State::Closed);
+    }
+
+    #[test]
+    fn test_release_without_wipe_leaves_ws_net_alone() {
+        let mut link = link();
+        link.release(false);
+        assert!(!link.conn.output().is_empty());
+        assert_eq!(link.conn.state(), ws_net::State::Open);
+    }
 }

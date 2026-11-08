@@ -33,7 +33,10 @@ its test, and its cost) and the build-time validation rules (V-1 to V-26) are in
 - **Refusals say nothing.** A refusal is a fixed short body for its status, with no `Server` field and
   no byte of the request in it, and it closes the connection after a lingering close.
 - **Buffers are wiped.** A profile zeroes request and reply bytes when they are released
-  (`wipe_buffers`, on by default). WebSocket buffers held by ws-net are not yet covered.
+  (`wipe_buffers`, on by default), WebSocket buffers held by ws-net included (since 0.8.0).
+- **WebSocket upgrades are same-origin.** A page on another site is answered 403 before the 101
+  (`WebSocketTarget::origins`, since 0.8.0), so a browser's cookies cannot carry another site's page
+  into the service (cross-site WebSocket hijacking).
 - **TLS protocols are matched.** A connection whose ALPN result names a protocol its profile has no
   engine for is closed before any byte reaches an engine.
 
@@ -48,7 +51,9 @@ its test, and its cost) and the build-time validation rules (V-1 to V-26) are in
    hard cap are reset rather than answered 503.
 5. Offer only `http/1.1` in your TLS acceptor's ALPN list until the HTTP/2 engine exists.
 6. Leave `wipe_buffers` on unless a measured cost says otherwise.
-7. Watch `Observer::connection_ended` and the transport counters for refusals, timeouts, and slow
+7. Give a WebSocket target an `OriginPolicy::allow` list when its pages live on another origin, and use
+   `any_origin` only for an endpoint that takes no cookies or HTTP credentials.
+8. Watch `Observer::connection_ended` and the transport counters for refusals, timeouts, and slow
    peers: they are the signal that a defence is working or a limit is too tight.
 
 ## What serve-net does not defend

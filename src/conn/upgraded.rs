@@ -221,10 +221,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         if link.opened {
             link.service.closed(&self.env, link.code);
         }
-        link.clear_message(self.wipe, 0);
-        if self.wipe {
-            crate::engine::wipe_bytes(&mut link.backlog);
-        }
+        link.release(self.wipe);
     }
 
     fn ws_drive<I: Io>(&mut self, io: &mut I, link: &mut WsLink, input: &[u8]) -> (usize, Step) {
