@@ -906,6 +906,19 @@ fn test_loopback_transport_limits_reach_net_io() {
     }
 }
 
+/// Waits until the server has taken `bytes` from its clients, so a manual
+/// clock moved afterwards moves past times the connection already holds: its
+/// accept time and its first bytes. Moving it earlier on a slow machine moves
+/// the accept itself into the future, and the deadline with it.
+#[cfg(not(target_os = "linux"))]
+fn wait_for_bytes_in(server: &serve_net::Running, bytes: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while server.stats().bytes_in < bytes && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(server.stats().bytes_in >= bytes, "{:?}", server.stats());
+}
+
 // A worker blocked in a read learns of a manual clock when woken, which needs
 // net-io's wait before each receive: Windows and macOS. Linux receives block
 // under SO_RCVTIMEO.
@@ -929,9 +942,9 @@ fn test_loopback_a_slow_body_is_answered_by_the_request_deadline() {
         }))
         .unwrap();
     let mut c = connect(server.local_addr().unwrap());
-    c.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(100));
+    let sent = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc";
+    c.write_all(sent).unwrap();
+    wait_for_bytes_in(&server, sent.len() as u64);
     // Longer than net-io's default read timeout, shorter than the deadline.
     clock.advance(Duration::from_secs(60));
     server.server_handle().wake_all();
@@ -1001,7 +1014,7 @@ fn test_loopback_manual_clock_drives_the_head_deadline() {
         .unwrap();
     let mut c = connect(server.local_addr().unwrap());
     c.write_all(b"GET / HT").unwrap();
-    std::thread::sleep(Duration::from_millis(100));
+    wait_for_bytes_in(&server, 8);
     // No real time passes; the clock says the deadline did.
     clock.advance(Duration::from_secs(6));
     // A worker blocked in a read learns of it when woken. A wake can land
