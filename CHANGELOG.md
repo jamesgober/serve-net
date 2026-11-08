@@ -25,10 +25,11 @@
 
 ### Changed
 
-- ws-net 0.8 (from 0.2): its fixes since 0.2 reach serve-net's WebSocket
+- ws-net 0.9 (from 0.2): its fixes since 0.2 reach serve-net's WebSocket
   connections, among them an allocation failure answered with 1011 instead of
-  aborting the process. `ws_net` types are part of serve-net's API, so code
-  that names them moves to ws-net 0.8 too.
+  aborting the process, and a 5 s close timeout armed from the start.
+  `ws_net` types are part of serve-net's API, so code that names them moves
+  to ws-net 0.9 too.
 - The TLS tests use tls-net 0.6.
 
 ### Fixed
