@@ -692,6 +692,63 @@ fn test_ws_sender_queue_is_bounded() {
     assert!(full, "the queue never filled");
 }
 
+/// A gate that denies every write.
+struct DenyAll;
+
+impl serve_net::Gate for DenyAll {
+    type Ticket = ();
+    fn admit(
+        &self,
+        _info: &serve_net::net_io::ConnectionInfo,
+        _stage: serve_net::net_io::AdmitStage,
+    ) -> Result<serve_net::net_io::Admitted<()>, serve_net::net_io::Refusal> {
+        Ok(serve_net::net_io::Admitted {
+            lane: serve_net::Lane(0),
+            ticket: (),
+            tag: serve_net::GateTag(0),
+        })
+    }
+    fn readmit(
+        &self,
+        _ticket: &mut (),
+        _info: &serve_net::net_io::ConnectionInfo,
+    ) -> Result<(), serve_net::net_io::Refusal> {
+        Ok(())
+    }
+    fn check(
+        &self,
+        _ticket: &mut (),
+        _write: &serve_net::net_io::WriteCheck,
+    ) -> Result<(), serve_net::net_io::Denial> {
+        Err(serve_net::net_io::Denial { code: 403 })
+    }
+}
+
+#[test]
+fn test_ws_gate_denial_of_the_101_answers_403() {
+    // D-105: the 101 is a reply like any other until it leaves. A denied one
+    // is answered with the gate's status, and nothing is switched or opened.
+    let seen = Arc::new(Seen::default());
+    let app = App {
+        seen: Arc::clone(&seen),
+        echo: Arc::new(Echo(Arc::clone(&seen))),
+    };
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .gate(DenyAll)
+        .serve(app)
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    match Client::open(addr, "/ws", &[], b"") {
+        Err(head) => assert!(head.starts_with("HTTP/1.1 403"), "{head}"),
+        Ok((head, _)) => panic!("switched: {head}"),
+    }
+    let _ = server.drain(Duration::from_secs(2));
+    assert_eq!(seen.upgraded.load(Ordering::SeqCst), 0);
+    assert_eq!(seen.opened.load(Ordering::SeqCst), 0);
+    assert_eq!(*seen.ends.lock().unwrap(), vec![RequestEnd::Denied]);
+}
+
 /// The origin policy (D-103): which web pages may open a WebSocket.
 mod origins {
     use std::sync::Arc;

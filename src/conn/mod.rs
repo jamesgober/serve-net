@@ -702,8 +702,10 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     /// refusal for `status` replaces it, and the connection closes (net-io
     /// closes it with `EgressDenied`).
     pub(crate) fn on_denied(&mut self, status: u16, worker: WorkerId) -> &[u8] {
-        if self.state == State::Upgraded {
-            // Another protocol: no HTTP refusal fits; net-io closes it.
+        if self.state == State::Upgraded && self.request.is_none() {
+            // The 101 left: another protocol, no HTTP refusal fits; net-io
+            // closes it. Before then the upgrade request still waits for
+            // its answer, and the refusal below replaces the 101.
             self.end = Some(EndReason::Denied);
             self.state = State::Closed;
             return &[];

@@ -150,6 +150,7 @@ Exit: a production site served for two weeks without a serve-net defect; `docs/A
 - A real application wrapper built on serve-net's hooks; a custom-family prototype for a database wire protocol.
 - [x] ws-net 0.8 and tls-net 0.6 (D-104); ws-net's buffers wiped under a wiping profile.
 - [x] WebSocket upgrades same-origin by default (D-103, T-41): `WebSocketTarget::origins`, `RefusalKind::CrossOrigin`, `Family::upgrade_allowed`.
+- [x] A gate denial of the 101 is answered with its status; the switch waits for the 101 to leave (D-105).
 - Adopt net-io 0.8: the drain grace for a connection that has not sent its first byte (its D-189, `Limits::first_request_grace`), `Session::on_drain`, `ListenerSpec::workers`, and the linger after a reply sent while idle (its D-192), which makes D-102's `set_phase(Sending)` redundant; keep it (harmless) unless the tests show a reason. Rerun `tests/restart.rs` and the soft-cap loopback test on it.
 
 ## v0.9.0 - Beta
@@ -191,7 +192,7 @@ Exit: every item in the register below is closed or carried into `docs/STABILITY
 | `dedicated_workers` on the reactor keeps connection seats, not workers: a flood on another profile still shares the dedicated profile's worker threads | D-074, 0.5 | a worker set per profile from net-io (asked), or document the seat as the guarantee |
 | Closed in 0.7 (D-092): a WebSocket service sends from any thread through `WsSender`, and a drain through `Running::drain` or `DrainHandle` closes open sockets with 1001; a drain started only on the owner's control line still closes a quiet socket without one | D-079 | decide at the 0.9 review whether the owner's line needs a notice hook |
 | Closed in 0.8 (D-104): ws-net kept message and input buffers that a wiping profile did not zero; ws-net's `Connection::wipe` now runs when an upgraded connection ends | D-079 | done |
-| A gate denial of the 101 closes the connection instead of answering 403 | D-079 | mark the 101 as a reply start (`begin_reply`) and give the upgraded state the HTTP refusal until the 101 leaves |
+| Closed in 0.8 (D-105): a gate denial of the 101 closed the connection instead of answering 403; the 101 is a reply start, and the switch happens only after it left | D-079 | done |
 | `UpgradeTarget::Custom` from the locked text is not built | D-079 | build it with the first custom family that upgrades, or drop it from the API |
 | WebSocket idle memory and per-message cost are estimates | D-079 | measure in the 0.6 performance pass beside the 10,000 idle test |
 | A drain settles accepts by watching counters (at most 150 ms), and a listener removed by reload can reset connections in the accept window | D-072 | drop the workaround when net-io fixes the race; reported to net-io |

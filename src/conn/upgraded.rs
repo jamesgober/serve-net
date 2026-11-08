@@ -118,6 +118,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             r.status = Some(101);
             r.bytes_out += self.out.len() as u64;
         }
+        // The 101 is a reply: a gate may still deny it until its first byte
+        // leaves, and the HTTP refusal then goes out in its place.
+        io.begin_reply();
         // The engine switched; what followed the request is the new protocol's.
         let _ = self.engine.poll();
         let outbox = Arc::new(crate::ws::Outbox::new(
@@ -225,7 +228,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     }
 
     fn ws_drive<I: Io>(&mut self, io: &mut I, link: &mut WsLink, input: &[u8]) -> (usize, Step) {
-        // The 101 first, then the upgrade request is done.
+        // The 101 first. The upgrade request is done, and the service hears
+        // of the switch, only once the 101 has left past the gate: a denial
+        // before then is answered as HTTP and nothing is opened.
         while self.out_sent < self.out.len() {
             let n = io.push(&self.out.as_slice()[self.out_sent..]);
             if n == 0 {
@@ -239,6 +244,10 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             self.out.clear(self.wipe);
             self.out.shrink(0);
             self.out_sent = 0;
+            if self.request.is_some() {
+                io.set_phase(Phase::Sending);
+                return (0, Step::Write);
+            }
         }
         if self.request.is_some() {
             self.finish_request(RequestEnd::Upgraded);

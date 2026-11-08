@@ -35,6 +35,11 @@
 
 - A wiping profile now zeroes ws-net's own input, message, and output
   buffers when an upgraded connection ends, not only serve-net's copies.
+- A gate that denied the 101 of a WebSocket upgrade closed the connection
+  with nothing written, after the service had already been told the socket
+  was open. The 101 is now a reply like any other until it leaves: a denial
+  is answered with the gate's status, the request ends `Denied`, and
+  `upgraded` and `opened` run only after the 101 has gone out.
 
 ---
 
