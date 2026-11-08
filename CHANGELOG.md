@@ -13,6 +13,19 @@
 
 ---
 
+## [0.7.1] - 2026-11-07
+
+### Fixed
+
+- The busy refusal at the soft connection cap closed without the linger: it
+  is written before anything is read, while net-io still counted the
+  connection idle, so the client's request on its way drew a reset, and on
+  Windows the client saw an aborted connection instead of the 503. The
+  refusal now marks the connection as sending and closes with the linger
+  like every other reply.
+
+---
+
 ## [0.7.0] - 2026-11-07
 
 Hardening: TLS with ALPN, the idle trim, WebSocket push, a 24-hour soak, and
@@ -388,7 +401,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/jamesgober/serve-net/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jamesgober/serve-net/compare/v0.6.3...v0.7.0
 [0.6.3]: https://github.com/jamesgober/serve-net/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/jamesgober/serve-net/compare/v0.6.1...v0.6.2

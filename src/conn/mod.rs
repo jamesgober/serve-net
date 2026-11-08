@@ -1734,6 +1734,12 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             _ => {}
         }
         self.state = State::Closing;
+        // A refusal at open is written before anything is read, while the
+        // connection is still idle to net-io, which closes an idle connection
+        // without its linger. The request on its way would then draw a reset,
+        // and Windows drops a received reply on a reset: the client saw an
+        // abort instead of the 503. Sending keeps the linger.
+        io.set_phase(Phase::Sending);
         io.set_exchange_deadline(Some(io.now() + self.limits().write_stall));
         io.begin_reply();
         self.flush(io)
