@@ -40,7 +40,10 @@
   `RLIMIT_NOFILE` (256 on a stock macOS) connections past the soft cap get
   the busy refusal (503) instead of a reset, and the profile caps still
   apply. The default stays 8,750 of 10,000 where descriptors allow.
-- The TLS tests use tls-net 0.7.1.
+- The TLS tests use tls-net 0.9. serve-net takes any `net_io::TlsAcceptor`
+  and does not depend on tls-net; a service that uses tls-net should move
+  to 0.9, which fixes a panic any client could cause in a session's
+  `encrypt` or `close`.
 
 ### Fixed
 
