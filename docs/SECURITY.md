@@ -47,8 +47,9 @@ its test, and its cost) and the build-time validation rules (V-1 to V-26) are in
 2. Keep forwarded-header listeners on loopback, a private address, or a Unix socket, and firewall them
    so only the proxy reaches them.
 3. Read the authority in `head` or `call` alike; both see the same value since 0.6.2.
-4. Raise `RLIMIT_NOFILE` above the connections you expect. Under a low limit, connections past net-io's
-   hard cap are reset rather than answered 503.
+4. Raise `RLIMIT_NOFILE` above the connections you expect. With no `max_connections` the caps follow
+   the limit, so a low one serves fewer clients, each still refused with a 503 past the soft cap; an
+   explicit `max_connections` the limit cannot hold is refused at start.
 5. Offer only `http/1.1` in your TLS acceptor's ALPN list until the HTTP/2 engine exists.
 6. Leave `wipe_buffers` on unless a measured cost says otherwise.
 7. Give a WebSocket target an `OriginPolicy::allow` list when its pages live on another origin, and use

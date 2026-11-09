@@ -635,7 +635,8 @@ fn reserves(d: &Draft<'_>, f: &mut Findings) {
         .filter_map(|p| p.budget.dedicated)
         .map(u32::from)
         .sum();
-    let (soft, _, _) = crate::server::connection_caps(d.limits, d.workers);
+    let (soft, _, _) =
+        crate::server::connection_caps(d.limits, d.workers, net_io::descriptor_limit());
     let others = d.profiles.iter().any(|p| p.budget.dedicated.is_none());
     if kept > soft || (kept == soft && others) {
         f.error(

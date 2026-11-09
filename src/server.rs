@@ -584,7 +584,10 @@ where
             hooks,
             ..
         } = self;
-        let (soft, hard, threads) = connection_caps(&limits, &workers);
+        // Read once: net-io checks its hard cap against the limit at start, and
+        // a reload keeps to what was checked.
+        let descriptors = net_io::descriptor_limit();
+        let (soft, hard, threads) = connection_caps(&limits, &workers, descriptors);
 
         let mut admit = hooks.admit;
         admit.driver(workers.resolved(), soft);
@@ -617,11 +620,9 @@ where
         if reactor {
             global = global.completion_queue(limits.max_deferred_per_worker);
         }
-        // With no cap asked for, the reactor's own default fits what
-        // descriptors the process has, where a fixed cap would refuse to start.
-        if !reactor || limits.max_connections.is_some() {
-            global = global.max_connections(hard);
-        }
+        // The hard cap is always serve-net's, so the soft cap sits under it
+        // and the busy refusal is written before net-io refuses (D-108).
+        global = global.max_connections(hard);
         let global = global.build().map_err(ServeError::Start)?;
         let merged = Arc::new(Merged::new(Arc::clone(&hooks.control)));
         let mut net = net_io::ServerBuilder::new()
@@ -760,6 +761,7 @@ where
             has_tls,
             workers,
             threads,
+            descriptors,
         };
         Ok(Bound::new(Parts {
             server,
@@ -786,32 +788,57 @@ impl net_io::Clock for SharedClock {
     }
 }
 
-/// The soft connection cap, net-io's hard cap, and the pool size.
+/// The soft connection cap, net-io's hard cap, and the pool size, under
+/// `descriptors` (the process's soft `RLIMIT_NOFILE`, `None` when unlimited
+/// or on Windows).
 ///
 /// On the blocking driver every open connection holds a thread, and net-io
 /// refuses at accept once every thread is busy, so the busy refusal can only
 /// be written when the pool covers the soft cap plus its headroom (D-043,
-/// D-044).
-pub(crate) fn connection_caps(limits: &Limits, workers: &Workers) -> (u32, u32, u16) {
+/// D-044). On the reactor with no cap asked for, both caps fit the
+/// descriptors the process has, so a low limit lowers the soft cap with the
+/// hard one instead of leaving clients to be reset (D-108).
+pub(crate) fn connection_caps(
+    limits: &Limits,
+    workers: &Workers,
+    descriptors: Option<u64>,
+) -> (u32, u32, u16) {
     let blocking = workers.resolved() == DriverKind::Blocking;
     let asked = workers.blocking_threads();
     let pool = if blocking {
         u32::from(asked)
     } else {
-        REACTOR_CONNECTIONS
+        reactor_room(workers.reactor_workers(), descriptors)
     };
     let soft = limits.max_connections.unwrap_or_else(|| {
         // A small pool keeps most of its threads for clients.
         pool.saturating_sub(limits.headroom_for(pool).min(pool / 4))
             .max(1)
     });
-    let hard = soft.saturating_add(limits.headroom_for(soft));
+    let mut hard = soft.saturating_add(limits.headroom_for(soft));
+    if !blocking && limits.max_connections.is_none() {
+        // The room itself, as net-io would pick it: 10,000 by default.
+        hard = pool;
+    }
     let threads = if blocking {
         u16::try_from(hard).unwrap_or(u16::MAX).max(asked)
     } else {
         workers.reactor_workers()
     };
     (soft, hard, threads)
+}
+
+/// The connections the reactor's default caps hold: 10,000, less where the
+/// descriptor limit would not hold them. The same room net-io 0.7 leaves for
+/// its own default: two wake descriptors per worker and 64 spare (listeners,
+/// the accept reserve, files the service opens), at least 16.
+pub(crate) fn reactor_room(workers: u16, descriptors: Option<u64>) -> u32 {
+    let wanted = REACTOR_CONNECTIONS;
+    descriptors.map_or(wanted, |have| {
+        let spare = u64::from(workers).saturating_mul(2).saturating_add(64);
+        let room = have.saturating_sub(spare).clamp(16, u64::from(wanted));
+        u32::try_from(room).unwrap_or(wanted)
+    })
 }
 
 /// The soft cap left for connections without a dedicated seat.
@@ -1160,5 +1187,49 @@ mod tests {
             .build()
             .unwrap();
         assert!(built.warnings().is_empty());
+    }
+
+    /// D-108: on the reactor with no cap asked for, both caps fit the
+    /// descriptor limit, and net-io accepts the hard cap against it.
+    #[test]
+    fn test_reactor_default_caps_fit_the_descriptor_limit() {
+        let limits = Limits::new();
+        let reactor = Workers::reactor(8);
+        assert_eq!(connection_caps(&limits, &reactor, None), (8_750, 10_000, 8));
+        assert_eq!(
+            connection_caps(&limits, &reactor, Some(1 << 20)),
+            (8_750, 10_000, 8)
+        );
+        // A stock macOS: 256 descriptors, less 2 per worker and 64 spare.
+        for (have, want) in [(256, (154, 176)), (1_024, (826, 944)), (50, (12, 16))] {
+            let (soft, hard, _) = connection_caps(&limits, &reactor, Some(have));
+            assert_eq!((soft, hard), want, "{have} descriptors");
+            assert!(soft < hard, "the busy refusal comes before net-io's");
+            if have >= 256 {
+                let net = net_io::Limits::builder()
+                    .max_connections(hard)
+                    .build()
+                    .unwrap();
+                assert!(net.validate(8, Some(have)).is_ok(), "{have} descriptors");
+            }
+        }
+    }
+
+    /// An explicit cap, and the blocking pool, do not move with the limit:
+    /// an explicit cap the descriptors cannot hold is refused at start.
+    #[test]
+    fn test_explicit_and_blocking_caps_ignore_the_descriptor_limit() {
+        let asked = Limits::new().max_connections(500);
+        let reactor = Workers::reactor(8);
+        assert_eq!(
+            connection_caps(&asked, &reactor, Some(256)),
+            connection_caps(&asked, &reactor, None)
+        );
+        assert_eq!(connection_caps(&asked, &reactor, None).1, 562);
+        let pool = Workers::blocking(256);
+        assert_eq!(
+            connection_caps(&Limits::new(), &pool, Some(256)),
+            connection_caps(&Limits::new(), &pool, None)
+        );
     }
 }

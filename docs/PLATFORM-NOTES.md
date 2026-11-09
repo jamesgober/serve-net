@@ -25,9 +25,12 @@ blocking driver: 224 of 256 threads, 6 of 8. Connections above it get the busy r
 driver keep-alive is shortened and then closed as the pool fills; on the reactor it is not, because an
 idle connection there costs about 9 KB of heap and no thread.
 
-On the reactor the hard cap is 10,000 or what the process's descriptors allow, whichever is lower. Raise
-`RLIMIT_NOFILE` for a server that should reach it: a stock macOS allows 256, and above a low hard cap
-clients are reset rather than refused with a 503.
+On the reactor the hard cap is 10,000 or what the process's descriptors allow, whichever is lower:
+the soft `RLIMIT_NOFILE` less two descriptors per worker and 64 spare. With no `max_connections` the
+soft cap follows it, so clients past the soft cap still get the 503: on a stock macOS (256
+descriptors) with 8 workers that is 154 of 176. Raise `RLIMIT_NOFILE` for a server that should hold
+more. The limit is read at start; raising it later takes a restart. An explicit `max_connections`
+the descriptors cannot hold is refused at start.
 
 ## Reading and waking
 

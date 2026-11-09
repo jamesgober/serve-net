@@ -91,6 +91,9 @@ pub(crate) struct Reloader {
     pub(crate) has_tls: bool,
     pub(crate) workers: Workers,
     pub(crate) threads: u16,
+    /// The descriptor limit read at start, which net-io's hard cap was
+    /// checked against.
+    pub(crate) descriptors: Option<u64>,
 }
 
 /// What net-io fixed when the listener was bound: a reload cannot change it
@@ -141,7 +144,7 @@ impl Reloader {
             reserved_percent: 0,
         });
         let mut errors = findings.errors;
-        let (soft, hard, threads) = connection_caps(&limits, &workers);
+        let (soft, hard, threads) = connection_caps(&limits, &workers, self.descriptors);
         if workers != self.workers || threads > self.threads {
             errors.push(error(
                 RuleId::ReloadWorkers,

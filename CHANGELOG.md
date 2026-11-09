@@ -30,7 +30,17 @@
   aborting the process, and a 5 s close timeout armed from the start.
   `ws_net` types are part of serve-net's API, so code that names them moves
   to ws-net 0.9 too.
-- The TLS tests use tls-net 0.6.
+- net-io 0.7.1 (from 0.6.2): its hardening reaches every connection, among
+  them TLS gate denials sent as an encrypted record and released buffers
+  wiped in full, and idle TLS connections give their buffers back on the
+  reactor. `net_io` types are part of serve-net's API, so code that
+  names them moves to net-io 0.7 too.
+- On the reactor with no `max_connections`, the soft cap now follows the
+  process's descriptor limit along with net-io's hard cap: under a low
+  `RLIMIT_NOFILE` (256 on a stock macOS) connections past the soft cap get
+  the busy refusal (503) instead of a reset, and the profile caps still
+  apply. The default stays 8,750 of 10,000 where descriptors allow.
+- The TLS tests use tls-net 0.7.1.
 
 ### Fixed
 

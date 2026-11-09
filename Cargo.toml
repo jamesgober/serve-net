@@ -61,7 +61,7 @@ ws = ["http1", "dep:ws-net"]
 [dependencies]
 # First-party crates at published versions only (dev/PLAN.md section 3.2).
 # net-io: the transport (required).
-net-io = "0.6.2"
+net-io = "0.7.1"
 http-net = { version = "0.9", default-features = false, optional = true }
 ws-net = { version = "0.9", default-features = false, optional = true }
 
@@ -75,7 +75,7 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 ws-net = "0.9"
 # A real TLS engine for the end-to-end TLS and ALPN tests; serve-net itself
 # takes any net-io acceptor. ring, so no build needs NASM or CMake.
-tls-net = { version = "0.6", default-features = false, features = ["ring", "net-io"] }
+tls-net = { version = "0.7.1", default-features = false, features = ["ring", "net-io"] }
 
 # The loom models run with RUSTFLAGS="--cfg serve_net_loom" (a name of our
 # own: `--cfg loom` reaches every crate in the build, net-io included).
