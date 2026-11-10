@@ -7,13 +7,13 @@ use crate::client::IngressKind;
 use crate::config::ProxyKind;
 use crate::config::validate::{self, Draft};
 use crate::config::{
-    Ingress, KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId, ProfileTable,
-    ProxySource, REACTOR_CONNECTIONS, Workers,
+    EngineChoice, Ingress, KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId,
+    ProfileTable, ProxySource, REACTOR_CONNECTIONS, Workers,
 };
 use crate::conn::session::{Cap, Factory, Runtime};
 use crate::conn::{ListenerRuntime, Shared, Tables, UnixRuntime};
 use crate::engine::{Family, Service};
-use crate::error::{ConfigErrors, ConfigWarning, ServeError};
+use crate::error::{ConfigError, ConfigErrors, ConfigWarning, RuleId, ServeError, Subject};
 use crate::health::{HealthState, Tap};
 use crate::hooks::{Admit, Checkpoint, DefaultHooks, Dispatch, HookSet, Hooks, Observer};
 use crate::net::{ControlLine, DriverKind, EventSink, Gate};
@@ -584,6 +584,11 @@ where
             hooks,
             ..
         } = self;
+        let http = is_http::<F>();
+        let mismatched = engine_family(&listeners, |id| profiles.get(id).map(|p| p.engine), http);
+        if let Some(errors) = ConfigErrors::from_vec(mismatched) {
+            return Err(ServeError::Config(errors));
+        }
         // Read once: net-io checks its hard cap against the limit at start, and
         // a reload keeps to what was checked.
         let descriptors = net_io::descriptor_limit();
@@ -762,6 +767,7 @@ where
             workers,
             threads,
             descriptors,
+            http,
         };
         Ok(Bound::new(Parts {
             server,
@@ -786,6 +792,52 @@ impl net_io::Clock for SharedClock {
     fn now(&self) -> std::time::Instant {
         self.0.now()
     }
+}
+
+/// Whether `F` is the built-in HTTP family; every other family is custom.
+pub(crate) fn is_http<F: Family>() -> bool {
+    #[cfg(feature = "http1")]
+    {
+        core::any::TypeId::of::<F>() == core::any::TypeId::of::<crate::HttpFamily>()
+    }
+    #[cfg(not(feature = "http1"))]
+    {
+        // Without the feature every family is custom.
+        let _ = core::any::TypeId::of::<F>();
+        false
+    }
+}
+
+/// One error per listener whose profile's engine belongs to another family
+/// than the one being bound (D-110): an HTTP engine choice needs the HTTP
+/// family, `EngineChoice::Custom` needs a custom one. A listener naming a
+/// missing profile is `UnknownProfile`'s, not this rule's.
+pub(crate) fn engine_family(
+    listeners: &[ListenerSpec],
+    engine_of: impl Fn(ProfileId) -> Option<EngineChoice>,
+    http: bool,
+) -> Vec<ConfigError> {
+    listeners
+        .iter()
+        .filter(|l| {
+            engine_of(l.profile)
+                .is_some_and(|e| matches!(e, EngineChoice::Custom { .. }) == http)
+        })
+        .map(|l| {
+            let (message, hint) = if http {
+                (
+                    "the profile serves a custom engine, but bind serves the HTTP family",
+                    "give the listener an HTTP profile, or serve the custom family with bind_family",
+                )
+            } else {
+                (
+                    "the profile serves HTTP, but bind_family serves a custom family",
+                    "give the listener a profile with EngineChoice::Custom (the default profile 0 is HTTP)",
+                )
+            };
+            ConfigError::new(RuleId::EngineFamily, Subject::Listener(l.name.clone()), message, hint)
+        })
+        .collect()
 }
 
 /// The soft connection cap, net-io's hard cap, and the pool size, under

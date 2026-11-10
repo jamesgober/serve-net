@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use crate::config::validate::{self, Draft};
 use crate::config::{
-    Ingress, KeepAlive, Limits, ListenerSpec, Profile, ProfileId, ProfileTable, ProxyKind, Workers,
+    EngineChoice, Ingress, KeepAlive, Limits, ListenerSpec, Profile, ProfileId, ProfileTable,
+    ProxyKind, Workers,
 };
 use crate::conn::session::{Cap, Runtime};
 use crate::conn::{ListenerRuntime, Tables};
@@ -13,7 +14,8 @@ use crate::error::{ConfigError, ConfigErrors, RuleId, ServeError, Subject};
 use crate::notify::Notifier;
 use crate::running::ListenerMeta;
 use crate::server::{
-    connection_caps, file_owner, listener_meta, listener_runtime, net_listener, shared_seats,
+    connection_caps, engine_family, file_owner, listener_meta, listener_runtime, net_listener,
+    shared_seats,
 };
 use crate::snapshot::Snapshot;
 
@@ -94,6 +96,9 @@ pub(crate) struct Reloader {
     /// The descriptor limit read at start, which net-io's hard cap was
     /// checked against.
     pub(crate) descriptors: Option<u64>,
+    /// Whether the server serves the HTTP family: a reload keeps each
+    /// listener's engine in that family (D-110).
+    pub(crate) http: bool,
 }
 
 /// What net-io fixed when the listener was bound: a reload cannot change it
@@ -153,6 +158,16 @@ impl Reloader {
                 "restart to change the workers, or keep max_connections within the pool",
             ));
         }
+        errors.extend(engine_family(
+            &listeners,
+            |id| match profiles.iter().find(|p| p.id == id) {
+                Some(p) => Some(p.engine),
+                // Profile 0 is made with defaults (HTTP) when none is given.
+                None if profiles.is_empty() && id == ProfileId(0) => Some(EngineChoice::Http1),
+                None => None,
+            },
+            self.http,
+        ));
         let mut kept: Vec<(usize, ListenerSpec)> = Vec::new();
         let mut added: Vec<ListenerSpec> = Vec::new();
         for spec in listeners {

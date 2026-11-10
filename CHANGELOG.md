@@ -22,6 +22,12 @@
   on. A request with no `Origin` (not a browser) is accepted.
 - `Family::upgrade_allowed`, a provided method that judges an upgrade on the
   head view; the default allows it.
+- `docs/ARCHITECTURE.md`: how the crate fits together, from the builder to
+  one request's path through the connection machine.
+- A complete custom family in `tests/custom_family.rs`: a key-value line
+  protocol served through `bind_family`, built from the public API alone.
+- `Profile::wipes_buffers`, so a custom family's engine can zero the
+  client's bytes it holds under a wiping profile, as the HTTP engine does.
 
 ### Changed
 
@@ -47,6 +53,12 @@
 
 ### Fixed
 
+- A listener is refused when its profile's engine belongs to another
+  family than the one being bound (`RuleId::EngineFamily`): `bind` served
+  HTTP on a profile marked `EngineChoice::Custom`, and `bind_family` served
+  a custom family on HTTP profiles. Checked at `bind`, `bind_family`, and
+  reload. A server for a custom family now needs its own profile 0 with
+  `EngineChoice::Custom`, since the default profile is HTTP.
 - A wiping profile now zeroes ws-net's own input, message, and output
   buffers when an upgraded connection ends, not only serve-net's copies.
 - A gate that denied the 101 of a WebSocket upgrade closed the connection

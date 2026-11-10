@@ -547,7 +547,7 @@ impl Bound {
 }
 ```
 
-`bind` takes the service and builds net-io's server: every listener is bound, adopted, inherited, or received in declaration order, net-io's PROXY expectation and trusted list are set per listener, and the workers start with the **door closed**: nothing is accepted (the kernel backlog may queue connections). This is the moment to drop privileges, after binding a privileged port and before any untrusted byte is read. `bind_family` does the same for a [custom family](#family-httpfamily) on listeners whose profile engine is `EngineChoice::Custom`.
+`bind` takes the service and builds net-io's server: every listener is bound, adopted, inherited, or received in declaration order, net-io's PROXY expectation and trusted list are set per listener, and the workers start with the **door closed**: nothing is accepted (the kernel backlog may queue connections). This is the moment to drop privileges, after binding a privileged port and before any untrusted byte is read. `bind_family` does the same for a [custom family](#family-httpfamily) on listeners whose profile engine is `EngineChoice::Custom`; a listener whose profile's engine is another family's is refused before anything binds (`RuleId::EngineFamily`, `ServeError::Config`).
 
 If any listener fails, everything bound so far is closed and the error names the failing listener. Inherited and handed-off sockets are to be released to the owner instead of closed; net-io 0.4's `build` consumes them, so until net-io can return them on a failed build they are closed too (tracked in `dev/ROADMAP.md`, v0.9.x register). Inherited sockets are matched by name first, then unnamed sockets by position; a socket no listener takes is closed.
 
@@ -1176,12 +1176,13 @@ impl Profile {
     pub fn wipe_buffers(self, on: bool) -> Self;          // default true
     pub fn body(self, policy: BodyPolicy) -> Self;        // default BodyPolicy::Buffer with the profile's max_body
     pub fn id(&self) -> ProfileId;
+    pub fn wipes_buffers(&self) -> bool;                  // 0.8.0: what wipe_buffers set
 }
 ```
 
 The answer to "connections on this listener use this engine, this lane, this budget, these limits". A single-service program has one profile (created with defaults if none is added), or two (a public and an admin listener with a smaller budget, a more important lane, and `critical(true)`).
 
-`wipe_buffers` zeroes the used part of every serve-net buffer when it returns to a pool and turns on http-net's request wipe, so credentials in one request never linger into another; since 0.8.0 it also zeroes ws-net's input, message, and output buffers when an upgraded connection ends; it matches net-io's own default. Cost about 50-100 ns per 2 KiB [est.]; turn it off only for traffic that never carries secrets. P0, Tier 2, `0.3.0`.
+`wipe_buffers` zeroes the used part of every serve-net buffer when it returns to a pool and turns on http-net's request wipe, so credentials in one request never linger into another; since 0.8.0 it also zeroes ws-net's input, message, and output buffers when an upgraded connection ends; it matches net-io's own default. A custom family's engine holds the client's bytes itself, so `Family::engine` reads `wipes_buffers` and zeroes them the same way (0.8.0). Cost about 50-100 ns per 2 KiB [est.]; turn it off only for traffic that never carries secrets. P0, Tier 2, `0.3.0`.
 
 ```rust
 use serve_net::{Budget, Lane, Limits, Profile, ProfileId};
@@ -2364,6 +2365,7 @@ pub enum RuleId {
     ProfileIdReserved, ProfileGap, UnknownProfile, DeadlineOrder, DeadlineRange, ZeroCap, DuplicateBind,
     DriverUnavailable, ReloadWorkers, DrainRange, AlpnWithoutTls, TlsOnFastCgi, SchemeTrustWithoutSource, AnyLocalPeerForwarded,
     AddressResolve, TlsWithoutAcceptor, BadHeaderName, IngressNeedsHttp, ReserveOverflow, TooMany,
+    EngineFamily,
     // warnings
     DeclaredSchemeHttp, MinRateOff, PanicCatchInAbortBuild, OffloadOnBlocking, ShortIdleBehindProxy,
     LockdownWithoutCritical, NoListeners,
@@ -2398,6 +2400,7 @@ impl RuleId { pub const fn as_str(self) -> &'static str; }   // stable snake_cas
 | `AddressResolve` | an address that resolved to nothing | none |
 | `BadHeaderName` | a `SingleAddress` field name that is not a token | none |
 | `IngressNeedsHttp` | forwarded headers or FastCGI on a listener whose profile serves a custom family | none |
+| `EngineFamily` (0.8.0) | at `bind`, `bind_family`, and reload: a listener whose profile's engine is not the family being bound, so `bind` (HTTP) refuses a profile with `EngineChoice::Custom` and `bind_family` with a custom family refuses an HTTP profile (the default profile 0 is HTTP: give a custom family's server its own profile 0). Reported as `ServeError::Config`, or `ServeError::Reload` | none |
 | `ReserveOverflow` | lane reserves summing above 100%, or dedicated workers leaving no connection for the other profiles | none |
 | `TooMany` | more than 64 listeners or 255 profiles | none |
 

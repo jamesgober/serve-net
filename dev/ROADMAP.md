@@ -147,7 +147,9 @@ Exit: zero open findings; the 24 h soak clean (NFR-18); `docs/SECURITY.md` writt
 ## v0.8.0 - Alpha
 Exit: a production site served for two weeks without a serve-net defect; `docs/ARCHITECTURE.md` draft; no API change needed by the first real wrapper that is not already made.
 - Moved from 0.7 (D-097). When fcgi-net is published: FastCGI on Linux and macOS first (`fastcgi`, `FastCgiListen`, `FastCgiIngress`, `Ingress::FastCgi`, `engine::FastCgi`, `ListenerSpec::fastcgi_descriptor_zero`, T-19, the `fastcgi_mapping` fuzz target, the T-19 attack test, `mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0). Windows waits for the decision on a Windows FastCGI deployment.
-- A real application wrapper built on serve-net's hooks; a custom-family prototype for a database wire protocol.
+- A real application wrapper built on serve-net's hooks.
+- [x] `docs/ARCHITECTURE.md` draft: the layers, threads, one request's path through the machine, states, families, shared state, memory, reload, and drain, as the code stands.
+- [x] A custom-family prototype for a database wire protocol (D-110): a key-value line protocol through `bind_family` from the public API alone; it found and fixed two gaps (`RuleId::EngineFamily`, `Profile::wipes_buffers`).
 - [x] ws-net 0.8, then 0.9 (D-104, D-107), and tls-net 0.6; ws-net's buffers wiped under a wiping profile.
 - [x] net-io 0.7.1 and tls-net 0.9 (D-108); `descriptor_limit()` places the reactor's default soft cap under the hard cap, so a low `RLIMIT_NOFILE` meets the 503, not resets (D-075 closed).
 - [x] WebSocket upgrades same-origin by default (D-103, T-41): `WebSocketTarget::origins`, `RefusalKind::CrossOrigin`, `Family::upgrade_allowed`.
