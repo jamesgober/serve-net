@@ -209,18 +209,23 @@ impl std::error::Error for EngineError {}
 #[derive(Default)]
 pub struct OutBuf {
     pub(crate) bytes: Vec<u8>,
+    /// The connection's profile wipes: growth zeroes the block it leaves.
+    pub(crate) wipe: bool,
 }
 
 impl OutBuf {
     /// An empty buffer.
     #[must_use]
     pub fn new() -> Self {
-        OutBuf { bytes: Vec::new() }
+        OutBuf {
+            bytes: Vec::new(),
+            wipe: false,
+        }
     }
 
     /// Appends `bytes`.
     pub fn push(&mut self, bytes: &[u8]) {
-        self.bytes.extend_from_slice(bytes);
+        extend_wiping(&mut self.bytes, bytes, self.wipe);
     }
 
     /// The number of bytes held.
@@ -274,11 +279,54 @@ impl fmt::Debug for OutBuf {
 #[cfg(feature = "http1")]
 impl http_net::Output for OutBuf {
     fn put(&mut self, bytes: &[u8]) {
-        self.bytes.extend_from_slice(bytes);
+        extend_wiping(&mut self.bytes, bytes, self.wipe);
     }
     fn reserve(&mut self, additional: usize) {
-        self.bytes.reserve(additional);
+        reserve_wiping(&mut self.bytes, additional, self.wipe);
     }
+}
+
+/// Makes room for `additional` more bytes. Growing a buffer frees its old
+/// block; when `wipe` is set the contents move to the new block first and
+/// the old one is zeroed, so no freed block keeps them (D-111).
+pub(crate) fn reserve_wiping(buf: &mut Vec<u8>, additional: usize, wipe: bool) {
+    if buf.capacity() - buf.len() >= additional {
+        return;
+    }
+    if !wipe {
+        buf.reserve(additional);
+        return;
+    }
+    drop(grow_wiping(buf, additional));
+}
+
+/// Moves `buf` into a block with room for `additional` more bytes and
+/// returns the old block, zeroed, for the caller to free.
+fn grow_wiping(buf: &mut Vec<u8>, additional: usize) -> Vec<u8> {
+    let need = buf.len().saturating_add(additional);
+    let mut grown = Vec::with_capacity(need.max(buf.capacity().saturating_mul(2)));
+    grown.extend_from_slice(buf);
+    let mut old = core::mem::replace(buf, grown);
+    wipe_bytes(&mut old);
+    old
+}
+
+/// Appends `bytes`, growing as `reserve_wiping` does.
+pub(crate) fn extend_wiping(buf: &mut Vec<u8>, bytes: &[u8], wipe: bool) {
+    reserve_wiping(buf, bytes.len(), wipe);
+    buf.extend_from_slice(bytes);
+}
+
+/// Appends `text` to a string, growing as `reserve_wiping` does.
+pub(crate) fn push_str_wiping(s: &mut String, text: &str, wipe: bool) {
+    if wipe && s.capacity() - s.len() < text.len() {
+        let need = s.len().saturating_add(text.len());
+        let mut grown = String::with_capacity(need.max(s.capacity().saturating_mul(2)));
+        grown.push_str(s);
+        let mut old = core::mem::replace(s, grown).into_bytes();
+        wipe_bytes(&mut old);
+    }
+    s.push_str(text);
 }
 
 /// Zeroes `bytes` with writes the optimizer keeps.
@@ -529,6 +577,29 @@ impl Engine for NoCustom {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_growth_on_a_wiping_buffer_zeroes_the_old_block() {
+        let mut buf = Vec::with_capacity(8);
+        buf.extend_from_slice(b"secret!!");
+        let old = grow_wiping(&mut buf, 8);
+        assert_eq!(buf, b"secret!!");
+        assert!(buf.capacity() >= 16);
+        assert_eq!(old.len(), 8);
+        assert!(old.iter().all(|&b| b == 0), "{old:?}");
+        let mut buf = b"pass".to_vec();
+        extend_wiping(&mut buf, b"word, and more than four bytes", true);
+        assert_eq!(buf, b"password, and more than four bytes");
+        let mut s = String::with_capacity(2);
+        s.push_str("ab");
+        push_str_wiping(&mut s, "cdefgh", true);
+        assert_eq!(s, "abcdefgh");
+        let mut out = OutBuf::new();
+        out.wipe = true;
+        out.push(&[7; 100]);
+        out.push(&[8; 1000]);
+        assert_eq!(out.len(), 1100);
+    }
 
     #[test]
     fn test_outbuf_clear_and_wipe() {

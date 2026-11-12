@@ -419,13 +419,13 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 Ok(ws_net::Event::Text(t)) => {
                     link.partial_since = None;
                     link.text.clear();
-                    link.text.push_str(t);
+                    crate::engine::push_str_wiping(&mut link.text, t, self.wipe);
                     true
                 }
                 Ok(ws_net::Event::Binary(b)) => {
                     link.partial_since = None;
                     link.scratch.clear();
-                    link.scratch.extend_from_slice(b);
+                    crate::engine::extend_wiping(&mut link.scratch, b, self.wipe);
                     false
                 }
                 Ok(ws_net::Event::Close(frame)) => {

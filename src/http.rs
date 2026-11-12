@@ -285,6 +285,15 @@ struct OwnedRequest {
     body: Box<[u8]>,
 }
 
+impl Drop for OwnedRequest {
+    /// The body copy is zeroed on every profile (D-111): an offloaded
+    /// request is slow work, and a 64 KiB body costs about 2 to 5 us
+    /// [est.]. The head is http-net's copy, which has no way to zero it.
+    fn drop(&mut self) {
+        crate::engine::wipe_bytes(&mut self.body);
+    }
+}
+
 impl DetachedRequest<HttpFamily> for OwnedRequest {
     fn with(&self, call: &mut dyn FnMut(&HttpRequest<'_>)) {
         call(&HttpRequest {
@@ -334,6 +343,14 @@ pub struct DetachedHead {
     path: Span,
     query: Option<Span>,
     fields: Vec<(Span, Span)>,
+}
+
+impl Drop for DetachedHead {
+    /// Zeroed on every profile (D-111): a head may hold credentials, and it is
+    /// typically under 1 KiB, about 50 ns [est.].
+    fn drop(&mut self) {
+        crate::engine::wipe_bytes(&mut self.bytes);
+    }
 }
 
 /// Fields whose values `Debug` never prints.

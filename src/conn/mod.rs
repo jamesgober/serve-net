@@ -227,6 +227,10 @@ impl<F: Family, S: Service<F>, H: Hooks> JobService<F> for Shared<F, S, H> {
     fn panicked(&self, env: &Envelope) {
         self.observer.service_error(env, "the service panicked");
     }
+
+    fn wipe_parts(&self, parts: &mut F::Parts) {
+        self.family.clear_parts(parts, true);
+    }
 }
 
 impl<F: Family, S: Service<F>, H: Hooks> crate::notify::ServerEvents for Shared<F, S, H> {
@@ -441,6 +445,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             reply: Reply::new(parts),
             out: OutBuf {
                 bytes: Vec::with_capacity(OUT_INITIAL),
+                wipe,
             },
             out_sent: 0,
             tail: None,
@@ -683,7 +688,8 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         match taken {
             None => Step::Park { until },
             Some(Some((parts, close))) => {
-                let old = core::mem::replace(&mut self.reply.parts, parts);
+                let mut old = core::mem::replace(&mut self.reply.parts, parts);
+                self.shared.family.clear_parts(&mut old, self.wipe);
                 drop(old);
                 self.state = State::Writing;
                 let outcome = if close { Outcome::Close } else { Outcome::Done };
@@ -1047,7 +1053,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                                         );
                                         return (input.len(), step);
                                     }
-                                    self.body.extend_from_slice(bytes);
+                                    crate::engine::extend_wiping(&mut self.body, bytes, self.wipe);
                                     None
                                 }
                                 BodyPolicy::Discard { max } => {
@@ -1074,7 +1080,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                                         crate::engine::wipe_bytes(&mut self.body);
                                     }
                                     self.body.clear();
-                                    self.body.extend_from_slice(bytes);
+                                    crate::engine::extend_wiping(&mut self.body, bytes, self.wipe);
                                     Some(self.stream_piece(io, false))
                                 }
                                 BodyPolicy::Stream => None,
@@ -1403,7 +1409,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 let slot = match &self.defer {
                     Some(s) => Arc::clone(s),
                     None => {
-                        let s = Arc::new(DeferSlot::new(io.waker(), self.connection));
+                        let mut s = DeferSlot::new(io.waker(), self.connection);
+                        if let (true, Some(job)) = (self.wipe, &self.reply.job) {
+                            s = s.wiping(Arc::new(crate::hooks::JobWiper(Arc::clone(job))));
+                        }
+                        let s = Arc::new(s);
                         self.defer = Some(Arc::clone(&s));
                         s
                     }
@@ -1922,7 +1932,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
 
     fn cancel_deferred(&mut self) {
         if let Some(slot) = &self.defer {
-            *slot.lock() = SlotState::Idle;
+            let left = core::mem::replace(&mut *slot.lock(), SlotState::Idle);
+            if let SlotState::Completed(_, mut parts, _) = left {
+                // A reply that came and was never sent.
+                self.shared.family.clear_parts(&mut parts, self.wipe);
+            }
         }
         self.unpark();
     }

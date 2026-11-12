@@ -49,11 +49,19 @@ pub(crate) enum SlotState<P> {
     Dropped(u64),
 }
 
+/// Zeroes reply data that leaves serve-net's hands unsent: a token dropped
+/// or expired with its reply still filled.
+pub(crate) trait WipeParts<P>: Send + Sync {
+    fn wipe(&self, parts: &mut P);
+}
+
 /// One connection's deferred-reply slot.
 pub(crate) struct DeferSlot<P> {
     pub(crate) state: Mutex<SlotState<P>>,
     pub(crate) waker: Arc<dyn Waker>,
     pub(crate) connection: ConnectionId,
+    /// Set when the connection's profile wipes buffers.
+    pub(crate) wiper: Option<Arc<dyn WipeParts<P>>>,
 }
 
 impl<P> DeferSlot<P> {
@@ -62,7 +70,14 @@ impl<P> DeferSlot<P> {
             state: Mutex::new(SlotState::Idle),
             waker,
             connection,
+            wiper: None,
         }
+    }
+
+    /// Tokens of this slot zero their reply data when dropped unsent.
+    pub(crate) fn wiping(mut self, wiper: Arc<dyn WipeParts<P>>) -> Self {
+        self.wiper = Some(wiper);
+        self
     }
 
     pub(crate) fn lock(&self) -> crate::sync::MutexGuard<'_, SlotState<P>> {
@@ -293,6 +308,13 @@ impl<F: Family> ReplyToken<F> {
 
 impl<F: Family> Drop for ReplyToken<F> {
     fn drop(&mut self) {
+        // Whatever the reply holds never leaves now: zeroed on a wiping
+        // profile (D-111).
+        if let (Some(inner), Some(reply)) = (self.inner.as_ref(), self.reply.as_mut()) {
+            if let Some(wiper) = &inner.slot.wiper {
+                wiper.wipe(&mut reply.parts);
+            }
+        }
         if let Some(inner) = self.inner.take() {
             let mut state = inner.slot.lock();
             if matches!(*state, SlotState::Waiting(g) if g == inner.generation) {

@@ -10,7 +10,7 @@ mod offload;
 use std::time::Duration;
 
 pub use admit::{Admit, Admitted, InFlightCap, Shed};
-pub(crate) use offload::JobService;
+pub(crate) use offload::{JobService, JobWiper};
 pub use offload::{Offload, OffloadJob, OffloadPool};
 
 use crate::Finished;

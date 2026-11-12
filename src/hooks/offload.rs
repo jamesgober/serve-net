@@ -66,6 +66,17 @@ pub(crate) trait JobService<F: Family>: Send + Sync {
     fn detach(&self, request: &F::Request<'_>) -> Option<Box<dyn DetachedRequest<F>>>;
     fn call(&self, request: &F::Request<'_>, env: &Envelope, reply: &mut Reply<F>) -> Outcome;
     fn panicked(&self, env: &Envelope);
+    /// Zeroes reply data that will not be sent.
+    fn wipe_parts(&self, parts: &mut F::Parts);
+}
+
+/// A deferral slot's wiper, through the connection's service handle.
+pub(crate) struct JobWiper<F: Family>(pub(crate) Arc<dyn JobService<F>>);
+
+impl<F: Family> crate::reply::WipeParts<F::Parts> for JobWiper<F> {
+    fn wipe(&self, parts: &mut F::Parts) {
+        self.0.wipe_parts(parts);
+    }
 }
 
 struct Job<F: Family> {
