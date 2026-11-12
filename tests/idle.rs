@@ -278,7 +278,17 @@ fn test_t33_large_replies_on_many_connections_stay_bounded() {
     for _ in 0..3 {
         round();
     }
-    let after = settle();
+    // On a loaded host the idle trim can run late: a connection still holding
+    // its 64 KiB reply buffer two seconds on looks like growth (CI once saw 44
+    // of them). A leak never comes back down, so wait up to 15 s for the heap
+    // to return under the bound before counting.
+    let bound = warm + 1024 * 1024;
+    let mut after = settle();
+    let until = std::time::Instant::now() + Duration::from_secs(15);
+    while after >= bound && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(250));
+        after = LIVE.load(Ordering::Relaxed);
+    }
     let grew = after.saturating_sub(warm);
     eprintln!("64 connections, 256 KiB replies: live heap {warm} -> {after} bytes (+{grew})");
     // Pools may take a buffer or two more; growth with the rounds is a leak.
