@@ -12,18 +12,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serve_net::{
-    KeepAlive, ListenerSpec, NoNotify, Notify, Running, Server, ServerConfig, SystemdNotify,
+    Limits, ListenerSpec, NoNotify, Notify, Running, Server, ServerConfig, SystemdNotify,
     WatchdogPinger,
 };
 
 const ADDR: &str = "127.0.0.1:9101";
 
-/// The configuration; `generation` changes the idle timeout, so every reload
-/// has something to apply.
+/// The configuration; `generation` changes the body limit, so every reload
+/// has something to apply. (The keep-alive idle timeout is one of the limits
+/// net-io fixes when it binds a listener, so a reload cannot change it.)
 fn config(generation: u32) -> ServerConfig {
     let mut c = ServerConfig::new();
     c.listeners.push(ListenerSpec::tcp("web", ADDR));
-    c.keep_alive = KeepAlive::new().idle(Duration::from_secs(20 + u64::from(generation % 2)));
+    c.limits = Limits::new().max_body(1024 * 1024 + u64::from(generation % 2));
     c
 }
 
