@@ -159,7 +159,7 @@ Exit: every finding of the independent review of 0.7.1 fixed with a test that fa
 - [x] A gate denial of the 101 is answered with its status; the switch waits for the 101 to leave (D-105).
 
 ## v0.8.x - Patches
-- net-io's security releases on its 0.7 line (announced with the review, not yet published on 2026-11-11): taken in 0.8.1 the day they are on crates.io. A hard reason for the wait: serve-net never uses a path dependency.
+- [x] 0.8.1 (2026-11-12): net-io 0.7.2, its security release (D-113). No serve-net 0.7.x patch for net-io 0.6.3: serve-net 0.7's `net-io = "0.6.2"` already takes it with `cargo update`.
 - ws-net 0.10 when published (its own review found a frame-header reservation defect on 0.9).
 
 ## v0.9.0 - Beta
