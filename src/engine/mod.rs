@@ -369,6 +369,14 @@ pub trait Family: Send + Sync + 'static {
         unix_secs: u64,
         out: &mut OutBuf,
     ) -> Result<u16, EngineError>;
+    /// The bytes of the current reply that follow what `respond` wrote, sent
+    /// by serve-net straight from the reply data as the transport takes
+    /// them: a large body is never copied into a per-connection buffer. Read
+    /// after `respond` and until the reply has left; the default is none.
+    fn reply_body<'p>(&self, parts: &'p Self::Parts) -> &'p [u8] {
+        let _ = parts;
+        &[]
+    }
     /// The request view for one piece of a streamed body.
     fn request_chunk<'a>(
         &self,

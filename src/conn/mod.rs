@@ -321,6 +321,9 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     reply: Reply<F>,
     out: OutBuf,
     out_sent: usize,
+    /// Bytes of the reply body sent from the reply data after `out`
+    /// (`Family::reply_body`); `None` when nothing follows.
+    tail: Option<usize>,
     seq: u32,
     accepted_at: Instant,
     clock_base: (Instant, u64),
@@ -438,6 +441,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 bytes: Vec::with_capacity(OUT_INITIAL),
             },
             out_sent: 0,
+            tail: None,
             seq: 0,
             accepted_at: now,
             clock_base: (now, unix),
@@ -766,6 +770,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         self.end = Some(EndReason::Denied);
         self.out.clear(self.wipe);
         self.out_sent = 0;
+        self.tail = None;
         let refusal = Refusal {
             kind: RefusalKind::Denied,
             status: if (400..=599).contains(&status) {
@@ -821,6 +826,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             .observer
             .connection_ended(self.connection, end, self.seq);
         self.out.clear(self.wipe);
+        self.tail = None;
         self.shared
             .family
             .clear_parts(&mut self.reply.parts, self.wipe);
@@ -834,7 +840,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         match self.state {
             State::Parked { until, .. } => Step::Park { until },
             State::Closed => Step::Close,
-            State::Closing | State::Writing if self.out_sent < self.out.len() => Step::Write,
+            State::Closing | State::Writing
+                if self.out_sent < self.out.len() || self.tail.is_some() =>
+            {
+                Step::Write
+            }
             State::Closing => Step::Close,
             State::Streaming => Step::Write,
             State::Upgraded if self.out_sent < self.out.len() => Step::Write,
@@ -853,9 +863,32 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             self.out_sent += n;
             self.count(io, Count::BytesOut(n as u64));
         }
-        self.out.clear(self.wipe);
-        self.out.shrink(OUT_RETAIN);
-        self.out_sent = 0;
+        if !self.out.is_empty() {
+            self.out.clear(self.wipe);
+            self.out.shrink(OUT_RETAIN);
+            self.out_sent = 0;
+        }
+        if let Some(mut sent) = self.tail {
+            // The body from the reply data, as the transport's budget takes
+            // it: the connection holds no copy of it (D-111).
+            let body = self.shared.family.reply_body(&self.reply.parts);
+            let start = sent;
+            let mut blocked = false;
+            while sent < body.len() {
+                let n = io.push(&body[sent..]);
+                if n == 0 {
+                    blocked = true;
+                    break;
+                }
+                sent += n;
+            }
+            self.tail = blocked.then_some(sent);
+            self.count(io, Count::BytesOut((sent - start) as u64));
+            if blocked {
+                io.set_phase(Phase::Sending);
+                return Step::Write;
+            }
+        }
         match self.state {
             State::Closing => {
                 self.state = State::Closed;
@@ -1734,7 +1767,13 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         };
         match encoded {
             Ok(status) => {
-                let n = self.out.len() as u64;
+                let body = if streamed {
+                    0
+                } else {
+                    shared.family.reply_body(&self.reply.parts).len()
+                };
+                self.tail = (body > 0).then_some(0);
+                let n = (self.out.len() + body) as u64;
                 if let Some(r) = self.request.as_mut() {
                     r.status = Some(status);
                     r.bytes_out = n;
@@ -1787,6 +1826,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         }
         self.out.clear(self.wipe);
         self.out_sent = 0;
+        self.tail = None;
         let refusal = Refusal {
             kind,
             status,
@@ -1816,6 +1856,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     ) -> Step {
         self.out.clear(self.wipe);
         self.out_sent = 0;
+        self.tail = None;
         let refusal = Refusal {
             kind,
             status,
@@ -1846,6 +1887,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         self.finish_request(RequestEnd::Denied);
         self.out.clear(self.wipe);
         self.out_sent = 0;
+        self.tail = None;
         self.state = State::Closed;
         Step::Abort
     }

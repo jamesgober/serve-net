@@ -488,6 +488,9 @@ pub struct HttpParts {
     streaming: bool,
     /// Bytes of a streamed reply in earlier parts.
     sent: u64,
+    /// `respond` wrote a head that a body follows; serve-net sends the body
+    /// from here (`Family::reply_body`).
+    send_body: bool,
 }
 
 impl HttpParts {
@@ -521,6 +524,7 @@ impl HttpParts {
         self.invalid = false;
         self.streaming = false;
         self.sent = 0;
+        self.send_body = false;
     }
 }
 
@@ -898,7 +902,20 @@ impl Family for HttpFamily {
         unix_secs: u64,
         out: &mut OutBuf,
     ) -> Result<u16, EngineError> {
-        encode(engine, parts, false, unix_secs, out).map(|(status, _)| status)
+        let (status, plan) = encode(engine, parts, false, unix_secs, out)?;
+        // The body stays where the service put it (D-111).
+        parts.send_body = matches!(plan, BodyPlan::Raw);
+        Ok(status)
+    }
+
+    fn reply_body<'p>(&self, parts: &'p HttpParts) -> &'p [u8] {
+        if !parts.send_body {
+            return &[];
+        }
+        match parts.body_static {
+            Some(b) => b,
+            None => &parts.body,
+        }
     }
 
     fn upgrade_allowed(
@@ -943,7 +960,9 @@ pub(crate) fn same_host(authority: &str, sni: &str) -> bool {
     !host.is_empty() && host.eq_ignore_ascii_case(sni)
 }
 
-/// Writes the reply's head, and its body unless `chunked`.
+/// Writes the reply's head. A streamed reply's part (`chunked`) writes its
+/// body too; a whole reply's body is sent from the parts by serve-net
+/// (`Family::reply_body`), so it is never copied into the connection's buffer.
 fn encode(
     engine: &mut Http1,
     parts: &HttpParts,
@@ -992,7 +1011,7 @@ fn encode(
     let start = out.len();
     match engine.conn.write_head(&head, Some(date), out) {
         Ok(plan) => {
-            if matches!(plan, BodyPlan::Raw) {
+            if chunked && matches!(plan, BodyPlan::Raw) {
                 out.push(body);
             }
             Ok((status, plan))
