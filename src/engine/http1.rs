@@ -182,6 +182,7 @@ pub(crate) fn refusal_body(status: u16) -> &'static [u8] {
         413 => b"413 Content Too Large\n",
         414 => b"414 URI Too Long\n",
         417 => b"417 Expectation Failed\n",
+        421 => b"421 Misdirected Request\n",
         429 => b"429 Too Many Requests\n",
         431 => b"431 Request Header Fields Too Large\n",
         500 => b"500 Internal Server Error\n",

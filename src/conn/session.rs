@@ -416,6 +416,9 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> Factory<F, S, H> {
             info.worker,
         );
         conn.set_gate_tag(info.gate);
+        if let Some(tls) = &info.tls {
+            conn.set_tls(Some(Arc::clone(tls)));
+        }
         if proxy_protocol.is_some() {
             conn.set_proxy_facts(info.proxy.clone());
         }

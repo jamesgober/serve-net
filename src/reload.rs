@@ -14,8 +14,8 @@ use crate::error::{ConfigError, ConfigErrors, RuleId, ServeError, Subject};
 use crate::notify::Notifier;
 use crate::running::ListenerMeta;
 use crate::server::{
-    connection_caps, engine_family, file_owner, listener_meta, listener_runtime, net_listener,
-    shared_seats,
+    connection_caps, engine_family, file_owner, listener_limits, listener_meta, listener_runtime,
+    net_listener, shared_seats,
 };
 use crate::snapshot::Snapshot;
 
@@ -203,6 +203,30 @@ impl Reloader {
         }
         let table = ProfileTable::compile(&profiles, limits, keep_alive);
 
+        // net-io fixed a kept listener's transport limits when it bound it
+        // (the write stall, the minimum rate, the output budget, the linger,
+        // the idle and read timeouts, its hard and per-source caps). A reload
+        // that would change them is refused rather than reported as applied
+        // (D-111).
+        let mut kept_limits = Vec::with_capacity(kept.len());
+        let mut fixed = Vec::new();
+        for (id, spec) in &kept {
+            let next = listener_limits(spec, &table, &limits, self.transport.as_ref(), hard)?;
+            if metas[*id].as_ref().is_some_and(|m| m.net_limits != next) {
+                fixed.push(error(
+                    RuleId::ReloadListener,
+                    Subject::Listener(spec.name.clone()),
+                    "the transport limits net-io enforces on this listener (write_stall, min_rate, max_pending_output, linger, keep-alive idle, the read timeout, its connection caps) are fixed when it is bound",
+                    "add the listener under a new name and remove the old one, or restart",
+                ));
+            }
+            kept_limits.push(next);
+        }
+        if let Some(errors) = ConfigErrors::from_vec(fixed) {
+            self.notifier.reload_refused(&errors);
+            return Err(ServeError::Reload(errors));
+        }
+
         // Bind every added listener, door closed; on failure only these close.
         let mut bound: Vec<(usize, ListenerSpec)> = Vec::new();
         let in_use: Vec<String> = metas.iter().flatten().map(|m| m.name.clone()).collect();
@@ -269,7 +293,7 @@ impl Reloader {
                 new.same_user = Arc::clone(&was.same_user);
             }
             listeners_table[*id] = Some(runtime);
-            let meta = listener_meta(spec);
+            let meta = listener_meta(spec, kept_limits.remove(0));
             if metas[*id].as_ref().is_some_and(|m| !m.same_settings(&meta)) {
                 changed.push(spec.name.clone());
             }
@@ -290,7 +314,8 @@ impl Reloader {
                 }
             }
             listeners_table[*id] = Some(runtime);
-            next_metas[*id] = Some(listener_meta(spec));
+            let net_limits = listener_limits(spec, &table, &limits, self.transport.as_ref(), hard)?;
+            next_metas[*id] = Some(listener_meta(spec, net_limits));
             added_names.push(spec.name.clone());
         }
         let profile_caps = table

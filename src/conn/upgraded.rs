@@ -141,9 +141,17 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let Some(mut link) = self.ws.take() else {
             return (input.len(), Step::Close);
         };
-        let r = self.ws_drive(io, &mut link, input);
+        // The service runs inside: whatever it does, the link goes back
+        // before an unwind continues, so the close that follows still shuts
+        // the outbox, leaves the drain registry, and calls `closed` (D-111).
+        // Nothing is caught that the option would not catch: the unwind
+        // resumes, and net-io closes the connection as before.
+        let r = catch_unwind(AssertUnwindSafe(|| self.ws_drive(io, &mut link, input)));
         self.ws = Some(link);
-        r
+        match r {
+            Ok(r) => r,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     /// The client closed its sending side: whatever it sent is handled, then
@@ -331,7 +339,6 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     /// After the 101 left: `upgraded`, the HTTP engine's memory back, the
     /// timers, and `opened`.
     fn ws_open<I: Io>(&mut self, io: &mut I, link: &mut WsLink) {
-        link.opened = true;
         // A drain tells this connection, so it can send its 1001 (D-092).
         self.shared
             .control
@@ -342,7 +349,15 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             protocol: "websocket",
             subprotocol: link.subprotocol,
         };
-        shared.service.upgraded(&self.env, conn);
+        let catch = shared.catch_panics;
+        if catch {
+            let env = &self.env;
+            if catch_unwind(AssertUnwindSafe(|| shared.service.upgraded(env, conn))).is_err() {
+                self.ws_panicked(link);
+            }
+        } else {
+            shared.service.upgraded(&self.env, conn);
+        }
         // The HTTP engine and the body buffer are not used again.
         self.engine.reset();
         let _ = self.engine.shrink_idle();
@@ -352,7 +367,12 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         link.timer = now + link.interval;
         io.set_idle_timeout(Some(link.interval * 2 + CLOSE_WAIT));
         Self::ws_idle(io, link);
-        let catch = shared.catch_panics;
+        if link.finish || link.conn.state() != ws_net::State::Open {
+            // `upgraded` panicked: the socket closes without `opened`.
+            return;
+        }
+        // From here `closed` follows, whatever `opened` does.
+        link.opened = true;
         let env = &self.env;
         let mut wc = WebSocketConn {
             conn: &mut link.conn,

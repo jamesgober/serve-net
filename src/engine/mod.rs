@@ -141,6 +141,9 @@ pub enum RefusalKind {
     /// An upgrade from a web page the target's origin policy does not allow
     /// (cross-site WebSocket hijacking).
     CrossOrigin,
+    /// The request names another host than the TLS server name the client
+    /// asked for (HTTP 421, T-42).
+    Misdirected,
 }
 
 impl RefusalKind {
@@ -160,6 +163,7 @@ impl RefusalKind {
             RefusalKind::Service => "service",
             RefusalKind::Internal => "internal",
             RefusalKind::CrossOrigin => "cross_origin",
+            RefusalKind::Misdirected => "misdirected",
         }
     }
 }
@@ -296,6 +300,11 @@ pub struct HeadContext<'c> {
     pub(crate) resolved: Option<ClientInfo>,
     /// The facts of the connection's PROXY header, on a PROXY listener.
     pub(crate) proxy_facts: Option<&'c net_io::ProxyFacts>,
+    /// The TLS handshake's facts, on a connection serve-net decrypts.
+    pub(crate) tls: Option<&'c net_io::TlsInfo>,
+    /// Whether a request naming another host than the TLS server name is
+    /// refused (the listener did not `allow_sni_mismatch`).
+    pub(crate) sni_check: bool,
 }
 
 impl HeadContext<'_> {
@@ -309,6 +318,21 @@ impl HeadContext<'_> {
     #[must_use]
     pub fn resolved(&self) -> Option<&ClientInfo> {
         self.resolved.as_ref()
+    }
+
+    /// The TLS handshake's facts, on a connection serve-net decrypts. A
+    /// family whose protocol names a host checks it against `sni` as the
+    /// HTTP family does (T-42).
+    #[must_use]
+    pub fn tls(&self) -> Option<&net_io::TlsInfo> {
+        self.tls
+    }
+
+    /// Whether the listener checks a request's host against the TLS server
+    /// name (`false` after `ListenerSpec::allow_sni_mismatch`).
+    #[must_use]
+    pub fn checks_sni(&self) -> bool {
+        self.sni_check
     }
 }
 

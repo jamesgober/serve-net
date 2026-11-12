@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::engine::RefusalKind;
 
 /// The number of [`RefusalKind`] variants.
-const KINDS: usize = 12;
+const KINDS: usize = 13;
 
 fn kind_index(kind: RefusalKind) -> usize {
     match kind {
@@ -22,6 +22,7 @@ fn kind_index(kind: RefusalKind) -> usize {
         RefusalKind::Service => 9,
         RefusalKind::Internal => 10,
         RefusalKind::CrossOrigin => 11,
+        RefusalKind::Misdirected => 12,
     }
 }
 

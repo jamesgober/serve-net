@@ -248,7 +248,7 @@ impl fmt::Debug for DrainHandle {
 }
 
 /// One listener's facts for `listeners()`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ListenerMeta {
     pub(crate) name: String,
     pub(crate) ingress: IngressKind,
@@ -259,6 +259,8 @@ pub(crate) struct ListenerMeta {
     pub(crate) transport: String,
     /// The settings a reload can change in place, as text for comparison.
     pub(crate) settings: String,
+    /// The limits net-io enforces on this listener, fixed when it was bound.
+    pub(crate) net_limits: net_io::Limits,
 }
 
 impl ListenerMeta {

@@ -37,9 +37,22 @@ pub struct Envelope {
     pub(crate) deadline: Instant,
     pub(crate) worker: WorkerId,
     pub(crate) user_word: u64,
+    /// The TLS handshake's facts, on a connection serve-net decrypts.
+    pub(crate) tls: Option<std::sync::Arc<net_io::TlsInfo>>,
 }
 
 impl Envelope {
+    /// The TLS handshake's facts when serve-net decrypts this connection
+    /// (`Ingress::DirectTls`): the server name the client asked for
+    /// (`sni`), the negotiated protocol, the version and cipher suite, and
+    /// the SHA-256 of a verified client certificate's public key
+    /// (`peer_spki_sha256`, `None` without one). `None` on a connection
+    /// without TLS, including one a front end decrypted.
+    #[must_use]
+    pub fn tls(&self) -> Option<&net_io::TlsInfo> {
+        self.tls.as_deref()
+    }
+
     /// The connection's id.
     #[must_use]
     pub fn connection(&self) -> ConnectionId {
@@ -144,6 +157,7 @@ pub(crate) mod tests {
             deadline: now,
             worker: WorkerId::first(),
             user_word: 0,
+            tls: None,
         }
     }
 

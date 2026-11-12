@@ -708,6 +708,19 @@ impl Family for HttpFamily {
         cx: &HeadContext<'a>,
     ) -> Result<(HttpHead<'a>, ClientInfo), EngineError> {
         let base = *cx.client;
+        // T-42: the client's own `Host` against the name it gave the TLS
+        // layer, before any service code sees the request. Checked once, at
+        // the head; the view built again for the call is the same request.
+        if cx.resolved.is_none() && cx.sni_check {
+            if let (Some(sni), Some(host)) = (cx.tls.and_then(net_io::TlsInfo::sni), raw.host()) {
+                if !same_host(host, sni) {
+                    return Err(EngineError {
+                        kind: RefusalKind::Misdirected,
+                        status: 421,
+                    });
+                }
+            }
+        }
         let ingress_error = EngineError {
             kind: RefusalKind::Ingress,
             status: 400,
@@ -913,6 +926,21 @@ impl Family for HttpFamily {
             UpgradeTarget::WebSocket(ref t) => crate::ws::switch_http1(engine, t, unix_secs, out),
         }
     }
+}
+
+/// Whether an authority (`host`, `host:port`, `[v6]:port`) names the TLS
+/// server name `sni`: letter case, a port, and one trailing dot are ignored.
+pub(crate) fn same_host(authority: &str, sni: &str) -> bool {
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or(rest, |(h, _)| h),
+        None => authority
+            .rsplit_once(':')
+            .filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit()))
+            .map_or(authority, |(h, _)| h),
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let sni = sni.strip_suffix('.').unwrap_or(sni);
+    !host.is_empty() && host.eq_ignore_ascii_case(sni)
 }
 
 /// Writes the reply's head, and its body unless `chunked`.
@@ -1190,6 +1218,20 @@ impl<F> fmt::Debug for Handler<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_same_host_ignores_case_port_and_one_trailing_dot() {
+        assert!(same_host("admin.example.test", "admin.example.test"));
+        assert!(same_host("ADMIN.Example.test:8443", "admin.example.test"));
+        assert!(same_host("admin.example.test.", "admin.example.test"));
+        assert!(same_host("admin.example.test", "admin.example.test."));
+        assert!(same_host("[::1]:443", "::1"));
+        assert!(!same_host("www.example.test", "admin.example.test"));
+        assert!(!same_host("admin.example.test.evil", "admin.example.test"));
+        assert!(!same_host("admin.example.tes", "admin.example.test"));
+        assert!(!same_host(":443", "admin.example.test"));
+        assert!(!same_host("", ""));
+    }
 
     #[test]
     fn test_reply_debug_redacts_values() {

@@ -699,6 +699,11 @@ where
             )?;
             net = net.listener(net_spec);
         }
+        // What net-io fixed for each listener, for a reload to compare.
+        let net_limits = listeners
+            .iter()
+            .map(|l| listener_limits(l, &profiles, &limits, transport.as_ref(), hard))
+            .collect::<Result<Vec<_>, _>>()?;
         let tables = Arc::new(Snapshot::new(Tables {
             profiles,
             listeners: runtime_listeners.into_iter().map(Some).collect(),
@@ -756,7 +761,11 @@ where
                 }
             }
         }
-        let listeners = listeners.iter().map(listener_meta).collect();
+        let listeners = listeners
+            .iter()
+            .zip(net_limits)
+            .map(|(l, n)| listener_meta(l, n))
+            .collect();
         let reloader = Reloader {
             transport,
             tables,
@@ -917,12 +926,13 @@ pub(crate) fn listener_runtime(l: &ListenerSpec, cap: Arc<Cap>) -> ListenerRunti
             }),
             _ => None,
         },
+        sni_check: l.sni_mismatch.is_none(),
         cap,
     }
 }
 
 /// What `listeners()` and a reload need to know about a listener.
-pub(crate) fn listener_meta(l: &ListenerSpec) -> ListenerMeta {
+pub(crate) fn listener_meta(l: &ListenerSpec, net_limits: net_io::Limits) -> ListenerMeta {
     ListenerMeta {
         ingress: match l.ingress.proxy().map(|p| p.kind) {
             None if l.ingress.is_unix() => IngressKind::Unix,
@@ -937,6 +947,7 @@ pub(crate) fn listener_meta(l: &ListenerSpec) -> ListenerMeta {
         source: l.source.clone(),
         transport: transport_key(&l.ingress),
         settings: format!("{:?} {:?} {:?}", l.ingress, l.scheme, l.max_connections),
+        net_limits,
     }
 }
 
@@ -987,6 +998,44 @@ pub(crate) fn net_listener(
             });
         }
     };
+    let mut net_spec = net_spec.limits(listener_limits(spec, profiles, limits, base, hard)?);
+    if named {
+        // A reload that replaces a listener binds it before the old one goes,
+        // and net-io wants names unique.
+        net_spec = net_spec.name(&spec.name);
+    }
+    if matches!(spec.ingress, Ingress::DirectTls) {
+        net_spec = net_spec.tls(true);
+    }
+    if let Some(ProxySource {
+        kind: ProxyKind::ProxyProtocol(versions),
+        trusted,
+        ..
+    }) = spec.ingress.proxy()
+    {
+        net_spec = net_spec.proxy(net_io::ProxyMode::Required {
+            versions: *versions,
+        });
+        // Over a Unix socket every peer that passed its credential check is
+        // trusted; net-io ignores the list there.
+        if !spec.ingress.is_unix() {
+            net_spec = net_spec.trusted_proxies(trusted.clone());
+        }
+    }
+    Ok(net_spec)
+}
+
+/// The limits net-io enforces on a listener's connections, from the spec,
+/// its profile, and the server's limits. net-io fixes them when it binds the
+/// listener, so a reload compares them and refuses a change it cannot make
+/// (D-111).
+pub(crate) fn listener_limits(
+    spec: &ListenerSpec,
+    profiles: &ProfileTable,
+    limits: &Limits,
+    base: Option<&net_io::Limits>,
+    hard: u32,
+) -> Result<net_io::Limits, ServeError> {
     let compiled = profiles.compiled(spec.profile);
     let behind = spec.ingress.proxy().is_some();
     let idle = compiled.map_or_else(
@@ -1037,32 +1086,7 @@ pub(crate) fn net_listener(
         // to the real client, so the cap stays.
         own = own.max_per_source(listener_hard, net_io::PrefixPolicy::DEFAULT);
     }
-    let own = own.build().map_err(ServeError::Start)?;
-    let mut net_spec = net_spec.limits(own);
-    if named {
-        // A reload that replaces a listener binds it before the old one goes,
-        // and net-io wants names unique.
-        net_spec = net_spec.name(&spec.name);
-    }
-    if matches!(spec.ingress, Ingress::DirectTls) {
-        net_spec = net_spec.tls(true);
-    }
-    if let Some(ProxySource {
-        kind: ProxyKind::ProxyProtocol(versions),
-        trusted,
-        ..
-    }) = proxy
-    {
-        net_spec = net_spec.proxy(net_io::ProxyMode::Required {
-            versions: *versions,
-        });
-        // Over a Unix socket every peer that passed its credential check is
-        // trusted; net-io ignores the list there.
-        if !spec.ingress.is_unix() {
-            net_spec = net_spec.trusted_proxies(trusted.clone());
-        }
-    }
-    Ok(net_spec)
+    own.build().map_err(ServeError::Start)
 }
 
 /// The first inherited listener's name, for an error about the environment.
