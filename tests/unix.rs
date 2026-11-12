@@ -38,7 +38,10 @@ fn start(tag: &str, ingress: Ingress) -> (serve_net::Running, PathBuf) {
 /// One request; `None` when the server closed without answering.
 fn ask(path: &PathBuf, request: &[u8]) -> Option<String> {
     let mut s = UnixStream::connect(path).ok()?;
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // macOS answers EINVAL when the server has already closed the socket (a
+    // peer outside the allowlist is closed at once): no answer, as a read
+    // would find.
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     s.write_all(request).ok()?;
     let mut got = Vec::new();
     let mut buf = [0u8; 4096];

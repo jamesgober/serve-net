@@ -275,26 +275,35 @@ fn test_t33_large_replies_on_many_connections_stay_bounded() {
         round();
     }
     let warm = settle();
-    for _ in 0..3 {
-        round();
-    }
-    // On a loaded host the idle trim can run late: a connection still holding
-    // its 64 KiB reply buffer two seconds on looks like growth (CI once saw 44
-    // of them). A leak never comes back down, so wait up to 15 s for the heap
-    // to return under the bound before counting.
+    // The pools hold a varying number of 64 KiB buffers from one reading to
+    // the next: locally the settled heap moved between 1.8 MB under and 0.1 MB
+    // over the warm reading across sets of rounds, and CI saw single readings
+    // up to 2.9 MB over (on a loaded host the idle trim also runs late). A
+    // leak raises every reading, so take the lowest of three sets, each
+    // settled, with up to 15 s for a late trim.
     let bound = warm + 1024 * 1024;
-    let mut after = settle();
-    let until = std::time::Instant::now() + Duration::from_secs(15);
-    while after >= bound && std::time::Instant::now() < until {
-        std::thread::sleep(Duration::from_millis(250));
-        after = LIVE.load(Ordering::Relaxed);
+    let mut readings = Vec::new();
+    for _ in 0..3 {
+        for _ in 0..2 {
+            round();
+        }
+        let mut v = settle();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while v >= bound && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(250));
+            v = LIVE.load(Ordering::Relaxed);
+        }
+        readings.push(v);
     }
+    let after = readings.iter().copied().min().unwrap_or(warm);
     let grew = after.saturating_sub(warm);
-    eprintln!("64 connections, 256 KiB replies: live heap {warm} -> {after} bytes (+{grew})");
+    eprintln!(
+        "64 connections, 256 KiB replies: live heap {warm} -> {readings:?} bytes (lowest +{grew})"
+    );
     // Pools may take a buffer or two more; growth with the rounds is a leak.
     assert!(
         grew < 1024 * 1024,
-        "{grew} bytes more after three more rounds"
+        "{grew} bytes more at the lowest of three sets of rounds: {readings:?} from {warm}"
     );
     drop(conns);
     let _ = server.drain(Duration::from_secs(2));
