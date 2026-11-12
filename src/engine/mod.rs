@@ -318,6 +318,7 @@ pub(crate) fn extend_wiping(buf: &mut Vec<u8>, bytes: &[u8], wipe: bool) {
 }
 
 /// Appends `text` to a string, growing as `reserve_wiping` does.
+#[cfg(feature = "ws")]
 pub(crate) fn push_str_wiping(s: &mut String, text: &str, wipe: bool) {
     if wipe && s.capacity() - s.len() < text.len() {
         let need = s.len().saturating_add(text.len());
@@ -590,10 +591,13 @@ mod tests {
         let mut buf = b"pass".to_vec();
         extend_wiping(&mut buf, b"word, and more than four bytes", true);
         assert_eq!(buf, b"password, and more than four bytes");
-        let mut s = String::with_capacity(2);
-        s.push_str("ab");
-        push_str_wiping(&mut s, "cdefgh", true);
-        assert_eq!(s, "abcdefgh");
+        #[cfg(feature = "ws")]
+        {
+            let mut s = String::with_capacity(2);
+            s.push_str("ab");
+            push_str_wiping(&mut s, "cdefgh", true);
+            assert_eq!(s, "abcdefgh");
+        }
         let mut out = OutBuf::new();
         out.wipe = true;
         out.push(&[7; 100]);
