@@ -48,11 +48,11 @@ production-site exit move to 0.9.0 (D-112).
   around this way. Such a request is now answered `421 Misdirected Request`
   before `head` runs (T-42); `ListenerSpec::allow_sni_mismatch(reason)` turns
   the check off for a listener whose hosts share one TLS policy. Affects 0.4.0
-  to 0.7.1 with `Ingress::DirectTls`.
+  to 0.7.1 with `Ingress::DirectTls`. Advisory: [GHSA-2px9-pm7v-j3cj](https://github.com/jamesgober/serve-net/security/advisories/GHSA-2px9-pm7v-j3cj).
 - WebSocket upgrades accepted any `Origin`, so a page on another site could
   open a socket with the visitor's cookies (cross-site WebSocket hijacking).
   Upgrades are now same-origin by default (`WebSocketTarget::origins`, below).
-  Affects 0.6.0 to 0.7.1 with feature `ws`.
+  Affects 0.6.0 to 0.7.1 with feature `ws`. Advisory: [GHSA-cjcj-vccf-cxfj](https://github.com/jamesgober/serve-net/security/advisories/GHSA-cjcj-vccf-cxfj).
 - A panic in `done` (or the observer) kept the request's admission for the
   life of the server, so a few such requests made every later one a 503.
   Admission is now released on every path, a panic included.

@@ -107,5 +107,5 @@ its test, and its cost) and the build-time validation rules (V-1 to V-26) are in
 |---|---|---|---|
 | [GHSA-7vvv-g6cw-p8gj](https://github.com/jamesgober/serve-net/security/advisories/GHSA-7vvv-g6cw-p8gj) | 0.3.0 to 0.6.1 | 0.6.2 | with `trust_host` on, a client that was not a trusted proxy could set the authority a service saw in `call` |
 | [GHSA-jcp7-qqq6-xw24](https://github.com/jamesgober/serve-net/security/advisories/GHSA-jcp7-qqq6-xw24) | 0.6.0 to 0.6.2 | 0.6.3 | request smuggling after a WebSocket upgrade, and two forwarded-fact spoofing defects |
-| (pending) | 0.4.0 to 0.7.1 | 0.8.0 | on a TLS listener, a request could name another host than the TLS server name, stepping around a policy the TLS acceptor chose per host (client certificates) |
-| (pending) | 0.6.0 to 0.7.1 | 0.8.0 | WebSocket upgrades accepted any `Origin`: a page on another site could open a socket with the visitor's cookies (cross-site WebSocket hijacking) |
+| [GHSA-2px9-pm7v-j3cj](https://github.com/jamesgober/serve-net/security/advisories/GHSA-2px9-pm7v-j3cj) | 0.4.0 to 0.7.1 | 0.8.0 | on a TLS listener, a request could name another host than the TLS server name, stepping around a policy the TLS acceptor chose per host (client certificates) |
+| [GHSA-cjcj-vccf-cxfj](https://github.com/jamesgober/serve-net/security/advisories/GHSA-cjcj-vccf-cxfj) | 0.6.0 to 0.7.1 | 0.8.0 | WebSocket upgrades accepted any `Origin`: a page on another site could open a socket with the visitor's cookies (cross-site WebSocket hijacking) |
