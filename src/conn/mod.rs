@@ -378,8 +378,28 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         now: Instant,
         worker: WorkerId,
     ) -> Self {
-        let tables_version = shared.tables.version();
-        let tables = shared.tables.load();
+        let tables = (shared.tables.version(), shared.tables.load());
+        Self::with_tables(
+            shared,
+            (tables.1, tables.0),
+            listener,
+            connection,
+            client,
+            now,
+            worker,
+        )
+    }
+
+    /// As `new`, with the tables (and their version) the caller already read.
+    pub(crate) fn with_tables(
+        shared: Arc<Shared<F, S, H>>,
+        (tables, tables_version): (Arc<Tables>, u64),
+        listener: usize,
+        connection: ConnectionId,
+        client: ClientInfo,
+        now: Instant,
+        worker: WorkerId,
+    ) -> Self {
         let profile_id = tables
             .listeners
             .get(listener)

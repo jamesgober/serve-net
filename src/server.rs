@@ -735,6 +735,11 @@ where
         let factory = Factory {
             shared,
             rt: Arc::clone(&rt),
+            readers: (0..threads.max(1))
+                .map(|_| {
+                    crate::conn::session::TableReader(crate::sync::Mutex::new(tables.reader()))
+                })
+                .collect(),
         };
         let health = Arc::new(HealthState::new(listeners.len(), accept_failure_window));
         let events = Tap {

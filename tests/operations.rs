@@ -598,3 +598,33 @@ fn test_t26_deferrals_past_the_per_worker_cap_are_refused() {
     assert!(got.starts_with("HTTP/1.1 200"), "{got}");
     let _ = server.drain(Duration::from_secs(2));
 }
+
+/// A worker that never comes back cannot hang `drain`: it returns about 5 s
+/// past its deadline with `stuck` set (D-111).
+#[test]
+fn test_drain_returns_when_a_worker_is_stuck() {
+    let (release, hold) = mpsc::channel::<()>();
+    let hold = Mutex::new(hold);
+    let (entered, inside) = mpsc::channel::<()>();
+    let entered = Mutex::new(entered);
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .workers(serve_net::Workers::reactor(1))
+        .serve(serve_net::handler(move |_req, reply| {
+            let _ = entered.lock().unwrap().send(());
+            // Blocks until the test lets it go, after the drain returned.
+            let _ = hold.lock().unwrap().recv();
+            reply.text(200, "late");
+        }))
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let mut c = TcpStream::connect(addr).unwrap();
+    c.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+    inside.recv_timeout(Duration::from_secs(10)).unwrap();
+    let started = Instant::now();
+    let report = server.drain(Duration::from_millis(200));
+    let took = started.elapsed();
+    assert!(report.stuck, "{report:?}");
+    assert!(took < Duration::from_secs(8), "drain took {took:?}");
+    let _ = release.send(());
+}

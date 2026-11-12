@@ -197,6 +197,11 @@ pub struct DrainReport {
     pub elapsed: Duration,
     /// Whether the deadline passed with connections still open.
     pub deadline_hit: bool,
+    /// net-io's shutdown had not returned 5 s after the deadline: a worker is
+    /// stuck (a service that never returns, or a dead worker). `drain`
+    /// returns anyway, and the stuck threads are left behind; the process
+    /// should exit (0.8.0).
+    pub stuck: bool,
 }
 
 impl DrainReport {
@@ -209,7 +214,52 @@ impl DrainReport {
             refused_while_draining,
             elapsed: r.took,
             deadline_hit: r.killed > 0,
+            stuck: false,
         }
+    }
+
+    /// A drain whose shutdown did not come back in time.
+    fn stuck(counters: &Counters, elapsed: Duration) -> Self {
+        let (requests_finished, refused_while_draining) = counters.draining();
+        DrainReport {
+            graceful: 0,
+            killed: 0,
+            requests_finished,
+            refused_while_draining,
+            elapsed,
+            deadline_hit: true,
+            stuck: true,
+        }
+    }
+}
+
+/// How long past its deadline `drain` waits for net-io's shutdown.
+const DRAIN_MARGIN: Duration = Duration::from_secs(5);
+
+/// Shuts `server` down with `deadline`, waiting at most `DRAIN_MARGIN` past
+/// it: a stuck worker cannot hang the caller (D-111). The shutdown runs on a
+/// thread of its own, which is left behind when it does not come back.
+fn bounded_shutdown(
+    server: net_io::Server,
+    deadline: Instant,
+    started: Instant,
+    counters: &Counters,
+) -> DrainReport {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("serve-net-drain".into())
+        .spawn(move || {
+            let _ = tx.send(server.shutdown(deadline));
+        });
+    if spawned.is_err() {
+        // No thread: the server was dropped with the closure, which closes
+        // every connection at once.
+        return DrainReport::stuck(counters, started.elapsed());
+    }
+    let wait = deadline.saturating_duration_since(Instant::now()) + DRAIN_MARGIN;
+    match rx.recv_timeout(wait) {
+        Ok(report) => DrainReport::from_net(report, counters),
+        Err(_) => DrainReport::stuck(counters, started.elapsed()),
     }
 }
 
@@ -523,7 +573,8 @@ impl Running {
     pub fn drain(mut self, deadline: Duration) -> DrainReport {
         let inner = self.inner.take().unwrap_or_else(|| unreachable!());
         inner.notifier.drain_deadline(deadline);
-        let deadline = Instant::now() + deadline;
+        let started = Instant::now();
+        let deadline = started + deadline;
         inner.settle_accepts();
         // Replies in flight read the line live and carry the close signal.
         inner.switch.request(deadline);
@@ -534,7 +585,7 @@ impl Running {
             .await_goodbyes(deadline.min(Instant::now() + GOODBYE_MAX));
         inner.await_drain_start();
         let (counters, notifier) = (Arc::clone(&inner.counters), Arc::clone(&inner.notifier));
-        let report = DrainReport::from_net(inner.into_server().shutdown(deadline), &counters);
+        let report = bounded_shutdown(inner.into_server(), deadline, started, &counters);
         notifier.drain_finished(&report);
         report
     }
