@@ -15,12 +15,12 @@
 
 ## [0.8.1] - 2026-11-12
 
-net-io 0.7.2, its security release (D-113).
+net-io 0.7.2, its security release.
 
 ### Security
 
-- net-io 0.7.2 (from 0.7.1) fixes two critical and three high defects found by
-  an independent review: on Windows, a crash or memory corruption when the gate
+- net-io 0.7.2 (from 0.7.1) fixes two critical and three high-severity bugs: on
+  Windows, a crash or memory corruption when the gate
   denied a write on a named-pipe connection, and a forged listener hand-off
   message; on the reactor with TLS, silent connections holding the shared
   buffer budget; Unix sockets bound in a directory other users can write to;
@@ -35,9 +35,9 @@ net-io 0.7.2, its security release (D-113).
 
 ## [0.8.0] - 2026-11-11
 
-The findings of an independent review of 0.7.1, each fixed with a test that
-fails without it, on top of the 0.8 work below. FastCGI, net-io 0.8, and the
-production-site exit move to 0.9.0 (D-112).
+Security fixes on the edges a client controls, and the 0.8 work below, each
+with a regression test. FastCGI, net-io 0.8, and the production-site exit
+move to 0.9.0.
 
 ### Security
 
@@ -48,11 +48,11 @@ production-site exit move to 0.9.0 (D-112).
   around this way. Such a request is now answered `421 Misdirected Request`
   before `head` runs (T-42); `ListenerSpec::allow_sni_mismatch(reason)` turns
   the check off for a listener whose hosts share one TLS policy. Affects 0.4.0
-  to 0.7.1 with `Ingress::DirectTls`.
+  to 0.7.1 with `Ingress::DirectTls`. Advisory: [GHSA-2px9-pm7v-j3cj](https://github.com/jamesgober/serve-net/security/advisories/GHSA-2px9-pm7v-j3cj).
 - WebSocket upgrades accepted any `Origin`, so a page on another site could
   open a socket with the visitor's cookies (cross-site WebSocket hijacking).
   Upgrades are now same-origin by default (`WebSocketTarget::origins`, below).
-  Affects 0.6.0 to 0.7.1 with feature `ws`.
+  Affects 0.6.0 to 0.7.1 with feature `ws`. Advisory: [GHSA-cjcj-vccf-cxfj](https://github.com/jamesgober/serve-net/security/advisories/GHSA-cjcj-vccf-cxfj).
 - A panic in `done` (or the observer) kept the request's admission for the
   life of the server, so a few such requests made every later one a 503.
   Admission is now released on every path, a panic included.
