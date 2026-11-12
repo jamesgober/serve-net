@@ -71,10 +71,10 @@ The path through `Conn` (`src/conn/mod.rs`), for any family:
 
 1. **Open.** `Factory::open` checks the soft caps (global, listener, profile). Over a cap, the engine writes the busy refusal (`503` for HTTP) before anything is read, and the connection closes with a linger so the client reads it instead of a reset. net-io's hard cap sits above with a headroom; past it net-io resets without calling serve-net.
 2. **Feed.** net-io hands its read buffer; `Conn::process` feeds the engine and polls it. The head deadline runs from accept for the first request and from the first byte for later ones.
-3. **Head.** On `EngineEvent::Head` (`Conn::on_head`): the control line is read (one load when its epoch has not moved), the family builds the head view and the real client (`Family::head`: for HTTP this is the trusted forwarded walk), then `Service::head` chooses the body policy, refuses, or asks for an upgrade. Then, in this order: the control line's shed and lockdown, `Admit::admit`, `Checkpoint` at `Admitted`, and the declared body length against `max_body`.
+3. **Head.** On `EngineEvent::Head` (`Conn::on_head`): the control line is read (one load when its epoch has not moved), the family builds the head view and the real client (`Family::head`: for HTTP this is the trusted forwarded walk, and on a TLS connection the check that `Host` names the TLS server name, answered 421 otherwise), then `Service::head` chooses the body policy, refuses, or asks for an upgrade. Then, in this order: the control line's shed and lockdown, `Admit::admit`, `Checkpoint` at `Admitted`, and the declared body length against `max_body`.
 4. **Body.** Buffered up to `max_body`, discarded with a bound, or streamed to the service piece by piece, under the request deadline and net-io's minimum rate.
 5. **Dispatch.** On `BodyEnd`: `Checkpoint` at `BeforeDispatch`, then `Dispatch` runs `Service::call` inline or offloaded.
-6. **Reply.** `Outcome::Done`: `Checkpoint` at `BeforeReply`, the family encodes the reply into the `OutBuf`, and the whole reply is pushed into net-io's output before the session returns. `Outcome::Deferred`: the connection parks under the reply deadline until the token completes or is dropped.
+6. **Reply.** `Outcome::Done`: `Checkpoint` at `BeforeReply`, the family encodes the reply's head into the `OutBuf`, and serve-net hands net-io the head and then the body straight from the reply data (`Family::reply_body`), as net-io's output budget takes them; a slow reader holds at most that budget, never a copy of the body. `Outcome::Deferred`: the connection parks under the reply deadline until the token completes or is dropped.
 7. **Done.** After the last byte is handed over, `Service::done` runs once, `Admit::release` returns the slot, and the machine goes back to step 2 with any pipelined input, or idles under the keep-alive timeout.
 
 Rules that hold on every path (PLAN section 8.3):
@@ -83,7 +83,7 @@ Rules that hold on every path (PLAN section 8.3):
 - `Service::call` never runs for a request that failed ingress, was refused at `head`, was not admitted, or was denied.
 - A refusal skips every later step and goes straight to the engine's refusal bytes and the close signal.
 - `Service::done` runs exactly once for every request that reached `head`, whether it was answered, refused, timed out, drained, or killed.
-- A reply is handed to net-io whole, so the gate's egress check and a checkpoint denial never split a reply.
+- A reply is complete before its first byte goes to net-io, so a checkpoint denial never splits one and the gate's egress check sees its start; only a streamed reply leaves part by part.
 
 ## States
 
@@ -133,7 +133,7 @@ Every rule runs at `build` and again at `reload`, and every error is reported at
 
 ## Drain and restart
 
-`drain(deadline)` sets serve-net's half of the merged control line to `Draining`: net-io closes the door, closes idle connections at once, and kills what remains at the deadline; serve-net sets the close signal on every reply still in progress and sends a WebSocket `1001` to open sockets. A restart without dropping connections hands the listening socket to the new process (descriptor passing or systemd socket activation) and drains the old one; `tests/restart.rs` kills the old process at four points under load and checks that nothing begun after the kill is lost (I-9, D-095).
+`drain(deadline)` sets serve-net's half of the merged control line to `Draining`: net-io closes the door, closes idle connections at once, and kills what remains at the deadline; serve-net sets the close signal on every reply still in progress and sends a WebSocket `1001` to open sockets. `drain` waits at most 5 s past its deadline for net-io's shutdown; a worker that never comes back leaves `DrainReport::stuck` set. A restart without dropping connections hands the listening socket to the new process (descriptor passing or systemd socket activation) and drains the old one; `tests/restart.rs` kills the old process at four points under load and checks that nothing begun after the kill is lost (I-9, D-095).
 
 ## Where to read next
 
