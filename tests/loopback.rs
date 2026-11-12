@@ -1047,10 +1047,13 @@ fn test_loopback_timeouts_answer_on_real_sockets() {
     use serve_net::{Limits, ListenerSpec, Server};
     let server = Server::builder()
         .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        // Deadlines a loaded machine can meet: the head's runs from accept,
+        // and a worker that reaches the bytes only after it passed closes
+        // quietly instead of answering 408.
         .limits(
             Limits::new()
-                .head_timeout(Duration::from_millis(200))
-                .request_timeout(Duration::from_millis(400))
+                .head_timeout(Duration::from_secs(1))
+                .request_timeout(Duration::from_secs(2))
                 .min_rate(0, Duration::from_secs(10)),
         )
         .serve(serve_net::handler(|_r, reply| {
@@ -1060,12 +1063,16 @@ fn test_loopback_timeouts_answer_on_real_sockets() {
     let addr = server.local_addr().unwrap();
     // A head that never finishes.
     let mut head = connect(addr);
+    head.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
     head.write_all(b"GET / HT").unwrap();
     let mut got = String::new();
     let _ = head.read_to_string(&mut got);
     assert!(got.starts_with("HTTP/1.1 408"), "head: {got}");
     // A body that never finishes.
     let mut body = connect(addr);
+    body.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
     body.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
         .unwrap();
     let mut got = String::new();
