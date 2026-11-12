@@ -11,6 +11,51 @@
 
 ## [Unreleased]
 
+---
+
+## [0.8.0] - 2026-11-11
+
+The findings of an independent review of 0.7.1, each fixed with a test that
+fails without it, on top of the 0.8 work below. FastCGI, net-io 0.8, and the
+production-site exit move to 0.9.0 (D-112).
+
+### Security
+
+- On a TLS listener, a request could name another host in `Host` than the
+  server name the client asked the TLS layer for, and serve-net served it as
+  that host. A TLS acceptor that chose its policy by name (client
+  certificates required for one host and not another) could be stepped
+  around this way. Such a request is now answered `421 Misdirected Request`
+  before `head` runs (T-42); `ListenerSpec::allow_sni_mismatch(reason)` turns
+  the check off for a listener whose hosts share one TLS policy. Affects 0.4.0
+  to 0.7.1 with `Ingress::DirectTls`.
+- WebSocket upgrades accepted any `Origin`, so a page on another site could
+  open a socket with the visitor's cookies (cross-site WebSocket hijacking).
+  Upgrades are now same-origin by default (`WebSocketTarget::origins`, below).
+  Affects 0.6.0 to 0.7.1 with feature `ws`.
+- A panic in `done` (or the observer) kept the request's admission for the
+  life of the server, so a few such requests made every later one a 503.
+  Admission is now released on every path, a panic included.
+- A panicking WebSocket handler with `catch_service_panics` off skipped
+  `closed`, left every `WsSender` accepting sends into a queue nobody
+  drained, and stayed in the drain registry. The connection now closes them,
+  and `closed` runs once after `opened`.
+- A reply body was copied whole into the connection's output buffer and held
+  until the client read it: slow readers of a large body could hold one copy
+  each (eight clients of an 8 MiB `body_static` held 64 MiB). The body is now
+  sent from where the service put it, and a slow reader holds at most the
+  output budget.
+- `Limits::max_deferred_per_worker` did not cap parked requests as
+  documented; it now does, and a deferral past it gets the busy refusal (T-26).
+- `RuleId::PublicBind` did not check sockets passed in by systemd or a
+  supervisor, or an inherited listener's fallback address; it now does, at
+  build for the fallback and at bind, before the door opens, for a passed
+  socket.
+- On a wiping profile, a buffer that grows now zeroes the block it leaves
+  (the request body, the reply head, WebSocket messages); a deferred reply
+  that is replaced, never sent, or dropped with its token is zeroed; an
+  offloaded request's body and a `DetachedHead` are zeroed when dropped.
+
 ### Added
 
 - `WebSocketTarget::origins`: which web pages may open a WebSocket, checked
@@ -28,9 +73,33 @@
   protocol served through `bind_family`, built from the public API alone.
 - `Profile::wipes_buffers`, so a custom family's engine can zero the
   client's bytes it holds under a wiping profile, as the HTTP engine does.
+- `Envelope::tls` and `HeadContext::tls`: the TLS handshake's facts (the
+  server name, ALPN, version, cipher suite, and the SHA-256 of a verified
+  client certificate's public key) on a connection serve-net decrypts.
+- `ListenerSpec::allow_sni_mismatch`, `HeadContext::checks_sni`, and
+  `RefusalKind::Misdirected`.
+- `Family::reply_body`, a provided method: the body that follows what
+  `respond` wrote, sent by serve-net from the reply data.
+- `DrainReport::stuck`: `Running::drain` waits at most 5 s past its deadline
+  for net-io's shutdown, and returns with this set when a worker never came
+  back.
 
 ### Changed
 
+- `catch_service_panics` covers `head`, `done`, and `upgraded` too: a panic
+  in `head` answers the 500 refusal instead of a reset, and `done` still runs
+  for that request with the option on or off.
+- A reload that changes the transport limits net-io enforces on a kept
+  listener (`write_stall`, `min_rate`, `max_pending_output`, `linger`,
+  keep-alive idle, the read timeout, its hard and per-source caps, which
+  moving it between direct and forwarded ingress changes) is refused with
+  `ReloadListener`. Before, it was reported as applied and never took effect.
+  Re-add the listener under a new name, or restart.
+- Each worker reads the server's tables through its own cache when it
+  accepts a connection: one atomic when nothing changed, instead of two
+  takes of a lock all workers share.
+- The README, the crate description, and the docs no longer present FastCGI
+  as available; it is planned for 0.9.0.
 - ws-net 0.9 (from 0.2): its fixes since 0.2 reach serve-net's WebSocket
   connections, among them an allocation failure answered with 1011 instead of
   aborting the process, and a 5 s close timeout armed from the start.
@@ -53,6 +122,10 @@
 
 ### Fixed
 
+- `BodyPolicy::Discard { max }` counted the head toward `max`, so a long head
+  closed a connection whose small body was well under it.
+- After a panic in `call` with `catch_service_panics` off, `Running::health`
+  reported the worker stalled while it sat idle.
 - A listener is refused when its profile's engine belongs to another
   family than the one being bound (`RuleId::EngineFamily`): `bind` served
   HTTP on a profile marked `EngineChoice::Custom`, and `bind_family` served
@@ -457,7 +530,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/serve-net/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/jamesgober/serve-net/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jamesgober/serve-net/compare/v0.6.3...v0.7.0
 [0.6.3]: https://github.com/jamesgober/serve-net/compare/v0.6.2...v0.6.3

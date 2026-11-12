@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "serve-net"
-version = "0.7.1"
+version = "0.8.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -19,7 +19,7 @@ readme = "README.md"
 exclude = ["fuzz/", "compare/"]
 
 # Description
-description = "The network service engine for Rust: listeners over net-io, ingress from direct clients, reverse proxies (PROXY protocol or trusted forwarded headers), Unix sockets, and FastCGI, a per-connection engine with a slot for any sans-IO protocol engine, admission, drain, and restarts without dropped connections."
+description = "The network service engine for Rust: listeners over net-io, ingress from direct clients, reverse proxies (PROXY protocol or trusted forwarded headers), and Unix sockets, a per-connection engine with a slot for any sans-IO protocol engine, admission, drain, and restarts without dropped connections."
 
 # Keywords (5 max)
 keywords = ["server", "network", "service", "http", "engine"]

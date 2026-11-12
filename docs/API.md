@@ -149,7 +149,7 @@ Every cost is a target on reference hardware. Numbers marked **[est.]** are esti
 |---|---|---|---|
 | (none) | always | the server, listeners, ingress, profiles, limits, hooks, snapshots, the engine and family traits | `0.3.0` |
 | `http1` | on | the HTTP family over http-net: `HttpService`, `HttpRequest`, `HttpReply`, `engine::Http1`, the Tier 1 functions `http` and `http_behind_proxy`, `testing` | `0.3.0` |
-| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.8.0` |
+| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.9.0` |
 | `ws` | off | WebSocket upgrades over ws-net: `UpgradeTarget::WebSocket`, `WebSocketTarget`, `WebSocketService`, `WebSocketConn`, `WsMessage`, `WsSendError`, the `ws_net` re-export (implies `http1`) | `0.6.0` |
 | `h2` | off | HTTP/2 over h2-net: `engine::H2`, ALPN `h2` | after `1.0.0`, or earlier as a minor version when h2-net reaches its 0.3 |
 
@@ -308,7 +308,7 @@ A FastCGI responder for Apache (`mod_fcgid`, `mod_proxy_fcgi`) or nginx (`fastcg
 
 | Grade | Tier | Version | Feature |
 |---|---|---|---|
-| P1 | 1 | `0.8.0` | `fastcgi` |
+| P1 | 1 | `0.9.0` | `fastcgi` |
 
 Errors: `ServeError::Inherited` ("descriptor 0 is not a listening socket: the process was not started by a FastCGI process manager; use FastCgiListen::Tcp or Unix"), `ServeError::Bind`, `ServeError::Config` (`PublicBind`). `DescriptorZero` and `Unix` are Unix only (mod_fcgid on Windows uses named pipes, after `1.0.0`).
 
@@ -412,7 +412,7 @@ Pure setters: nothing is checked until [`build`](#serverbuilderbuild-built-confi
 | `listener`, `profile`, `limits`, `keep_alive`, `workers` | as above | P0 | 2 | `0.3.0` |
 | `drain_deadline` | the deadline `wait` uses when a drain is requested without one, and the deadline for listeners removed by a reload; 1 ms to 1 h (rule `DrainRange`) | P0 | 2 | `0.3.0` |
 | `accept_failure_window` | how long a listener may report accept errors before health is `Degraded` | P1 | 2 | `0.3.0` |
-| `catch_service_panics` | wrap service calls in `catch_unwind`: a caught panic answers the 500 refusal, closes the connection, calls `done` with `RequestEnd::ServicePanic`, and is reported. Effective only with `panic = "unwind"`; with `abort`, `build` adds a warning | P2 | 2 | `0.5.0` |
+| `catch_service_panics` | wrap service calls in `catch_unwind`: `head`, `call`, `done`, `upgraded`, and a WebSocket service's `opened` and `message` (`head`, `done`, and `upgraded` since 0.8.0). A caught panic in `head` or `call` answers the 500 refusal, closes the connection, calls `done` with `RequestEnd::ServicePanic`, and is reported; one in `done` is reported. On or off, a panic costs only its connection: admission is released, `done` runs once for every request that reached `head`, a WebSocket's `closed` runs once after `opened` and its senders are closed (0.8.0). `Observer`, `Checkpoint`, and `Admit` code must not panic. Effective only with `panic = "unwind"`; with `abort`, `build` adds a warning | P2 | 2 | `0.5.0` |
 | `transport_limits` | the base net-io limits for every listener; values serve-net maps (section [Defaults and reasons](#defaults-and-reasons)) are set from serve-net's own limits on top | P1 | 3 | `0.3.0` |
 | `clock` | the clock net-io's deadlines run on; serve-net reads time from net-io, so a `ManualClock` makes every serve-net deadline deterministic too | P2 | 3 | `0.3.0` |
 | `config` | replaces listeners, profiles, limits, keep-alive, workers, and the drain deadline with a `ServerConfig` (the same value [`reload`](#serverconfig-runningreload-reloadsummary) takes) | P1 | 2 | `0.4.0` |
@@ -697,10 +697,11 @@ pub struct DrainReport {
     pub refused_while_draining: u64,    // requests refused because the server was draining
     pub elapsed: Duration,
     pub deadline_hit: bool,
+    pub stuck: bool,                    // 0.8.0: net-io's shutdown had not returned 5 s past the deadline
 }
 ```
 
-P0, Tier 2, `0.3.0`.
+`drain` waits at most 5 s past its deadline for net-io's shutdown (0.8.0). A worker that never comes back (a service that never returns) leaves `stuck` set and its threads behind; the process should exit. Cost: one thread for the shutdown, once per drain. P0, Tier 2, `0.3.0`.
 
 ### `ListenerInfo`, `ListenerState`
 
@@ -750,7 +751,7 @@ pub struct ReloadSummary { pub added: Vec<String>, pub removed: Vec<String>, pub
 
 `ServerConfig` is plain data, so a program can build it from its own configuration format and pass the same value at start-up (`ServerBuilder::config`) and at reload.
 
-`reload` validates `next` with every rule (nothing changes on failure); diffs listeners by name (a changed address or source is a removal plus an addition; changed ingress, trust, profile, or limits apply in place); binds every added listener with its door closed (on failure only the new listeners are closed and nothing changes); calls `Notify::reloading`; publishes the new profile table, per-listener ingress and trust, and limits through [snapshots](#snapshots); opens the door on added listeners; closes the door on removed listeners and drains their connections with the drain deadline; calls `Notify::ready()` and `Observer::reloaded`. Connection-level limits apply to connections accepted after the swap; request-level limits to requests whose head completes after it; work in flight keeps the table it started with. What net-io fixes at bind (PROXY trust, TLS) cannot change in place and is refused with `ReloadListener`: add the listener under a new name and remove the old one. `InFlightCap` budgets keep their start-up values until a restart. Reloads are serialized: a reload while another runs waits for it.
+`reload` validates `next` with every rule (nothing changes on failure); diffs listeners by name (a changed address or source is a removal plus an addition; changed ingress, trust, profile, or limits apply in place); binds every added listener with its door closed (on failure only the new listeners are closed and nothing changes); calls `Notify::reloading`; publishes the new profile table, per-listener ingress and trust, and limits through [snapshots](#snapshots); opens the door on added listeners; closes the door on removed listeners and drains their connections with the drain deadline; calls `Notify::ready()` and `Observer::reloaded`. serve-net's request-level limits (`head_timeout`, `request_timeout`, `reply_timeout`, `max_body`, body policies) apply to requests whose head completes after the swap; work in flight keeps the table it started with. What net-io fixes when it binds a listener cannot change on a kept one and is refused with `ReloadListener` (0.8.0 for the limits; before, such a change was reported as applied and never took effect): PROXY trust, TLS, and the transport limits serve-net sets on it, namely `write_stall`, `min_rate`, `max_pending_output`, `linger`, the keep-alive idle timeout, the read timeout, the listener's hard cap, and its per-source cap (which moving a listener between direct and forwarded ingress changes). Add the listener under a new name and remove the old one, or restart. `InFlightCap` budgets keep their start-up values until a restart. Reloads are serialized: a reload while another runs waits for it.
 
 | Grade | Tier | Version | Cost |
 |---|---|---|---|
@@ -786,7 +787,7 @@ impl ListenerSpec {
     pub fn tcp<A: ToSocketAddrs>(name: &str, addr: A) -> Self;
     pub fn unix(name: &str, path: impl Into<PathBuf>) -> Self;                     // P1, 0.4.0
     pub fn inherited(name: &str) -> Self;                                           // P1, 0.4.0
-    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.8.0, Unix
+    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.9.0, Unix
     pub fn handed_off(name: &str, listener: net_io::ListenerHandle) -> Self;        // P0, 0.4.0
 }
 ```
@@ -830,6 +831,7 @@ impl ListenerSpec {
     pub fn transport_limits(self, limits: net_io::Limits) -> Self;       // net-io values for this listener only
     pub fn max_connections(self, n: u32) -> Self;                        // soft cap for this listener
     pub fn allow_public_bind(self, reason: &'static str) -> Self;
+    pub fn allow_sni_mismatch(self, reason: &'static str) -> Self;      // 0.8.0, TLS listeners
     pub fn allow_broad_trust(self, reason: &'static str) -> Self;
     pub fn fallback_bind(self, addr: SocketAddr) -> Self;                // P1, 0.4.0, inherited only
     pub fn unix_mode(self, mode: UnixMode) -> Self;                      // P1, 0.4.0, unix only
@@ -849,6 +851,7 @@ impl ListenerSpec {
 | `transport_limits` | net-io limits for this listener, on top of the server's `transport_limits` | P2 | 3 | `0.3.0` |
 | `max_connections` | the listener's soft connection cap ([connection caps](#limits)) | P0 | 2 | `0.3.0` |
 | `allow_public_bind` | permits a proxy or FastCGI listener on a public or unspecified address; the reason is required, kept in `ListenerInfo`, and reported to the observer at `open` | P0 | 2 | `0.3.0` |
+| `allow_sni_mismatch` | serves a request whose `Host` names another host than the server name the client asked the TLS layer for; by default such a request is answered `421 Misdirected Request` before `head` runs (T-42). The names are compared without letter case, a port, or one trailing dot; a connection that sent no server name, or a request without a host, is not checked. Turn the check off only when every host behind the listener has the same TLS policy | P0 | 2 | `0.8.0` |
 | `allow_broad_trust` | permits trust entries broader than /8 (IPv4) or /32 (IPv6); a /0 entry is never allowed | P1 | 2 | `0.3.0` |
 | `fallback_bind`, `unix_mode`, `allow_world_writable` | as named | P1 | 2 | `0.4.0` |
 
@@ -912,7 +915,7 @@ pub enum Ingress {
     DirectTls,                                  // P0, 0.4.0: the same over TLS (net-io's TLS seam)
     Proxy(ProxySource),                         // behind a reverse proxy or load balancer
     Unix(UnixPeerTrust, Option<ProxySource>),   // P1, 0.4.0: None means the local peer is the client
-    FastCgi(FastCgiIngress),                    // P1, 0.8.0, feature fastcgi
+    FastCgi(FastCgiIngress),                    // P1, 0.9.0, feature fastcgi
 }
 impl Default for Ingress;   // Direct
 ```
@@ -929,7 +932,7 @@ How clients reach a listener, and therefore where the real client comes from. Ex
 
 | Grade | Tier | Version |
 |---|---|---|
-| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`); `0.8.0` (`FastCgi`) |
+| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`); `0.9.0` (`FastCgi`) |
 
 Errors (at `build`): `ForwardedOnDirect`, `TwoClientSources`, `PublicBind`, `TrustEmpty`, `TrustWildcard`, `TrustTooBroad`, `FastCgiTrust`, `TlsOnFastCgi`, `TlsWithoutAcceptor`, `PeerCredentialsUnavailable`.
 
@@ -1035,7 +1038,7 @@ impl FastCgiIngress {
 }
 ```
 
-The FastCGI ingress options. `REMOTE_ADDR` is believed only because only trusted front ends can connect (rule `FastCgiTrust` refuses an empty list on TCP). P1, Tier 2, `0.8.0`, feature `fastcgi`.
+The FastCGI ingress options. `REMOTE_ADDR` is believed only because only trusted front ends can connect (rule `FastCgiTrust` refuses an empty list on TCP). P1, Tier 2, `0.9.0`, feature `fastcgi`.
 
 ---
 
@@ -1120,10 +1123,11 @@ impl Envelope {
     pub fn worker(&self) -> WorkerId;
     pub fn user_word(&self) -> u64;               // one word a wrapper may set in head()
     pub fn set_user_word(&mut self, word: u64);
+    pub fn tls(&self) -> Option<&net_io::TlsInfo>; // 0.8.0: the handshake's server name, ALPN, version, client key hash
 }
 ```
 
-The facts serve-net keeps about one request, passed to every hook and service call. `connection` plus `seq` identify a request within the process. `user_word` lets a wrapper link its own per-request record (for example the index of a slot taken in `Admit`) without serve-net knowing its type. `gate_tag` carries the tag the gate returned in `Gate::admit`, so a gate integration (bouncer-io) finds its own record for the connection without a map from connection id to tag. `Send + Sync`, 128 bytes on 64-bit targets (the gate tag is 8 of them), stored in the connection record: no allocation. P0, Tier 2, `0.3.0`.
+The facts serve-net keeps about one request, passed to every hook and service call. `connection` plus `seq` identify a request within the process. `user_word` lets a wrapper link its own per-request record (for example the index of a slot taken in `Admit`) without serve-net knowing its type. `gate_tag` carries the tag the gate returned in `Gate::admit`, so a gate integration (bouncer-io) finds its own record for the connection without a map from connection id to tag. `tls` (0.8.0) gives the facts of the TLS handshake on a connection serve-net decrypts (`Ingress::DirectTls`): `sni()`, the server name the client asked for, which a service with several hosts checks before it trusts a policy chosen by name; `alpn()`, `version()`, `cipher_suite()`; and `peer_spki_sha256()`, the SHA-256 of a verified client certificate's public key (`None` without one), for mapping a mutual-TLS peer to a principal. `None` without TLS, including behind a front end that decrypted. The facts are shared with net-io's own copy: no allocation. `Send + Sync`, 136 bytes on 64-bit targets (the gate tag is 8 of them, the TLS facts 8), stored in the connection record: no allocation. P0, Tier 2, `0.3.0`.
 
 ```rust
 use serve_net::{Envelope, HeadAction, HttpHead, HttpReply, HttpRequest, HttpService, Lane, Outcome};
@@ -1245,13 +1249,13 @@ The compiled, immutable table, published through a [`Snapshot`](#snapshot) so a 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EngineChoice {
     #[default] Http1,
-    FastCgi,                                       // P1, 0.8.0
+    FastCgi,                                       // P1, 0.9.0
     Http1OrH2ByAlpn,                               // P1, 0.7.0 (h2 with feature h2)
     Custom { alpn: &'static [&'static str] },      // a family given to bind_family; ALPN ids it serves
 }
 ```
 
-The engine a profile's connections start with, chosen by the TLS handshake's ALPN result. The acceptor (tls-net, or any `net_io::TlsAcceptor`) decides what is offered; serve-net reads what was negotiated, after the handshake and before any byte reaches an engine. `Http1` and `Http1OrH2ByAlpn` run HTTP/1.1 for `http/1.1`, `http/1.0`, or no ALPN; `Custom` runs its family for no ALPN or one of its ids. An ALPN result with no compiled engine closes the connection (`EndReason::NoEngine`); until the HTTP/2 engine exists that includes `h2`, so offer only `http/1.1` on the acceptor. ALPN choices on a listener without TLS are refused (`RuleId::AlpnWithoutTls`). P0 (`Http1`, `Custom`) `0.3.0`, P1 (`Http1OrH2ByAlpn` `0.7.0`, `FastCgi` `0.8.0`), Tier 2.
+The engine a profile's connections start with, chosen by the TLS handshake's ALPN result. The acceptor (tls-net, or any `net_io::TlsAcceptor`) decides what is offered; serve-net reads what was negotiated, after the handshake and before any byte reaches an engine. `Http1` and `Http1OrH2ByAlpn` run HTTP/1.1 for `http/1.1`, `http/1.0`, or no ALPN; `Custom` runs its family for no ALPN or one of its ids. An ALPN result with no compiled engine closes the connection (`EndReason::NoEngine`); until the HTTP/2 engine exists that includes `h2`, so offer only `http/1.1` on the acceptor. ALPN choices on a listener without TLS are refused (`RuleId::AlpnWithoutTls`). P0 (`Http1`, `Custom`) `0.3.0`, P1 (`Http1OrH2ByAlpn` `0.7.0`, `FastCgi` `0.9.0`), Tier 2.
 
 ---
 
@@ -1455,8 +1459,8 @@ pub type HttpReply = Reply<HttpFamily>;      // pooled: status, fields, body, an
 impl Reply<HttpFamily> {
     pub fn status(&mut self, status: u16) -> &mut Self;                          // default 200
     pub fn header(&mut self, name: &str, value: impl AsRef<[u8]>) -> &mut Self;
-    pub fn body(&mut self, bytes: &[u8]) -> &mut Self;                           // copied into the pooled buffer
-    pub fn body_static(&mut self, bytes: &'static [u8]) -> &mut Self;            // no copy
+    pub fn body(&mut self, bytes: &[u8]) -> &mut Self;                           // copied into the reply's buffer, sent from there
+    pub fn body_static(&mut self, bytes: &'static [u8]) -> &mut Self;            // no copy: sent from `bytes` (0.8.0)
     pub fn text(&mut self, status: u16, text: &str) -> &mut Self;                // text/plain; charset=utf-8
     pub fn html(&mut self, status: u16, html: &str) -> &mut Self;                // text/html; charset=utf-8
     pub fn close(&mut self) -> &mut Self;                                        // end the connection after it
@@ -1543,7 +1547,7 @@ A reply finished on another thread (a database call, a password hash, a call to 
 |---|---|---|---|
 | P0 | 3 | `0.3.0` (blocking driver), `0.5.0` (reactor) | one queue post and one wake, about 1-5 µs from `complete` to the reply being written [est.]; no allocation (the reply moves through a per-connection slot reused across requests) |
 
-Errors: `Expired`, `Busy`, as above. A per-worker cap (`Limits::max_deferred_per_worker`) bounds parked requests; past it, a deferral is answered with the busy refusal.
+Errors: `Expired`, `Busy`, as above. A per-worker cap (`Limits::max_deferred_per_worker`) bounds parked requests; past it, a deferral is answered with the busy refusal. The cap holds since 0.8.0: each worker counts its parked requests, and past the cap the token can only expire (before, it sized net-io's completion queue and nothing more).
 
 ```rust
 use serve_net::{CompleteError, Envelope, HttpReply, HttpRequest, HttpService, Outcome, ReplyToken, WorkClass};
@@ -1709,7 +1713,7 @@ pub enum WsSendError { Full, Closed, Invalid }
 
 `head` returns `HeadAction::Upgrade(target)`. The upgrade request then goes through admission and the checkpoints like any request (a declared body is refused with 413). serve-net checks the handshake through ws-net (`ServerHandshake::from_request`: method, version 13, the key, `Host`, the form of `Origin`, the offered subprotocols) and answers an invalid one with 400 before anything else is written. Before admission, the target's origin policy (0.8.0, `WebSocketTarget::origins`, ws-net's `OriginPolicy`) judges the page that asked: by default its `Origin` must name the request's authority (the trusted proxy's with `trust_host` on, else the `Host` field), and a request with no `Origin` (not a browser) is accepted. A disallowed page is answered 403 (`RefusalKind::CrossOrigin`) and nothing is switched; more than one `Origin` field is 400. A browser sends its cookies with an upgrade from any site, so this is the defence against cross-site WebSocket hijacking (T-41). Cost: one scan of the head's fields and two small parses per upgrade, about 100 ns [est.]; no allocation for the default, and an allowlist is shared by every clone of its target. An upgrade the client never offered, or a subprotocol it did not offer, is a service bug: 500, reported through `Observer::service_error`. Otherwise http-net writes the 101 with `sec-websocket-accept`. The 101 is a reply like any other until it leaves: a gate that denies it is answered with the gate's status (0.8.0; before, the connection closed with nothing), the request ends `RequestEnd::Denied`, and nothing is opened. Once the 101 has left, the upgrade request ends (`done` with `RequestEnd::Upgraded`, its admission released), `HttpService::upgraded` runs, the HTTP engine's buffers are released, and the bytes that arrived after the request go to ws-net, never to the HTTP parser (T-21). `Upgrade: h2c` never reaches this path: it is not an upgrade offer, and the request is served as HTTP/1.1. A 2xx to `CONNECT` is refused unless a profile allows tunnels (after `1.0.0`).
 
-After the switch the target's `WebSocketService` is called on the worker: `opened` once, `message` once per complete message (text validated as UTF-8, fragments joined), `closed` exactly once. Before each message the connection passes the checks a request passes before its service call: the control line (draining or stopping closes with 1001, lockdown or a shed lane with 1013) and `Checkpoint` at `BeforeDispatch` (a denial closes with 1008, a kill aborts), so a session revoked while the socket is open stops at the next message. A protocol violation closes with ws-net's code (1002, 1007, 1009); a caught panic (`catch_service_panics`) with 1011. Pings are answered by ws-net. A connection quiet for `ping_interval` is pinged, and one that sends nothing for another interval is closed. A close handshake the service starts waits 5 s for the client's Close.
+After the switch the target's `WebSocketService` is called on the worker: `opened` once, `message` once per complete message (text validated as UTF-8, fragments joined), `closed` exactly once. Before each message the connection passes the checks a request passes before its service call: the control line (draining or stopping closes with 1001, lockdown or a shed lane with 1013) and `Checkpoint` at `BeforeDispatch` (a denial closes with 1008, a kill aborts), so a session revoked while the socket is open stops at the next message. A protocol violation closes with ws-net's code (1002, 1007, 1009); a caught panic (`catch_service_panics`) with 1011. Pings are answered by ws-net. A connection quiet for `ping_interval` is pinged, and one that sends nothing for another interval is closed. A close handshake the service starts waits 5 s for the client's Close. With `catch_service_panics` on or off, a panicking handler still gets `closed` (when `opened` ran), its `WsSender`s close, and the connection leaves the drain registry (0.8.0).
 
 Sends go into ws-net's output and leave when the call returns. Output is bounded: past `max_pending_output` a send returns `WsSendError::Full`, and the connection stops reading until the client takes what is queued, so a client that does not read holds back its own input, not the server's memory.
 
@@ -1782,7 +1786,7 @@ serve-net's budgets: the request-level ones it enforces itself and the transport
 | `min_rate` | net-io's meter, inbound while receiving and outbound while sending | trickles inside every per-read timeout |
 | `max_body` | the engine (the smaller of this and the engine's limit) | large uploads |
 | `max_pipelined_per_wake` | serve-net | one connection starving its worker (T-6) |
-| `max_pending_output` | net-io's output budget and serve-net's reply queue | replies piling up (T-3, T-6) |
+| `max_pending_output` | net-io's output budget: what a connection holds of a reply the client has not taken; the body itself is sent from where the service put it (0.8.0) | replies piling up (T-3, T-6) |
 | `max_deferred_per_worker` | net-io's completion queue | parked-request floods (T-26) |
 | `max_connections`, `hard_cap_headroom` | serve-net (soft cap, busy refusal) and net-io (hard cap, reset) | connection floods (T-5) |
 | `linger` | net-io's graceful linger | a reset destroying the last reply |
@@ -1936,7 +1940,7 @@ pub struct Admitted { pub token: u64 }        // opaque to serve-net: a slot ind
 pub struct Shed { pub retry_after: Option<Duration>, pub close: bool }
 ```
 
-Request admission: "can this worker take this request now?". `admit` runs after `head` and before any body byte; `release` runs after `done`, exactly once per `Admitted`, on every path. Both run on the worker that owns the connection, and a connection never moves between workers, so state indexed by `worker` is written by one thread only: a per-worker counter needs no lock and no read-modify-write. `prepare` runs once in `bind`, before any worker starts, to size per-worker state. `Shed` produces the busy refusal (503) with `retry_after` (jittered by serve-net when `None`), and `close: true` ends the connection after it.
+Request admission: "can this worker take this request now?". `admit` runs after `head` and before any body byte; `release` runs after `done`, exactly once per `Admitted`, on every path. Both run on the worker that owns the connection, and a connection never moves between workers, so state indexed by `worker` is written by one thread only: a per-worker counter needs no lock and no read-modify-write. `prepare` runs once in `bind`, before any worker starts, to size per-worker state. `Shed` produces the busy refusal (503) with `retry_after` (jittered by serve-net when `None`), and `close: true` ends the connection after it. Since 0.8.0 the release happens through a guard, so a panic in `done` or the observer cannot keep a permit.
 
 A connection gate answers a different question ("is this source behaving?") at accept; `Admit` answers "can we take more work?" per request. P0, Tier 3, `0.3.0`; the cost is the implementation's.
 
@@ -2375,7 +2379,7 @@ impl RuleId { pub const fn as_str(self) -> &'static str; }   // stable snake_cas
 
 | Rule | Refuses | Override |
 |---|---|---|
-| `PublicBind` | a TCP listener with `Proxy` or `FastCgi` ingress on an unspecified (`0.0.0.0`, `::`) or public address. Allowed without override: loopback, private ranges (`10/8`, `172.16/12`, `192.168/16`, `fc00::/7`), link-local, Unix paths, descriptor 0, inherited and handed-off sockets | `allow_public_bind(reason)` |
+| `PublicBind` | a TCP listener with `Proxy` or `FastCgi` ingress on an unspecified (`0.0.0.0`, `::`) or public address. Allowed without override: loopback, private ranges (`10/8`, `172.16/12`, `192.168/16`, `fc00::/7`), link-local, Unix paths, descriptor 0. An inherited listener's `fallback_bind` address is checked at build, and the address of an inherited or handed-off socket at bind, once net-io reports it, before the door opens (0.8.0; before, passed sockets were not checked) | `allow_public_bind(reason)` |
 | `ForwardedOnDirect` | forwarded-header trust on a `Direct` listener | none |
 | `FastCgiTrust` | a FastCGI TCP listener with an empty trust list | none |
 | `TrustWildcard` | a trust entry of prefix length 0 | none |
@@ -2392,7 +2396,7 @@ impl RuleId { pub const fn as_str(self) -> &'static str; }   // stable snake_cas
 | `ZeroCap` | a connection or in-flight cap of 0 | none |
 | `DuplicateBind` | two listeners on one address or path | none |
 | `DriverUnavailable`, `ReloadWorkers` | a driver this build or platform lacks; a reload that changes `Workers` | restart instead |
-| `ReloadListener` | a reload that changes PROXY trust or TLS on a listener that keeps its socket (`0.4.0`) | a new listener name, or restart |
+| `ReloadListener` | a reload that changes PROXY trust or TLS on a listener that keeps its socket (`0.4.0`), or the transport limits net-io enforces on it (`0.8.0`: `write_stall`, `min_rate`, `max_pending_output`, `linger`, keep-alive idle, the read timeout, its hard and per-source caps) | a new listener name, or restart |
 | `DrainRange` | a drain deadline of 0 or above 1 h | none |
 | `AlpnWithoutTls`, `TlsOnFastCgi`, `TlsWithoutAcceptor` | ALPN without TLS; TLS on FastCGI; TLS with no acceptor | none |
 | `SchemeTrustWithoutSource` | `trust_scheme` or `trust_host` where no source can carry them (a single-address header, PROXY v1) | none |
@@ -2507,7 +2511,7 @@ pub struct Refusal { pub kind: RefusalKind, pub status: u16, pub retry_after: Op
 
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RefusalKind { Malformed, TooLarge, HeadTimeout, BodyTimeout, ReplyTimeout, Busy, Draining, Denied, Ingress, Service, Internal, CrossOrigin }  // CrossOrigin 0.8.0
+pub enum RefusalKind { Malformed, TooLarge, HeadTimeout, BodyTimeout, ReplyTimeout, Busy, Draining, Denied, Ingress, Service, Internal, CrossOrigin, Misdirected }  // CrossOrigin 0.8.0
 impl RefusalKind { pub const fn as_str(self) -> &'static str; }
 ```
 
@@ -2526,7 +2530,7 @@ impl OutBuf {
 impl http_net::Output for OutBuf;   // feature http1: engines encode straight into it
 ```
 
-Where an engine encodes a reply. A per-worker pooled buffer that grows to `max_pending_output` and shrinks to 16 KiB on return, zeroed on return when the profile wipes. serve-net pushes its whole content into net-io's output before writing, so the egress check sees the whole reply. P0, Tier 3, `0.3.0`.
+Where an engine encodes a reply's head (and a refusal, or a streamed part). A per-connection buffer that shrinks to 16 KiB after each reply; on a wiping profile it is zeroed on return and its growth zeroes the block it leaves (0.8.0). The reply's body is not copied into it: serve-net sends what `Family::reply_body` names straight from the reply data, as net-io's output budget takes it (0.8.0; before, the whole body was copied here and held until the client took it). P0, Tier 3, `0.3.0`.
 
 ### `Family`, `HttpFamily`
 
@@ -2552,6 +2556,7 @@ pub trait Family: Send + Sync + 'static {
     fn respond_stream(&self, engine: &mut Self::Engine, parts: &mut Self::Parts, first: bool, last: bool,
         unix_secs: u64, out: &mut OutBuf) -> Result<u16, EngineError>;  // default: 500
     fn next_stream_part(&self, parts: &mut Self::Parts, wipe: bool);
+    fn reply_body<'p>(&self, parts: &'p Self::Parts) -> &'p [u8] { &[] } // 0.8.0: the body after what respond wrote, sent from the parts
     fn detach(&self, request: &Self::Request<'_>) -> Option<Box<dyn DetachedRequest<Self>>> where Self: Sized { None }
     fn upgrade_allowed(&self, head: &Self::Head<'_>, target: &UpgradeTarget)
         -> Result<(), EngineError> { Ok(()) }                          // 0.8.0: judged on the head view before admission; Err is the refusal
@@ -2563,6 +2568,8 @@ pub struct HeadContext<'c> { /* the connection's client and the listener's ingre
 impl HeadContext<'_> {
     pub fn client(&self) -> &ClientInfo;
     pub fn resolved(&self) -> Option<&ClientInfo>;   // set when the view is built again for the call (D-040)
+    pub fn tls(&self) -> Option<&net_io::TlsInfo>;   // 0.8.0: the handshake's facts, as Envelope::tls
+    pub fn checks_sni(&self) -> bool;                // 0.8.0: false after allow_sni_mismatch
 }
 
 pub struct Reply<F: Family> { /* F::Parts and the link to its connection */ }
@@ -2628,7 +2635,7 @@ The HTTP/1.1 engine: an adapter over `http_net::ServerConn` with the profile's `
 
 ### `engine::FastCgi`
 
-The FastCGI responder: an adapter over fcgi-net. One request at a time per connection; answers `FCGI_GET_VALUES`; an `FCGI_ABORT_REQUEST` ends the request with `RequestEnd::PeerGone` and cancels a pending `ReplyToken`. P1, Tier 3, `0.8.0`, feature `fastcgi`.
+The FastCGI responder: an adapter over fcgi-net. One request at a time per connection; answers `FCGI_GET_VALUES`; an `FCGI_ABORT_REQUEST` ends the request with `RequestEnd::PeerGone` and cancels a pending `ReplyToken`. P1, Tier 3, `0.9.0`, feature `fastcgi`.
 
 ### `engine::WebSocket`
 

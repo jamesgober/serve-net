@@ -2,13 +2,13 @@
 //!
 //! The network service engine for Rust: listeners over net-io, ingress from
 //! direct clients, reverse proxies (PROXY protocol or trusted forwarded
-//! headers), Unix sockets, and FastCGI, a per-connection engine with a slot
+//! headers), and Unix sockets, a per-connection engine with a slot
 //! for any sans-IO protocol engine, admission, drain, and restarts without
 //! dropped connections.
 //!
 //! ## Status
 //!
-//! `0.7.0`: HTTP/1.1 over net-io's reactor (or its blocking pool), directly,
+//! `0.8.0`: HTTP/1.1 over net-io's reactor (or its blocking pool), directly,
 //! over TLS, behind a reverse proxy, or on a Unix socket, with WebSocket
 //! upgrades (feature `ws`), streaming bodies, an offload pool, live reload, and restarts that drop nothing. The public API is locked in `docs/API.md`, and the design behind
 //! it in `dev/PLAN.md` (both in the
