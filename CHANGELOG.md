@@ -13,6 +13,26 @@
 
 ---
 
+## [0.8.1] - 2026-11-12
+
+net-io 0.7.2, its security release (D-113).
+
+### Security
+
+- net-io 0.7.2 (from 0.7.1) fixes two critical and three high defects found by
+  an independent review: on Windows, a crash or memory corruption when the gate
+  denied a write on a named-pipe connection, and a forged listener hand-off
+  message; on the reactor with TLS, silent connections holding the shared
+  buffer budget; Unix sockets bound in a directory other users can write to;
+  and named-pipe names Windows rewrites into file or network paths.
+
+### Changed
+
+- A Unix listener in a directory every user can write to, without the sticky
+  bit, is refused at bind (net-io's `ConfigReason::InsecureDirectory`).
+
+---
+
 ## [0.8.0] - 2026-11-11
 
 The findings of an independent review of 0.7.1, each fixed with a test that
@@ -530,7 +550,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/jamesgober/serve-net/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/jamesgober/serve-net/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/jamesgober/serve-net/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jamesgober/serve-net/compare/v0.6.3...v0.7.0

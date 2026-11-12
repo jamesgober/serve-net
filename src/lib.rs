@@ -8,7 +8,7 @@
 //!
 //! ## Status
 //!
-//! `0.8.0`: HTTP/1.1 over net-io's reactor (or its blocking pool), directly,
+//! `0.8.1`: HTTP/1.1 over net-io's reactor (or its blocking pool), directly,
 //! over TLS, behind a reverse proxy, or on a Unix socket, with WebSocket
 //! upgrades (feature `ws`), streaming bodies, an offload pool, live reload, and restarts that drop nothing. The public API is locked in `docs/API.md`, and the design behind
 //! it in `dev/PLAN.md` (both in the

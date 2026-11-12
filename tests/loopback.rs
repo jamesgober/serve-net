@@ -273,7 +273,16 @@ fn test_loopback_stats_health_listeners() {
     assert_eq!(stats.replied, 4);
     assert_eq!(stats.refused, 0);
     assert!(stats.bytes_in > 0 && stats.bytes_out > 0);
-    assert_eq!(stats.transport.accepted, 1);
+    // net-io counts an accept on its accept thread after it hands the
+    // connection to a worker, so on a loaded host the worker can serve all
+    // four requests before the count lands: wait for it.
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    let mut accepted = stats.transport.accepted;
+    while accepted == 0 && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+        accepted = server.stats().transport.accepted;
+    }
+    assert_eq!(accepted, 1);
     assert!(server.health().is_ok(), "{:?}", server.health());
     let listeners = server.listeners();
     assert_eq!(listeners.len(), 1);

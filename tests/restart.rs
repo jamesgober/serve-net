@@ -240,7 +240,11 @@ mod restart {
         }
         assert!(served.load(Ordering::Relaxed) > 0);
         let failed = failed.lock().unwrap();
-        assert!(failed.is_empty(), "failed in the restart: {failed:?}");
+        assert!(
+            failed.is_empty(),
+            "failed in the restart: {failed:?}; refusals (server, reason, ended): {:?}",
+            refusals()
+        );
         let _ = new.drain(Duration::from_secs(2));
     }
 
