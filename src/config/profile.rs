@@ -214,6 +214,14 @@ impl Profile {
     pub fn id(&self) -> ProfileId {
         self.id
     }
+
+    /// Whether buffers are zeroed when they return to a pool: a custom
+    /// family's engine reads it in `Family::engine` and zeroes the client's
+    /// bytes it holds, as the HTTP engine does.
+    #[must_use]
+    pub fn wipes_buffers(&self) -> bool {
+        self.wipe_buffers
+    }
 }
 
 /// The compiled profiles, indexed by id.

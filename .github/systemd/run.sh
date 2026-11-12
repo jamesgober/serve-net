@@ -37,6 +37,12 @@ else
 fi
 
 cleanup() {
+    status=$?
+    if [ "$status" != 0 ]; then
+        echo "failed with $status; the unit's status and the example's output:"
+        "${ctl[@]}" status --no-pager "$unit" 2>&1 || true
+        cat "$log" || true
+    fi
     "${ctl[@]}" stop "$unit" >/dev/null 2>&1 || true
     "${ctl[@]}" reset-failed "$unit" >/dev/null 2>&1 || true
 }

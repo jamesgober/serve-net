@@ -7,13 +7,13 @@ use crate::client::IngressKind;
 use crate::config::ProxyKind;
 use crate::config::validate::{self, Draft};
 use crate::config::{
-    Ingress, KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId, ProfileTable,
-    ProxySource, REACTOR_CONNECTIONS, Workers,
+    EngineChoice, Ingress, KeepAlive, Limits, ListenerSource, ListenerSpec, Profile, ProfileId,
+    ProfileTable, ProxySource, REACTOR_CONNECTIONS, Workers,
 };
 use crate::conn::session::{Cap, Factory, Runtime};
 use crate::conn::{ListenerRuntime, Shared, Tables, UnixRuntime};
 use crate::engine::{Family, Service};
-use crate::error::{ConfigErrors, ConfigWarning, ServeError};
+use crate::error::{ConfigError, ConfigErrors, ConfigWarning, RuleId, ServeError, Subject};
 use crate::health::{HealthState, Tap};
 use crate::hooks::{Admit, Checkpoint, DefaultHooks, Dispatch, HookSet, Hooks, Observer};
 use crate::net::{ControlLine, DriverKind, EventSink, Gate};
@@ -584,7 +584,15 @@ where
             hooks,
             ..
         } = self;
-        let (soft, hard, threads) = connection_caps(&limits, &workers);
+        let http = is_http::<F>();
+        let mismatched = engine_family(&listeners, |id| profiles.get(id).map(|p| p.engine), http);
+        if let Some(errors) = ConfigErrors::from_vec(mismatched) {
+            return Err(ServeError::Config(errors));
+        }
+        // Read once: net-io checks its hard cap against the limit at start, and
+        // a reload keeps to what was checked.
+        let descriptors = net_io::descriptor_limit();
+        let (soft, hard, threads) = connection_caps(&limits, &workers, descriptors);
 
         let mut admit = hooks.admit;
         admit.driver(workers.resolved(), soft);
@@ -617,11 +625,9 @@ where
         if reactor {
             global = global.completion_queue(limits.max_deferred_per_worker);
         }
-        // With no cap asked for, the reactor's own default fits what
-        // descriptors the process has, where a fixed cap would refuse to start.
-        if !reactor || limits.max_connections.is_some() {
-            global = global.max_connections(hard);
-        }
+        // The hard cap is always serve-net's, so the soft cap sits under it
+        // and the busy refusal is written before net-io refuses (D-108).
+        global = global.max_connections(hard);
         let global = global.build().map_err(ServeError::Start)?;
         let merged = Arc::new(Merged::new(Arc::clone(&hooks.control)));
         let mut net = net_io::ServerBuilder::new()
@@ -693,6 +699,11 @@ where
             )?;
             net = net.listener(net_spec);
         }
+        // What net-io fixed for each listener, for a reload to compare.
+        let net_limits = listeners
+            .iter()
+            .map(|l| listener_limits(l, &profiles, &limits, transport.as_ref(), hard))
+            .collect::<Result<Vec<_>, _>>()?;
         let tables = Arc::new(Snapshot::new(Tables {
             profiles,
             listeners: runtime_listeners.into_iter().map(Some).collect(),
@@ -724,6 +735,11 @@ where
         let factory = Factory {
             shared,
             rt: Arc::clone(&rt),
+            readers: (0..threads.max(1))
+                .map(|_| {
+                    crate::conn::session::TableReader(crate::sync::Mutex::new(tables.reader()))
+                })
+                .collect(),
         };
         let health = Arc::new(HealthState::new(listeners.len(), accept_failure_window));
         let events = Tap {
@@ -750,7 +766,43 @@ where
                 }
             }
         }
-        let listeners = listeners.iter().map(listener_meta).collect();
+        // A socket passed in (systemd, a supervisor) has an address only now:
+        // one that trusts a front end on a public address is refused before
+        // the door opens, as a bound one is at build (D-111).
+        let exposed: Vec<ConfigError> = server
+            .listeners()
+            .iter()
+            .filter_map(|info| {
+                let spec = listeners.get(usize::from(info.id.get()))?;
+                let net_io::Endpoint::Ip(addr) = info.local else {
+                    return None;
+                };
+                let passed = matches!(
+                    spec.source,
+                    ListenerSource::Inherited { .. } | ListenerSource::HandedOff
+                );
+                (passed
+                    && matches!(spec.ingress, Ingress::Proxy(_))
+                    && spec.public_bind.is_none()
+                    && validate::is_public(addr.ip()))
+                .then(|| {
+                    ConfigError::new(
+                        RuleId::PublicBind,
+                        Subject::Listener(spec.name.clone()),
+                        validate::PUBLIC_BIND.0,
+                        validate::PUBLIC_BIND.1,
+                    )
+                })
+            })
+            .collect();
+        if let Some(errors) = ConfigErrors::from_vec(exposed) {
+            return Err(ServeError::Config(errors));
+        }
+        let listeners = listeners
+            .iter()
+            .zip(net_limits)
+            .map(|(l, n)| listener_meta(l, n))
+            .collect();
         let reloader = Reloader {
             transport,
             tables,
@@ -760,6 +812,8 @@ where
             has_tls,
             workers,
             threads,
+            descriptors,
+            http,
         };
         Ok(Bound::new(Parts {
             server,
@@ -786,32 +840,103 @@ impl net_io::Clock for SharedClock {
     }
 }
 
-/// The soft connection cap, net-io's hard cap, and the pool size.
+/// Whether `F` is the built-in HTTP family; every other family is custom.
+pub(crate) fn is_http<F: Family>() -> bool {
+    #[cfg(feature = "http1")]
+    {
+        core::any::TypeId::of::<F>() == core::any::TypeId::of::<crate::HttpFamily>()
+    }
+    #[cfg(not(feature = "http1"))]
+    {
+        // Without the feature every family is custom.
+        let _ = core::any::TypeId::of::<F>();
+        false
+    }
+}
+
+/// One error per listener whose profile's engine belongs to another family
+/// than the one being bound (D-110): an HTTP engine choice needs the HTTP
+/// family, `EngineChoice::Custom` needs a custom one. A listener naming a
+/// missing profile is `UnknownProfile`'s, not this rule's.
+pub(crate) fn engine_family(
+    listeners: &[ListenerSpec],
+    engine_of: impl Fn(ProfileId) -> Option<EngineChoice>,
+    http: bool,
+) -> Vec<ConfigError> {
+    listeners
+        .iter()
+        .filter(|l| {
+            engine_of(l.profile)
+                .is_some_and(|e| matches!(e, EngineChoice::Custom { .. }) == http)
+        })
+        .map(|l| {
+            let (message, hint) = if http {
+                (
+                    "the profile serves a custom engine, but bind serves the HTTP family",
+                    "give the listener an HTTP profile, or serve the custom family with bind_family",
+                )
+            } else {
+                (
+                    "the profile serves HTTP, but bind_family serves a custom family",
+                    "give the listener a profile with EngineChoice::Custom (the default profile 0 is HTTP)",
+                )
+            };
+            ConfigError::new(RuleId::EngineFamily, Subject::Listener(l.name.clone()), message, hint)
+        })
+        .collect()
+}
+
+/// The soft connection cap, net-io's hard cap, and the pool size, under
+/// `descriptors` (the process's soft `RLIMIT_NOFILE`, `None` when unlimited
+/// or on Windows).
 ///
 /// On the blocking driver every open connection holds a thread, and net-io
 /// refuses at accept once every thread is busy, so the busy refusal can only
 /// be written when the pool covers the soft cap plus its headroom (D-043,
-/// D-044).
-pub(crate) fn connection_caps(limits: &Limits, workers: &Workers) -> (u32, u32, u16) {
+/// D-044). On the reactor with no cap asked for, both caps fit the
+/// descriptors the process has, so a low limit lowers the soft cap with the
+/// hard one instead of leaving clients to be reset (D-108).
+pub(crate) fn connection_caps(
+    limits: &Limits,
+    workers: &Workers,
+    descriptors: Option<u64>,
+) -> (u32, u32, u16) {
     let blocking = workers.resolved() == DriverKind::Blocking;
     let asked = workers.blocking_threads();
     let pool = if blocking {
         u32::from(asked)
     } else {
-        REACTOR_CONNECTIONS
+        reactor_room(workers.reactor_workers(), descriptors)
     };
     let soft = limits.max_connections.unwrap_or_else(|| {
         // A small pool keeps most of its threads for clients.
         pool.saturating_sub(limits.headroom_for(pool).min(pool / 4))
             .max(1)
     });
-    let hard = soft.saturating_add(limits.headroom_for(soft));
+    let mut hard = soft.saturating_add(limits.headroom_for(soft));
+    if !blocking && limits.max_connections.is_none() {
+        // The room itself, as net-io would pick it: 10,000 by default.
+        hard = pool;
+    }
     let threads = if blocking {
         u16::try_from(hard).unwrap_or(u16::MAX).max(asked)
     } else {
         workers.reactor_workers()
     };
     (soft, hard, threads)
+}
+
+/// The connections the reactor's default caps hold: 10,000, less where the
+/// descriptor limit would not hold them. The same room net-io 0.7 leaves for
+/// its own default: two wake descriptors per worker and 64 spare (listeners,
+/// the accept reserve, files the service opens), at least 16.
+pub(crate) fn reactor_room(workers: u16, descriptors: Option<u64>) -> u32 {
+    let wanted = REACTOR_CONNECTIONS;
+    descriptors.map_or(wanted, |have| {
+        let spare = u64::from(workers).saturating_mul(2).saturating_add(64);
+        let room = have.saturating_sub(spare).clamp(16, u64::from(wanted));
+        u32::try_from(room).unwrap_or(wanted)
+    })
 }
 
 /// The soft cap left for connections without a dedicated seat.
@@ -838,12 +963,13 @@ pub(crate) fn listener_runtime(l: &ListenerSpec, cap: Arc<Cap>) -> ListenerRunti
             }),
             _ => None,
         },
+        sni_check: l.sni_mismatch.is_none(),
         cap,
     }
 }
 
 /// What `listeners()` and a reload need to know about a listener.
-pub(crate) fn listener_meta(l: &ListenerSpec) -> ListenerMeta {
+pub(crate) fn listener_meta(l: &ListenerSpec, net_limits: net_io::Limits) -> ListenerMeta {
     ListenerMeta {
         ingress: match l.ingress.proxy().map(|p| p.kind) {
             None if l.ingress.is_unix() => IngressKind::Unix,
@@ -858,6 +984,7 @@ pub(crate) fn listener_meta(l: &ListenerSpec) -> ListenerMeta {
         source: l.source.clone(),
         transport: transport_key(&l.ingress),
         settings: format!("{:?} {:?} {:?}", l.ingress, l.scheme, l.max_connections),
+        net_limits,
     }
 }
 
@@ -908,6 +1035,44 @@ pub(crate) fn net_listener(
             });
         }
     };
+    let mut net_spec = net_spec.limits(listener_limits(spec, profiles, limits, base, hard)?);
+    if named {
+        // A reload that replaces a listener binds it before the old one goes,
+        // and net-io wants names unique.
+        net_spec = net_spec.name(&spec.name);
+    }
+    if matches!(spec.ingress, Ingress::DirectTls) {
+        net_spec = net_spec.tls(true);
+    }
+    if let Some(ProxySource {
+        kind: ProxyKind::ProxyProtocol(versions),
+        trusted,
+        ..
+    }) = spec.ingress.proxy()
+    {
+        net_spec = net_spec.proxy(net_io::ProxyMode::Required {
+            versions: *versions,
+        });
+        // Over a Unix socket every peer that passed its credential check is
+        // trusted; net-io ignores the list there.
+        if !spec.ingress.is_unix() {
+            net_spec = net_spec.trusted_proxies(trusted.clone());
+        }
+    }
+    Ok(net_spec)
+}
+
+/// The limits net-io enforces on a listener's connections, from the spec,
+/// its profile, and the server's limits. net-io fixes them when it binds the
+/// listener, so a reload compares them and refuses a change it cannot make
+/// (D-111).
+pub(crate) fn listener_limits(
+    spec: &ListenerSpec,
+    profiles: &ProfileTable,
+    limits: &Limits,
+    base: Option<&net_io::Limits>,
+    hard: u32,
+) -> Result<net_io::Limits, ServeError> {
     let compiled = profiles.compiled(spec.profile);
     let behind = spec.ingress.proxy().is_some();
     let idle = compiled.map_or_else(
@@ -958,32 +1123,7 @@ pub(crate) fn net_listener(
         // to the real client, so the cap stays.
         own = own.max_per_source(listener_hard, net_io::PrefixPolicy::DEFAULT);
     }
-    let own = own.build().map_err(ServeError::Start)?;
-    let mut net_spec = net_spec.limits(own);
-    if named {
-        // A reload that replaces a listener binds it before the old one goes,
-        // and net-io wants names unique.
-        net_spec = net_spec.name(&spec.name);
-    }
-    if matches!(spec.ingress, Ingress::DirectTls) {
-        net_spec = net_spec.tls(true);
-    }
-    if let Some(ProxySource {
-        kind: ProxyKind::ProxyProtocol(versions),
-        trusted,
-        ..
-    }) = proxy
-    {
-        net_spec = net_spec.proxy(net_io::ProxyMode::Required {
-            versions: *versions,
-        });
-        // Over a Unix socket every peer that passed its credential check is
-        // trusted; net-io ignores the list there.
-        if !spec.ingress.is_unix() {
-            net_spec = net_spec.trusted_proxies(trusted.clone());
-        }
-    }
-    Ok(net_spec)
+    own.build().map_err(ServeError::Start)
 }
 
 /// The first inherited listener's name, for an error about the environment.
@@ -1160,5 +1300,49 @@ mod tests {
             .build()
             .unwrap();
         assert!(built.warnings().is_empty());
+    }
+
+    /// D-108: on the reactor with no cap asked for, both caps fit the
+    /// descriptor limit, and net-io accepts the hard cap against it.
+    #[test]
+    fn test_reactor_default_caps_fit_the_descriptor_limit() {
+        let limits = Limits::new();
+        let reactor = Workers::reactor(8);
+        assert_eq!(connection_caps(&limits, &reactor, None), (8_750, 10_000, 8));
+        assert_eq!(
+            connection_caps(&limits, &reactor, Some(1 << 20)),
+            (8_750, 10_000, 8)
+        );
+        // A stock macOS: 256 descriptors, less 2 per worker and 64 spare.
+        for (have, want) in [(256, (154, 176)), (1_024, (826, 944)), (50, (12, 16))] {
+            let (soft, hard, _) = connection_caps(&limits, &reactor, Some(have));
+            assert_eq!((soft, hard), want, "{have} descriptors");
+            assert!(soft < hard, "the busy refusal comes before net-io's");
+            if have >= 256 {
+                let net = net_io::Limits::builder()
+                    .max_connections(hard)
+                    .build()
+                    .unwrap();
+                assert!(net.validate(8, Some(have)).is_ok(), "{have} descriptors");
+            }
+        }
+    }
+
+    /// An explicit cap, and the blocking pool, do not move with the limit:
+    /// an explicit cap the descriptors cannot hold is refused at start.
+    #[test]
+    fn test_explicit_and_blocking_caps_ignore_the_descriptor_limit() {
+        let asked = Limits::new().max_connections(500);
+        let reactor = Workers::reactor(8);
+        assert_eq!(
+            connection_caps(&asked, &reactor, Some(256)),
+            connection_caps(&asked, &reactor, None)
+        );
+        assert_eq!(connection_caps(&asked, &reactor, None).1, 562);
+        let pool = Workers::blocking(256);
+        assert_eq!(
+            connection_caps(&Limits::new(), &pool, Some(256)),
+            connection_caps(&Limits::new(), &pool, None)
+        );
     }
 }

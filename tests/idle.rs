@@ -8,6 +8,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,18 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static COUNTING: Counting = Counting;
 
+/// `LIVE` counts the whole process, so the tests here run one at a time: run
+/// together, one test's connections and replies were counted in another's
+/// measurement (Linux CI measured 1,429 to 4,214 bytes per idle connection
+/// for the same code).
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+fn alone() -> std::sync::MutexGuard<'static, ()> {
+    ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
 
 /// The most a connection may hold while idle, excluding kernel buffers. The
@@ -57,6 +70,7 @@ fn one_request(s: &mut TcpStream) {
 #[test]
 #[ignore = "needs 20,000 descriptors"]
 fn test_ten_thousand_idle_connections_stay_bounded() {
+    let _alone = alone();
     let count: usize = std::env::var("SERVE_NET_IDLE").map_or(10_000, |n| n.parse().unwrap());
     let server = Server::builder()
         .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
@@ -129,6 +143,7 @@ fn test_ten_thousand_idle_connections_stay_bounded() {
 #[test]
 #[ignore = "opens 100,000 connections"]
 fn test_hundred_thousand_connections_leak_nothing() {
+    let _alone = alone();
     const CLOSE: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
     let count: usize = std::env::var("SERVE_NET_LEAK").map_or(100_000, |n| n.parse().unwrap());
     let server = Server::builder()
@@ -202,6 +217,7 @@ fn test_hundred_thousand_connections_leak_nothing() {
 #[test]
 #[ignore = "moves about 1 GB over loopback"]
 fn test_t33_large_replies_on_many_connections_stay_bounded() {
+    let _alone = alone();
     static BIG: [u8; 256 * 1024] = [b'x'; 256 * 1024];
     let server = Server::builder()
         .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
@@ -262,7 +278,17 @@ fn test_t33_large_replies_on_many_connections_stay_bounded() {
     for _ in 0..3 {
         round();
     }
-    let after = settle();
+    // On a loaded host the idle trim can run late: a connection still holding
+    // its 64 KiB reply buffer two seconds on looks like growth (CI once saw 44
+    // of them). A leak never comes back down, so wait up to 15 s for the heap
+    // to return under the bound before counting.
+    let bound = warm + 1024 * 1024;
+    let mut after = settle();
+    let until = std::time::Instant::now() + Duration::from_secs(15);
+    while after >= bound && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(250));
+        after = LIVE.load(Ordering::Relaxed);
+    }
     let grew = after.saturating_sub(warm);
     eprintln!("64 connections, 256 KiB replies: live heap {warm} -> {after} bytes (+{grew})");
     // Pools may take a buffer or two more; growth with the rounds is a leak.

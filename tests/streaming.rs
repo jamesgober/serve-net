@@ -463,3 +463,45 @@ fn test_stream_body_over_the_profile_limit_is_refused_413() {
         "the service saw {seen} bytes past a 10-byte limit"
     );
 }
+
+/// `Discard { max }` counts body bytes only: a long head did not use up the
+/// allowance and close a connection whose small body was well under it
+/// (D-111).
+#[test]
+fn test_discard_counts_the_body_not_the_head() {
+    struct Drop100;
+    impl HttpService for Drop100 {
+        fn head(&self, _head: &HttpHead<'_>, _env: &mut Envelope) -> HeadAction {
+            HeadAction::ProceedWith(BodyPolicy::Discard { max: 100 })
+        }
+        fn call(&self, _req: &HttpRequest<'_>, _env: &Envelope, reply: &mut HttpReply) -> Outcome {
+            reply.text(200, "ok");
+            Outcome::Done
+        }
+    }
+    let filler = "x".repeat(150);
+    let long = format!(
+        "POST / HTTP/1.1\r\nHost: a\r\nX-Filler: {filler}\r\nContent-Length: 10\r\n\r\n0123456789"
+    );
+    let mut conn = serve_net::testing::TestConnection::new(Drop100);
+    let replies = conn.send(long.as_bytes());
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].status, 200);
+    assert!(
+        replies[0].header("connection").is_none(),
+        "{:?}",
+        replies[0]
+    );
+    assert!(conn.is_open());
+    // Over the allowance, the reply closes the connection as before.
+    let big = format!(
+        "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 101\r\n\r\n{}",
+        "y".repeat(101)
+    );
+    let mut conn = serve_net::testing::TestConnection::new(Drop100);
+    let replies = conn.send(big.as_bytes());
+    assert_eq!(
+        replies[0].header("connection").map(<[u8]>::to_vec),
+        Some(b"close".to_vec())
+    );
+}

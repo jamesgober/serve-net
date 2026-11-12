@@ -144,29 +144,67 @@ fn test_reload_limits_reach_an_open_connection_at_its_next_request() {
 }
 
 #[test]
-fn test_reload_changes_ingress_in_place() {
+fn test_reload_changes_trust_in_place() {
+    let a = free_addr();
+    let elsewhere = TrustedProxies::parse("10.0.0.0/8").unwrap();
+    let behind = |trusted: TrustedProxies| {
+        ListenerSpec::tcp("web", a).ingress(Ingress::Proxy(ProxySource::forwarded_for(trusted)))
+    };
+    let server = Server::builder()
+        .config(config(vec![behind(elsewhere)]))
+        .serve(site())
+        .unwrap();
+    let forged = FORGED;
+    // Loopback is not trusted yet: the header is the client's own word.
+    let untrusted = exchange(&mut connect(a), forged);
+    assert!(untrusted.contains("127.0.0.1"), "{untrusted}");
+    let summary = server
+        .reload(config(vec![behind(TrustedProxies::loopback())]))
+        .unwrap();
+    assert_eq!(summary.changed, ["web"]);
+    let trusted = exchange(&mut connect(a), forged);
+    assert!(trusted.contains("203.0.113.9"), "{trusted}");
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+/// A reload cannot change what net-io fixed when it bound a kept listener:
+/// moving it from direct clients to a proxy changes its keep-alive idle and
+/// lifts its per-source cap, and a new write stall is net-io's too, so each
+/// is refused and nothing changes, rather than reported as applied (D-111).
+#[test]
+fn test_reload_refuses_transport_limits_net_io_fixed() {
     let a = free_addr();
     let server = Server::builder()
         .config(config(vec![ListenerSpec::tcp("web", a)]))
         .serve(site())
         .unwrap();
-    let forged = b"GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 203.0.113.9\r\n\r\n";
-    let direct = exchange(&mut connect(a), forged);
-    assert!(direct.contains("127.0.0.1"), "{direct}");
-
     let behind = ListenerSpec::tcp("web", a).ingress(Ingress::Proxy(ProxySource::forwarded_for(
         TrustedProxies::loopback(),
     )));
-    let summary = server.reload(config(vec![behind])).unwrap();
-    assert_eq!(summary.changed, ["web"]);
-    let trusted = exchange(&mut connect(a), forged);
-    assert!(trusted.contains("203.0.113.9"), "{trusted}");
+    let err = server.reload(config(vec![behind])).unwrap_err();
+    assert!(
+        matches!(&err, ServeError::Reload(e) if e.has(RuleId::ReloadListener)),
+        "{err}"
+    );
+    let mut next = config(vec![ListenerSpec::tcp("web", a)]);
+    next.limits = Limits::new().write_stall(Duration::from_millis(200));
+    let err = server.reload(next).unwrap_err();
+    assert!(
+        matches!(&err, ServeError::Reload(e) if e.has(RuleId::ReloadListener)),
+        "{err}"
+    );
+    // The old configuration serves on.
+    let direct = exchange(&mut connect(a), FORGED);
+    assert!(direct.contains("127.0.0.1"), "{direct}");
     assert_eq!(
         server.listeners()[0].ingress,
-        serve_net::IngressKind::Forwarded
+        serve_net::IngressKind::Direct
     );
     let _ = server.drain(Duration::from_secs(2));
 }
+
+/// A request whose forwarded header names another client.
+const FORGED: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 203.0.113.9\r\n\r\n";
 
 #[test]
 fn test_reload_public_bind_refused_old_config_kept() {

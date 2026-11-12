@@ -18,10 +18,10 @@
 
 <div align="left">
     <p>
-        <strong>serve-net</strong> is the engine a network service runs on. It takes listeners from <a href="https://crates.io/crates/net-io">net-io</a>, learns the real client behind any front end (a reverse proxy with PROXY protocol or forwarded headers, a Unix socket, FastCGI), runs a sans-IO protocol engine over each connection, and hands one normalized request at a time to your service. It owns what sits between the socket and the service: request deadlines, keep-alive, limits, admission under load, drain, restarts without dropped connections, and readiness.
+        <strong>serve-net</strong> is the engine a network service runs on. It takes listeners from <a href="https://crates.io/crates/net-io">net-io</a>, learns the real client behind any front end (a reverse proxy with PROXY protocol or forwarded headers, a Unix socket; FastCGI is planned), runs a sans-IO protocol engine over each connection, and hands one normalized request at a time to your service. It owns what sits between the socket and the service: request deadlines, keep-alive, limits, admission under load, drain, restarts without dropped connections, and readiness.
     </p>
     <p>
-        The protocol engine is a slot. For the web it holds <a href="https://crates.io/crates/http-net">http-net</a> (with ws-net after an upgrade and fcgi-net behind a FastCGI front end); for a database it holds that database's own wire format. One engine, one set of limits and hooks, for every kind of service. No async runtime and no third-party dependencies.
+        The protocol engine is a slot. For the web it holds <a href="https://crates.io/crates/http-net">http-net</a> (with ws-net after an upgrade, and fcgi-net behind a FastCGI front end once fcgi-net is published); for a database it holds that database's own wire format. One engine, one set of limits and hooks, for every kind of service. No async runtime and no third-party dependencies.
     </p>
     <br>
     <hr>
@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: <code>0.7.1</code>.</strong> HTTP/1.1 over net-io's reactor (or its blocking pool): directly, over TLS through an acceptor you supply, behind forwarded headers or the PROXY protocol, or on a Unix socket, with WebSocket upgrades, systemd activation, live reload, and restarts that drop nothing. See <a href="./docs/DEPLOYMENT.md"><code>docs/DEPLOYMENT.md</code></a>. The public API is locked in <a href="./docs/API.md"><code>docs/API.md</code></a>; the design and every decision behind it are in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. Streaming bodies, an offload pool for slow work, and 10,000 idle connections per process are in; <code>0.6.0</code> adds WebSocket upgrades and FastCGI, and the performance pass.
+        <strong>Status: <code>0.8.0</code>.</strong> HTTP/1.1 over net-io's reactor (or its blocking pool): directly, over TLS through an acceptor you supply, behind forwarded headers or the PROXY protocol, or on a Unix socket, with WebSocket upgrades, systemd activation, live reload, and restarts that drop nothing. See <a href="./docs/DEPLOYMENT.md"><code>docs/DEPLOYMENT.md</code></a>. The public API is locked in <a href="./docs/API.md"><code>docs/API.md</code></a>, and how the code fits together is in <a href="./docs/ARCHITECTURE.md"><code>docs/ARCHITECTURE.md</code></a>; the design and every decision behind it are in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. Streaming bodies, an offload pool for slow work, 10,000 idle connections per process, same-origin WebSocket upgrades, and a check that a TLS client's <code>Host</code> is the host it asked the TLS layer for are in. FastCGI waits for fcgi-net and is planned for <code>0.9.0</code>.
     </blockquote>
 </div>
 
@@ -40,7 +40,7 @@
 
 ```toml
 [dependencies]
-serve-net = "0.7"
+serve-net = "0.8"
 ```
 
 ```rust
@@ -69,14 +69,14 @@ Several listeners, profiles, limits, a connection gate, a control line, and cust
 
 ## Scope
 
-- **Listeners** over net-io: TCP and Unix sockets, inherited from systemd, passed by mod_fcgid on descriptor 0, or handed over by a supervisor for restarts without a closed port.
-- **Ingress**: direct (plain or TLS through net-io's seam), behind a reverse proxy (PROXY protocol v1 and v2, or trusted `Forwarded` / `X-Forwarded-For` with a right-to-left walk and a hop limit), over a Unix socket, or as a FastCGI responder. Every HTTP ingress gives the service the same request and the same client facts.
+- **Listeners** over net-io: TCP and Unix sockets, inherited from systemd, or handed over by a supervisor for restarts without a closed port.
+- **Ingress**: direct (plain or TLS through net-io's seam), behind a reverse proxy (PROXY protocol v1 and v2, or trusted `Forwarded` / `X-Forwarded-For` with a right-to-left walk and a hop limit), or over a Unix socket (a FastCGI responder is planned for 0.9.0). Every HTTP ingress gives the service the same request and the same client facts.
 - **Per connection**: head and request deadlines, minimum transfer rates, keep-alive with request and age limits, pipelining in order, generic refusals that never name the reason, the switch to WebSocket after an upgrade (`h2c` is never honoured).
 - **Admission**: soft connection caps answered with `503` and a jittered `Retry-After`, an in-flight cap per worker and per profile after the head is complete, priority lanes with reserved capacity, and a process-wide control line (shed, lockdown, drain, stop).
 - **Hooks**: admission, dispatch (offload slow work), revocation checkpoints, observation, readiness (systemd `sd_notify` in safe code), plus net-io's gate and event sink.
-- **Start-up safety**: every configuration error reported at once; a proxy or FastCGI listener on a public address, or a trust list that is too broad, is refused unless the override names its reason.
+- **Start-up safety**: every configuration error reported at once; a proxy listener on a public address (a socket passed in by systemd or a supervisor included), or a trust list that is too broad, is refused unless the override names its reason.
 
-It is not a web framework (no routing, middleware, or templates), not a transport (net-io is), not a protocol parser (the engines are), and not a TLS implementation (tls-net is). There is no CGI mode: services run as persistent processes, and FastCGI covers shared hosting.
+It is not a web framework (no routing, middleware, or templates), not a transport (net-io is), not a protocol parser (the engines are), and not a TLS implementation (tls-net is). There is no CGI mode: services run as persistent processes, and FastCGI (planned) will cover shared hosting.
 
 See [`dev/PLAN.md`](./dev/PLAN.md) for the full scope, what is left to other crates, and the decision log.
 

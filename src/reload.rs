@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use crate::config::validate::{self, Draft};
 use crate::config::{
-    Ingress, KeepAlive, Limits, ListenerSpec, Profile, ProfileId, ProfileTable, ProxyKind, Workers,
+    EngineChoice, Ingress, KeepAlive, Limits, ListenerSpec, Profile, ProfileId, ProfileTable,
+    ProxyKind, Workers,
 };
 use crate::conn::session::{Cap, Runtime};
 use crate::conn::{ListenerRuntime, Tables};
@@ -13,7 +14,8 @@ use crate::error::{ConfigError, ConfigErrors, RuleId, ServeError, Subject};
 use crate::notify::Notifier;
 use crate::running::ListenerMeta;
 use crate::server::{
-    connection_caps, file_owner, listener_meta, listener_runtime, net_listener, shared_seats,
+    connection_caps, engine_family, file_owner, listener_limits, listener_meta, listener_runtime,
+    net_listener, shared_seats,
 };
 use crate::snapshot::Snapshot;
 
@@ -91,6 +93,12 @@ pub(crate) struct Reloader {
     pub(crate) has_tls: bool,
     pub(crate) workers: Workers,
     pub(crate) threads: u16,
+    /// The descriptor limit read at start, which net-io's hard cap was
+    /// checked against.
+    pub(crate) descriptors: Option<u64>,
+    /// Whether the server serves the HTTP family: a reload keeps each
+    /// listener's engine in that family (D-110).
+    pub(crate) http: bool,
 }
 
 /// What net-io fixed when the listener was bound: a reload cannot change it
@@ -141,7 +149,7 @@ impl Reloader {
             reserved_percent: 0,
         });
         let mut errors = findings.errors;
-        let (soft, hard, threads) = connection_caps(&limits, &workers);
+        let (soft, hard, threads) = connection_caps(&limits, &workers, self.descriptors);
         if workers != self.workers || threads > self.threads {
             errors.push(error(
                 RuleId::ReloadWorkers,
@@ -150,6 +158,16 @@ impl Reloader {
                 "restart to change the workers, or keep max_connections within the pool",
             ));
         }
+        errors.extend(engine_family(
+            &listeners,
+            |id| match profiles.iter().find(|p| p.id == id) {
+                Some(p) => Some(p.engine),
+                // Profile 0 is made with defaults (HTTP) when none is given.
+                None if profiles.is_empty() && id == ProfileId(0) => Some(EngineChoice::Http1),
+                None => None,
+            },
+            self.http,
+        ));
         let mut kept: Vec<(usize, ListenerSpec)> = Vec::new();
         let mut added: Vec<ListenerSpec> = Vec::new();
         for spec in listeners {
@@ -184,6 +202,30 @@ impl Reloader {
             profiles.push(Profile::new(ProfileId(0)));
         }
         let table = ProfileTable::compile(&profiles, limits, keep_alive);
+
+        // net-io fixed a kept listener's transport limits when it bound it
+        // (the write stall, the minimum rate, the output budget, the linger,
+        // the idle and read timeouts, its hard and per-source caps). A reload
+        // that would change them is refused rather than reported as applied
+        // (D-111).
+        let mut kept_limits = Vec::with_capacity(kept.len());
+        let mut fixed = Vec::new();
+        for (id, spec) in &kept {
+            let next = listener_limits(spec, &table, &limits, self.transport.as_ref(), hard)?;
+            if metas[*id].as_ref().is_some_and(|m| m.net_limits != next) {
+                fixed.push(error(
+                    RuleId::ReloadListener,
+                    Subject::Listener(spec.name.clone()),
+                    "the transport limits net-io enforces on this listener (write_stall, min_rate, max_pending_output, linger, keep-alive idle, the read timeout, its connection caps) are fixed when it is bound",
+                    "add the listener under a new name and remove the old one, or restart",
+                ));
+            }
+            kept_limits.push(next);
+        }
+        if let Some(errors) = ConfigErrors::from_vec(fixed) {
+            self.notifier.reload_refused(&errors);
+            return Err(ServeError::Reload(errors));
+        }
 
         // Bind every added listener, door closed; on failure only these close.
         let mut bound: Vec<(usize, ListenerSpec)> = Vec::new();
@@ -251,7 +293,7 @@ impl Reloader {
                 new.same_user = Arc::clone(&was.same_user);
             }
             listeners_table[*id] = Some(runtime);
-            let meta = listener_meta(spec);
+            let meta = listener_meta(spec, kept_limits.remove(0));
             if metas[*id].as_ref().is_some_and(|m| !m.same_settings(&meta)) {
                 changed.push(spec.name.clone());
             }
@@ -272,7 +314,8 @@ impl Reloader {
                 }
             }
             listeners_table[*id] = Some(runtime);
-            next_metas[*id] = Some(listener_meta(spec));
+            let net_limits = listener_limits(spec, &table, &limits, self.transport.as_ref(), hard)?;
+            next_metas[*id] = Some(listener_meta(spec, net_limits));
             added_names.push(spec.name.clone());
         }
         let profile_caps = table

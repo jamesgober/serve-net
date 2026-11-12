@@ -100,6 +100,10 @@ pub enum RuleId {
     NoListeners,
     /// `catch_service_panics` in a build where panics abort.
     CatchPanicsInAbortBuild,
+    /// A listener whose profile's engine is not the family being bound:
+    /// `bind` on a profile with `EngineChoice::Custom`, or `bind_family` with
+    /// a custom family on an HTTP profile.
+    EngineFamily,
 }
 
 impl RuleId {
@@ -149,6 +153,7 @@ impl RuleId {
             RuleId::LockdownWithoutCritical => "lockdown_without_critical",
             RuleId::NoListeners => "no_listeners",
             RuleId::CatchPanicsInAbortBuild => "catch_panics_in_abort_build",
+            RuleId::EngineFamily => "engine_family",
         }
     }
 }

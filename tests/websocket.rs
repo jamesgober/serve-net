@@ -691,3 +691,233 @@ fn test_ws_sender_queue_is_bounded() {
     }
     assert!(full, "the queue never filled");
 }
+
+/// A gate that denies every write.
+struct DenyAll;
+
+impl serve_net::Gate for DenyAll {
+    type Ticket = ();
+    fn admit(
+        &self,
+        _info: &serve_net::net_io::ConnectionInfo,
+        _stage: serve_net::net_io::AdmitStage,
+    ) -> Result<serve_net::net_io::Admitted<()>, serve_net::net_io::Refusal> {
+        Ok(serve_net::net_io::Admitted {
+            lane: serve_net::Lane(0),
+            ticket: (),
+            tag: serve_net::GateTag(0),
+        })
+    }
+    fn readmit(
+        &self,
+        _ticket: &mut (),
+        _info: &serve_net::net_io::ConnectionInfo,
+    ) -> Result<(), serve_net::net_io::Refusal> {
+        Ok(())
+    }
+    fn check(
+        &self,
+        _ticket: &mut (),
+        _write: &serve_net::net_io::WriteCheck,
+    ) -> Result<(), serve_net::net_io::Denial> {
+        Err(serve_net::net_io::Denial { code: 403 })
+    }
+}
+
+#[test]
+fn test_ws_gate_denial_of_the_101_answers_403() {
+    // D-105: the 101 is a reply like any other until it leaves. A denied one
+    // is answered with the gate's status, and nothing is switched or opened.
+    let seen = Arc::new(Seen::default());
+    let app = App {
+        seen: Arc::clone(&seen),
+        echo: Arc::new(Echo(Arc::clone(&seen))),
+    };
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .gate(DenyAll)
+        .serve(app)
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    match Client::open(addr, "/ws", &[], b"") {
+        Err(head) => assert!(head.starts_with("HTTP/1.1 403"), "{head}"),
+        Ok((head, _)) => panic!("switched: {head}"),
+    }
+    let _ = server.drain(Duration::from_secs(2));
+    assert_eq!(seen.upgraded.load(Ordering::SeqCst), 0);
+    assert_eq!(seen.opened.load(Ordering::SeqCst), 0);
+    assert_eq!(*seen.ends.lock().unwrap(), vec![RequestEnd::Denied]);
+}
+
+/// The origin policy (D-103): which web pages may open a WebSocket.
+mod origins {
+    use std::sync::Arc;
+
+    use serve_net::testing::TestConnection;
+    use serve_net::{
+        Envelope, HeadAction, HttpHead, HttpReply, HttpRequest, HttpService, Outcome, ProxySource,
+        TrustedProxies, WebSocketConn, WebSocketService, WebSocketTarget, WsMessage,
+    };
+    use ws_net::OriginPolicy;
+
+    struct Quiet;
+    impl WebSocketService for Quiet {
+        fn message(&self, _e: &Envelope, _m: WsMessage<'_>, _c: &mut WebSocketConn<'_>) {}
+    }
+
+    struct Site {
+        allow: WebSocketTarget,
+        any: WebSocketTarget,
+    }
+
+    impl HttpService for Site {
+        fn head(&self, head: &HttpHead<'_>, _env: &mut Envelope) -> HeadAction {
+            match head.path() {
+                "/ws" => HeadAction::Upgrade(WebSocketTarget::new(Quiet).into()),
+                "/ws-allow" => HeadAction::Upgrade(self.allow.clone().into()),
+                "/ws-any" => HeadAction::Upgrade(self.any.clone().into()),
+                _ => HeadAction::Proceed,
+            }
+        }
+        fn call(&self, _r: &HttpRequest<'_>, _e: &Envelope, reply: &mut HttpReply) -> Outcome {
+            reply.text(200, "plain");
+            Outcome::Done
+        }
+    }
+
+    fn site() -> Site {
+        let quiet: Arc<dyn WebSocketService> = Arc::new(Quiet);
+        Site {
+            allow: WebSocketTarget::shared(Arc::clone(&quiet))
+                .origins(OriginPolicy::allow(&["https://app.example"]).unwrap()),
+            any: WebSocketTarget::shared(quiet).origins(OriginPolicy::any_origin()),
+        }
+    }
+
+    /// The first line of the answer to an upgrade request to `path` with
+    /// these extra fields.
+    fn status(conn: &mut TestConnection<Site>, path: &str, fields: &str) -> String {
+        let request = format!(
+            "GET {path} HTTP/1.1\r\n{fields}Upgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        let mut out = Vec::new();
+        conn.send_into(request.as_bytes(), &mut out);
+        let text = String::from_utf8_lossy(&out).into_owned();
+        text.lines().next().unwrap_or("").to_owned()
+    }
+
+    fn direct(path: &str, fields: &str) -> String {
+        status(&mut TestConnection::new(site()), path, fields)
+    }
+
+    #[test]
+    fn test_ws_same_origin_page_is_switched() {
+        let host = "Host: chat.example\r\n";
+        assert_eq!(
+            direct("/ws", &format!("{host}Origin: https://chat.example\r\n")),
+            "HTTP/1.1 101 Switching Protocols"
+        );
+        // Ports compare after the scheme's default is filled in.
+        assert_eq!(
+            direct(
+                "/ws",
+                "Host: chat.example:8080\r\nOrigin: http://chat.example:8080\r\n"
+            ),
+            "HTTP/1.1 101 Switching Protocols"
+        );
+    }
+
+    #[test]
+    fn test_ws_cross_origin_page_is_refused_403() {
+        let host = "Host: chat.example\r\n";
+        for origin in [
+            "https://evil.example",
+            "https://chat.example.evil.example",
+            "https://chat.example:8443",
+            "null",
+            "file://",
+        ] {
+            assert_eq!(
+                direct("/ws", &format!("{host}Origin: {origin}\r\n")),
+                "HTTP/1.1 403 Forbidden",
+                "{origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ws_request_without_origin_is_switched() {
+        // Not a browser: no ambient credentials ride on it.
+        assert_eq!(
+            direct("/ws", "Host: chat.example\r\n"),
+            "HTTP/1.1 101 Switching Protocols"
+        );
+    }
+
+    #[test]
+    fn test_ws_two_origin_fields_are_400() {
+        assert_eq!(
+            direct(
+                "/ws",
+                "Host: chat.example\r\nOrigin: https://chat.example\r\nOrigin: https://evil.example\r\n"
+            ),
+            "HTTP/1.1 400 Bad Request"
+        );
+    }
+
+    #[test]
+    fn test_ws_allowlist_and_any_origin() {
+        let host = "Host: chat.example\r\n";
+        assert_eq!(
+            direct(
+                "/ws-allow",
+                &format!("{host}Origin: https://app.example\r\n")
+            ),
+            "HTTP/1.1 101 Switching Protocols"
+        );
+        // An allowlist is the whole list: the endpoint's own origin is not on it.
+        assert_eq!(
+            direct(
+                "/ws-allow",
+                &format!("{host}Origin: https://chat.example\r\n")
+            ),
+            "HTTP/1.1 403 Forbidden"
+        );
+        assert_eq!(
+            direct(
+                "/ws-any",
+                &format!("{host}Origin: https://evil.example\r\n")
+            ),
+            "HTTP/1.1 101 Switching Protocols"
+        );
+    }
+
+    #[test]
+    fn test_ws_origin_is_judged_on_the_trusted_authority() {
+        // A proxy that rewrites Host and names the public one in
+        // X-Forwarded-Host: with trust_host on, the page's origin is the
+        // public name.
+        let fields = "Host: backend:8080\r\nX-Forwarded-For: 198.51.100.7\r\n\
+                      X-Forwarded-Host: chat.example\r\nOrigin: https://chat.example\r\n";
+        let trusted = ProxySource::forwarded_for(TrustedProxies::loopback()).trust_host(true);
+        let mut behind = TestConnection::behind(
+            site(),
+            trusted,
+            serve_net::Profile::new(serve_net::ProfileId(0)),
+        );
+        assert_eq!(
+            status(&mut behind, "/ws", fields),
+            "HTTP/1.1 101 Switching Protocols"
+        );
+        // Without trust_host the Host field is the authority, and the page is
+        // another origin.
+        let untrusted = ProxySource::forwarded_for(TrustedProxies::loopback());
+        let mut plain = TestConnection::behind(
+            site(),
+            untrusted,
+            serve_net::Profile::new(serve_net::ProfileId(0)),
+        );
+        assert_eq!(status(&mut plain, "/ws", fields), "HTTP/1.1 403 Forbidden");
+    }
+}

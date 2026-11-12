@@ -76,6 +76,11 @@ enum Turn {
 
 impl Client {
     fn connect(addr: SocketAddr, alpn: &[Alpn]) -> Client {
+        Client::connect_as(addr, alpn, "example.test")
+    }
+
+    /// As `connect`, asking for `sni` in the handshake.
+    fn connect_as(addr: SocketAddr, alpn: &[Alpn], sni: &str) -> Client {
         let tls = ClientBuilder::new()
             .trust(TrustAnchors::from_pem(CA_PEM).unwrap())
             .alpn(alpn)
@@ -85,7 +90,7 @@ impl Client {
         sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         Client {
             sock,
-            session: tls.connect("example.test").unwrap(),
+            session: tls.connect(sni).unwrap(),
             inbuf: vec![0; 64 * 1024],
             filled: 0,
             out: vec![0; 64 * 1024],
@@ -228,4 +233,91 @@ fn test_by_alpn_on_a_listener_without_tls_is_refused() {
         .build()
         .unwrap_err();
     assert!(err.has(RuleId::AlpnWithoutTls), "{err}");
+}
+
+/// A server whose service names the TLS server name it saw.
+fn serve_names(spec: ListenerSpec) -> serve_net::Running {
+    Server::builder()
+        .listener(spec)
+        .tls(acceptor(&[Alpn::HTTP_1_1]))
+        .serve(Names)
+        .unwrap()
+}
+
+/// Answers with the TLS server name and the request's authority.
+struct Names;
+
+impl serve_net::HttpService for Names {
+    fn call(
+        &self,
+        req: &serve_net::HttpRequest<'_>,
+        env: &serve_net::Envelope,
+        reply: &mut serve_net::HttpReply,
+    ) -> serve_net::Outcome {
+        let sni = env.tls().and_then(|t| t.sni()).unwrap_or("-");
+        let host = req.head().authority().unwrap_or("-");
+        reply.text(200, &format!("sni={sni} host={host}"));
+        serve_net::Outcome::Done
+    }
+}
+
+fn tls_listener() -> ListenerSpec {
+    ListenerSpec::tcp("secure", "127.0.0.1:0").ingress(Ingress::DirectTls)
+}
+
+fn get(addr: SocketAddr, sni: &str, host: &str) -> String {
+    let mut c = Client::connect_as(addr, &[Alpn::HTTP_1_1], sni);
+    assert!(c.handshake().is_some(), "no handshake for {sni}");
+    let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    c.exchange(request.as_bytes()).expect("a reply")
+}
+
+/// T-42: a client that asked the TLS layer for one name and the HTTP layer
+/// for another is answered 421, so a policy the TLS layer chose by name
+/// (client certificates per host) cannot be stepped around through `Host`.
+#[test]
+fn test_t42_host_that_differs_from_the_tls_server_name_is_misdirected() {
+    let server = serve_names(tls_listener());
+    let addr = server.local_addr().unwrap();
+    let reply = get(addr, "www.example.test", "admin.example.test");
+    assert!(reply.starts_with("HTTP/1.1 421 "), "{reply}");
+    assert!(!reply.contains("sni="), "the service ran: {reply}");
+    // The names match: served, and the service sees the server name.
+    let reply = get(addr, "admin.example.test", "admin.example.test");
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    assert!(
+        reply.ends_with("sni=admin.example.test host=admin.example.test"),
+        "{reply}"
+    );
+    // A port, a trailing dot, and letter case do not make a mismatch.
+    let reply = get(addr, "admin.example.test", "ADMIN.example.test.:443");
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+#[test]
+fn test_t42_allow_sni_mismatch_serves_and_shows_both_names() {
+    let server = serve_names(tls_listener().allow_sni_mismatch("a test of the opt-out"));
+    let addr = server.local_addr().unwrap();
+    let reply = get(addr, "www.example.test", "admin.example.test");
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    assert!(
+        reply.ends_with("sni=www.example.test host=admin.example.test"),
+        "{reply}"
+    );
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+#[test]
+fn test_plain_listener_has_no_tls_facts() {
+    let server = serve_names(ListenerSpec::tcp("plain", "127.0.0.1:0"));
+    let addr = server.local_addr().unwrap();
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut got = String::new();
+    let _ = s.read_to_string(&mut got);
+    assert!(got.ends_with("sni=- host=a"), "{got}");
+    let _ = server.drain(Duration::from_secs(2));
 }

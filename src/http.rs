@@ -285,6 +285,15 @@ struct OwnedRequest {
     body: Box<[u8]>,
 }
 
+impl Drop for OwnedRequest {
+    /// The body copy is zeroed on every profile (D-111): an offloaded
+    /// request is slow work, and a 64 KiB body costs about 2 to 5 us
+    /// [est.]. The head is http-net's copy, which has no way to zero it.
+    fn drop(&mut self) {
+        crate::engine::wipe_bytes(&mut self.body);
+    }
+}
+
 impl DetachedRequest<HttpFamily> for OwnedRequest {
     fn with(&self, call: &mut dyn FnMut(&HttpRequest<'_>)) {
         call(&HttpRequest {
@@ -334,6 +343,14 @@ pub struct DetachedHead {
     path: Span,
     query: Option<Span>,
     fields: Vec<(Span, Span)>,
+}
+
+impl Drop for DetachedHead {
+    /// Zeroed on every profile (D-111): a head may hold credentials, and it is
+    /// typically under 1 KiB, about 50 ns [est.].
+    fn drop(&mut self) {
+        crate::engine::wipe_bytes(&mut self.bytes);
+    }
 }
 
 /// Fields whose values `Debug` never prints.
@@ -488,6 +505,9 @@ pub struct HttpParts {
     streaming: bool,
     /// Bytes of a streamed reply in earlier parts.
     sent: u64,
+    /// `respond` wrote a head that a body follows; serve-net sends the body
+    /// from here (`Family::reply_body`).
+    send_body: bool,
 }
 
 impl HttpParts {
@@ -521,6 +541,7 @@ impl HttpParts {
         self.invalid = false;
         self.streaming = false;
         self.sent = 0;
+        self.send_body = false;
     }
 }
 
@@ -708,6 +729,19 @@ impl Family for HttpFamily {
         cx: &HeadContext<'a>,
     ) -> Result<(HttpHead<'a>, ClientInfo), EngineError> {
         let base = *cx.client;
+        // T-42: the client's own `Host` against the name it gave the TLS
+        // layer, before any service code sees the request. Checked once, at
+        // the head; the view built again for the call is the same request.
+        if cx.resolved.is_none() && cx.sni_check {
+            if let (Some(sni), Some(host)) = (cx.tls.and_then(net_io::TlsInfo::sni), raw.host()) {
+                if !same_host(host, sni) {
+                    return Err(EngineError {
+                        kind: RefusalKind::Misdirected,
+                        status: 421,
+                    });
+                }
+            }
+        }
         let ingress_error = EngineError {
             kind: RefusalKind::Ingress,
             status: 400,
@@ -885,7 +919,32 @@ impl Family for HttpFamily {
         unix_secs: u64,
         out: &mut OutBuf,
     ) -> Result<u16, EngineError> {
-        encode(engine, parts, false, unix_secs, out).map(|(status, _)| status)
+        let (status, plan) = encode(engine, parts, false, unix_secs, out)?;
+        // The body stays where the service put it (D-111).
+        parts.send_body = matches!(plan, BodyPlan::Raw);
+        Ok(status)
+    }
+
+    fn reply_body<'p>(&self, parts: &'p HttpParts) -> &'p [u8] {
+        if !parts.send_body {
+            return &[];
+        }
+        match parts.body_static {
+            Some(b) => b,
+            None => &parts.body,
+        }
+    }
+
+    fn upgrade_allowed(
+        &self,
+        head: &HttpHead<'_>,
+        target: &UpgradeTarget,
+    ) -> Result<(), EngineError> {
+        let _ = &head;
+        match *target {
+            #[cfg(feature = "ws")]
+            UpgradeTarget::WebSocket(ref t) => crate::ws::origin_allowed(head, t),
+        }
     }
 
     fn upgrade(
@@ -903,7 +962,24 @@ impl Family for HttpFamily {
     }
 }
 
-/// Writes the reply's head, and its body unless `chunked`.
+/// Whether an authority (`host`, `host:port`, `[v6]:port`) names the TLS
+/// server name `sni`: letter case, a port, and one trailing dot are ignored.
+pub(crate) fn same_host(authority: &str, sni: &str) -> bool {
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or(rest, |(h, _)| h),
+        None => authority
+            .rsplit_once(':')
+            .filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit()))
+            .map_or(authority, |(h, _)| h),
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let sni = sni.strip_suffix('.').unwrap_or(sni);
+    !host.is_empty() && host.eq_ignore_ascii_case(sni)
+}
+
+/// Writes the reply's head. A streamed reply's part (`chunked`) writes its
+/// body too; a whole reply's body is sent from the parts by serve-net
+/// (`Family::reply_body`), so it is never copied into the connection's buffer.
 fn encode(
     engine: &mut Http1,
     parts: &HttpParts,
@@ -952,7 +1028,7 @@ fn encode(
     let start = out.len();
     match engine.conn.write_head(&head, Some(date), out) {
         Ok(plan) => {
-            if matches!(plan, BodyPlan::Raw) {
+            if chunked && matches!(plan, BodyPlan::Raw) {
                 out.push(body);
             }
             Ok((status, plan))
@@ -1178,6 +1254,20 @@ impl<F> fmt::Debug for Handler<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_same_host_ignores_case_port_and_one_trailing_dot() {
+        assert!(same_host("admin.example.test", "admin.example.test"));
+        assert!(same_host("ADMIN.Example.test:8443", "admin.example.test"));
+        assert!(same_host("admin.example.test.", "admin.example.test"));
+        assert!(same_host("admin.example.test", "admin.example.test."));
+        assert!(same_host("[::1]:443", "::1"));
+        assert!(!same_host("www.example.test", "admin.example.test"));
+        assert!(!same_host("admin.example.test.evil", "admin.example.test"));
+        assert!(!same_host("admin.example.tes", "admin.example.test"));
+        assert!(!same_host(":443", "admin.example.test"));
+        assert!(!same_host("", ""));
+    }
 
     #[test]
     fn test_reply_debug_redacts_values() {

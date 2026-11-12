@@ -103,9 +103,30 @@ mod restart {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use serve_net::{ListenerSpec, Server};
+    use serve_net::{EndReason, ListenerSpec, Server};
 
     const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+
+    /// Which server refused a connection, and why, with when it ended: a
+    /// failure message then says whether the old server or the new one sent a
+    /// refusal, and whether the old one did so after its kill returned.
+    static REFUSALS: Mutex<Vec<(&str, EndReason, std::time::Instant)>> = Mutex::new(Vec::new());
+
+    struct Refusals(&'static str);
+
+    impl serve_net::Observer for Refusals {
+        fn connection_ended(&self, _c: serve_net::ConnectionId, end: EndReason, _requests: u32) {
+            if matches!(end, EndReason::Shed | EndReason::CapacityRefused) {
+                if let Ok(mut r) = REFUSALS.lock() {
+                    r.push((self.0, end, std::time::Instant::now()));
+                }
+            }
+        }
+    }
+
+    fn refusals() -> Vec<(&'static str, EndReason, std::time::Instant)> {
+        REFUSALS.lock().map(|r| r.clone()).unwrap_or_default()
+    }
 
     /// A connect that timed out. With four clients each holding at most one
     /// connection the backlog cannot fill, so an unanswered handshake is the
@@ -170,6 +191,7 @@ mod restart {
         Server::builder()
             .workers(workers)
             .listener(ListenerSpec::handed_off("web", handle).transport_limits(room))
+            .observer(Refusals(who))
             .serve(serve_net::handler(move |_req, reply| {
                 reply.text(200, who);
             }))
@@ -328,7 +350,11 @@ mod restart {
                 *begun > killed_at && r.as_ref().is_err_and(|e| !e.starts_with(HOST_TIMEOUT))
             })
             .collect();
-        assert!(late.is_empty(), "{at:?}: failed after the kill: {late:?}");
+        assert!(
+            late.is_empty(),
+            "{at:?}: failed after the kill at {killed_at:?}: {late:?}; refusals (server, reason, ended): {:?}",
+            refusals()
+        );
         let served_after = log
             .iter()
             .filter(|(begun, r)| *begun > killed_at && r.is_ok())

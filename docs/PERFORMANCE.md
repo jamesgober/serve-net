@@ -4,8 +4,10 @@ What serve-net costs, measured, and where it misses a target. The targets are `d
 (NFR) and section 10 (P-1 to P-14). Every number here names its method and hardware. A target that is
 not met says why and what closes it; a missed throughput target blocks 1.0.
 
-Status at 0.6.0. Numbers from a development machine compare serve-net builds with each other. They
-are not the competitor comparison (NFR-5), which needs the reference hardware described at the end.
+Status at 0.8.0. The request-path and defence numbers are from the 0.6 pass; idle memory and the
+reply path are as of 0.8.0. Numbers from a development machine compare serve-net builds with each
+other. They are not the competitor comparison (NFR-5), which needs the reference hardware described at
+the end.
 
 ## Method
 
@@ -66,17 +68,26 @@ is the idle-memory question below and is decided there.
 
 Zero allocations per request after warm-up, enforced by `tests/alloc.rs` with a counting allocator:
 10,000 keep-alive GETs, 5,000 POSTs with a 4 KiB buffered body, 2,000 batches of 8 pipelined requests,
-and a refusal. Met.
+and a refusal. Met for requests that follow each other within a second: a connection quiet for a
+second gives its engine, output, body, and reply buffers back (the idle trim, D-087), so its next
+request allocates them again, by design.
+
+## Reply bodies (0.8.0)
+
+A reply body is sent from where the service put it (`body` into the reply's buffer, `body_static` with
+no copy at all), as net-io's output budget takes it; it is no longer copied whole into the connection's
+output buffer. That removes one copy of every reply byte, and a slow reader holds at most the output
+budget (`max_pending_output`, 256 KiB by default) instead of the whole body: eight stalled clients of
+an 8 MiB static body held 64 MiB before and hold the budget now (`tests/reply_memory.rs`). Cost: one
+more push into net-io per reply.
 
 ## Idle memory (P-5, NFR-3)
 
-About 8.9 KB per idle keep-alive connection on the reactor (89 MB for 10,000), enforced at 12 KiB by
-`tests/idle.rs` in CI on Linux, macOS, and Windows. **Target: at most 4 KiB. Not met.** About 2.9 KB is
-the session and its small allocations; the rest is the engine buffer, the output buffer, and reply data,
-kept so a keep-alive request allocates nothing. A trim after a quiet second was built and measured: it
-frees them, but net-io 0.5 hands each session call an output buffer and returns it only when no read is
-pending, so a timer callback pins 16 KiB to free 6 KiB. The trim lands when net-io returns that buffer
-(D-076, requested).
+About 3.8 KB per idle keep-alive connection on Linux, 3.0 KB on macOS, and 4.0 KB on Windows on the
+reactor (D-094, D-109), enforced by `tests/idle.rs` in CI with 10,000 connections: 4 KiB, and 4.25 KiB
+on Windows, where net-io's completion-port bookkeeping adds about 150 bytes (in the register). Met on
+Linux and macOS. The idle trim (D-087) releases the engine, output, body, and reply buffers after a
+quiet second, on net-io 0.6.1 or later, which returns the buffer a timer callback held.
 
 ## Throughput against other servers (P-2 to P-4, NFR-5)
 

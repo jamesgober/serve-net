@@ -171,9 +171,12 @@ fn test_tls_listener_serves_https_through_the_seam() {
         serve_net::IngressKind::DirectTls
     );
     let addr = server.local_addr().unwrap();
-    let a = ask(addr, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    let a = ask(addr, b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n");
     assert!(a.starts_with("HTTP/1.1 200"), "{a}");
     assert!(a.ends_with("DirectTls https"), "{a}");
+    // The handshake asked for example.test: another host is misdirected (T-42).
+    let b = ask(addr, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(b.starts_with("HTTP/1.1 421 Misdirected Request"), "{b}");
     let report = server.drain(Duration::from_secs(2));
     assert_eq!(report.killed, 0, "{report:?}");
 }

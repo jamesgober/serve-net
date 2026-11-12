@@ -257,16 +257,35 @@ fn public_bind(l: &ListenerSpec, f: &mut Findings) {
     if !matches!(l.ingress, Ingress::Proxy(_)) || l.public_bind.is_some() {
         return;
     }
-    if let ListenerSource::Tcp(addr) = l.source {
-        if addr.ip().is_unspecified() || !is_local_or_private(addr.ip()) {
-            f.error(
-                RuleId::PublicBind,
-                Subject::Listener(l.name.clone()),
-                "a listener that trusts a front end is bound to a public or unspecified address, so anyone who reaches it can forge client facts",
-                "bind 127.0.0.1, a private address, or a Unix socket, or call allow_public_bind with the reason",
-            );
-        }
+    // An inherited socket's fallback is checked here; the address of a socket
+    // passed in (systemd, a supervisor) is checked once it is known, at bind.
+    let addr = match &l.source {
+        ListenerSource::Tcp(addr) => Some(*addr),
+        ListenerSource::Inherited {
+            fallback: Some(addr),
+            ..
+        } => Some(*addr),
+        _ => None,
+    };
+    if addr.is_some_and(|a| is_public(a.ip())) {
+        f.error(
+            RuleId::PublicBind,
+            Subject::Listener(l.name.clone()),
+            PUBLIC_BIND.0,
+            PUBLIC_BIND.1,
+        );
     }
+}
+
+/// The `PublicBind` message and hint.
+pub(crate) const PUBLIC_BIND: (&str, &str) = (
+    "a listener that trusts a front end is bound to a public or unspecified address, so anyone who reaches it can forge client facts",
+    "bind 127.0.0.1, a private address, or a Unix socket, or call allow_public_bind with the reason",
+);
+
+/// An address a listener that trusts a front end must not be bound to.
+pub(crate) fn is_public(ip: IpAddr) -> bool {
+    ip.is_unspecified() || !is_local_or_private(ip)
 }
 
 /// TLS needs an acceptor, and ALPN ids need TLS.
@@ -635,7 +654,8 @@ fn reserves(d: &Draft<'_>, f: &mut Findings) {
         .filter_map(|p| p.budget.dedicated)
         .map(u32::from)
         .sum();
-    let (soft, _, _) = crate::server::connection_caps(d.limits, d.workers);
+    let (soft, _, _) =
+        crate::server::connection_caps(d.limits, d.workers, net_io::descriptor_limit());
     let others = d.profiles.iter().any(|p| p.budget.dedicated.is_none());
     if kept > soft || (kept == soft && others) {
         f.error(
@@ -774,6 +794,21 @@ mod tests {
             &[],
         );
         assert!(!rules(&f).contains(&RuleId::PublicBind));
+    }
+
+    #[test]
+    fn test_build_inherited_fallback_public_bind_refused() {
+        let behind = |spec: ListenerSpec| {
+            spec.ingress(Ingress::Proxy(ProxySource::forwarded_for(
+                TrustedProxies::loopback(),
+            )))
+        };
+        let public =
+            behind(ListenerSpec::inherited("p").fallback_bind("0.0.0.0:0".parse().unwrap()));
+        assert!(rules(&run(&[public], &[])).contains(&RuleId::PublicBind));
+        let private =
+            behind(ListenerSpec::inherited("p").fallback_bind("127.0.0.1:0".parse().unwrap()));
+        assert!(!rules(&run(&[private], &[])).contains(&RuleId::PublicBind));
     }
 
     #[test]

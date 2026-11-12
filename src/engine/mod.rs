@@ -138,6 +138,12 @@ pub enum RefusalKind {
     Service,
     /// A service bug (an invalid reply, a dropped token, a panic).
     Internal,
+    /// An upgrade from a web page the target's origin policy does not allow
+    /// (cross-site WebSocket hijacking).
+    CrossOrigin,
+    /// The request names another host than the TLS server name the client
+    /// asked for (HTTP 421, T-42).
+    Misdirected,
 }
 
 impl RefusalKind {
@@ -156,6 +162,8 @@ impl RefusalKind {
             RefusalKind::Ingress => "ingress",
             RefusalKind::Service => "service",
             RefusalKind::Internal => "internal",
+            RefusalKind::CrossOrigin => "cross_origin",
+            RefusalKind::Misdirected => "misdirected",
         }
     }
 }
@@ -201,18 +209,23 @@ impl std::error::Error for EngineError {}
 #[derive(Default)]
 pub struct OutBuf {
     pub(crate) bytes: Vec<u8>,
+    /// The connection's profile wipes: growth zeroes the block it leaves.
+    pub(crate) wipe: bool,
 }
 
 impl OutBuf {
     /// An empty buffer.
     #[must_use]
     pub fn new() -> Self {
-        OutBuf { bytes: Vec::new() }
+        OutBuf {
+            bytes: Vec::new(),
+            wipe: false,
+        }
     }
 
     /// Appends `bytes`.
     pub fn push(&mut self, bytes: &[u8]) {
-        self.bytes.extend_from_slice(bytes);
+        extend_wiping(&mut self.bytes, bytes, self.wipe);
     }
 
     /// The number of bytes held.
@@ -266,11 +279,55 @@ impl fmt::Debug for OutBuf {
 #[cfg(feature = "http1")]
 impl http_net::Output for OutBuf {
     fn put(&mut self, bytes: &[u8]) {
-        self.bytes.extend_from_slice(bytes);
+        extend_wiping(&mut self.bytes, bytes, self.wipe);
     }
     fn reserve(&mut self, additional: usize) {
-        self.bytes.reserve(additional);
+        reserve_wiping(&mut self.bytes, additional, self.wipe);
     }
+}
+
+/// Makes room for `additional` more bytes. Growing a buffer frees its old
+/// block; when `wipe` is set the contents move to the new block first and
+/// the old one is zeroed, so no freed block keeps them (D-111).
+pub(crate) fn reserve_wiping(buf: &mut Vec<u8>, additional: usize, wipe: bool) {
+    if buf.capacity() - buf.len() >= additional {
+        return;
+    }
+    if !wipe {
+        buf.reserve(additional);
+        return;
+    }
+    drop(grow_wiping(buf, additional));
+}
+
+/// Moves `buf` into a block with room for `additional` more bytes and
+/// returns the old block, zeroed, for the caller to free.
+fn grow_wiping(buf: &mut Vec<u8>, additional: usize) -> Vec<u8> {
+    let need = buf.len().saturating_add(additional);
+    let mut grown = Vec::with_capacity(need.max(buf.capacity().saturating_mul(2)));
+    grown.extend_from_slice(buf);
+    let mut old = core::mem::replace(buf, grown);
+    wipe_bytes(&mut old);
+    old
+}
+
+/// Appends `bytes`, growing as `reserve_wiping` does.
+pub(crate) fn extend_wiping(buf: &mut Vec<u8>, bytes: &[u8], wipe: bool) {
+    reserve_wiping(buf, bytes.len(), wipe);
+    buf.extend_from_slice(bytes);
+}
+
+/// Appends `text` to a string, growing as `reserve_wiping` does.
+#[cfg(feature = "ws")]
+pub(crate) fn push_str_wiping(s: &mut String, text: &str, wipe: bool) {
+    if wipe && s.capacity() - s.len() < text.len() {
+        let need = s.len().saturating_add(text.len());
+        let mut grown = String::with_capacity(need.max(s.capacity().saturating_mul(2)));
+        grown.push_str(s);
+        let mut old = core::mem::replace(s, grown).into_bytes();
+        wipe_bytes(&mut old);
+    }
+    s.push_str(text);
 }
 
 /// Zeroes `bytes` with writes the optimizer keeps.
@@ -292,6 +349,11 @@ pub struct HeadContext<'c> {
     pub(crate) resolved: Option<ClientInfo>,
     /// The facts of the connection's PROXY header, on a PROXY listener.
     pub(crate) proxy_facts: Option<&'c net_io::ProxyFacts>,
+    /// The TLS handshake's facts, on a connection serve-net decrypts.
+    pub(crate) tls: Option<&'c net_io::TlsInfo>,
+    /// Whether a request naming another host than the TLS server name is
+    /// refused (the listener did not `allow_sni_mismatch`).
+    pub(crate) sni_check: bool,
 }
 
 impl HeadContext<'_> {
@@ -305,6 +367,21 @@ impl HeadContext<'_> {
     #[must_use]
     pub fn resolved(&self) -> Option<&ClientInfo> {
         self.resolved.as_ref()
+    }
+
+    /// The TLS handshake's facts, on a connection serve-net decrypts. A
+    /// family whose protocol names a host checks it against `sni` as the
+    /// HTTP family does (T-42).
+    #[must_use]
+    pub fn tls(&self) -> Option<&net_io::TlsInfo> {
+        self.tls
+    }
+
+    /// Whether the listener checks a request's host against the TLS server
+    /// name (`false` after `ListenerSpec::allow_sni_mismatch`).
+    #[must_use]
+    pub fn checks_sni(&self) -> bool {
+        self.sni_check
     }
 }
 
@@ -341,6 +418,14 @@ pub trait Family: Send + Sync + 'static {
         unix_secs: u64,
         out: &mut OutBuf,
     ) -> Result<u16, EngineError>;
+    /// The bytes of the current reply that follow what `respond` wrote, sent
+    /// by serve-net straight from the reply data as the transport takes
+    /// them: a large body is never copied into a per-connection buffer. Read
+    /// after `respond` and until the reply has left; the default is none.
+    fn reply_body<'p>(&self, parts: &'p Self::Parts) -> &'p [u8] {
+        let _ = parts;
+        &[]
+    }
     /// The request view for one piece of a streamed body.
     fn request_chunk<'a>(
         &self,
@@ -386,6 +471,18 @@ pub trait Family: Send + Sync + 'static {
     {
         let _ = request;
         None
+    }
+    /// Whether an upgrade the service asked for in `head` may go ahead,
+    /// judged on the head view (where the trusted authority is known),
+    /// before admission. An `Err` is written as the refusal and the
+    /// connection closes; nothing is switched. The default allows it.
+    fn upgrade_allowed(
+        &self,
+        head: &Self::Head<'_>,
+        target: &UpgradeTarget,
+    ) -> Result<(), EngineError> {
+        let _ = (head, target);
+        Ok(())
     }
     /// Checks the handshake of an upgrade the service asked for and writes
     /// the switch response. After it the engine reports
@@ -481,6 +578,32 @@ impl Engine for NoCustom {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_growth_on_a_wiping_buffer_zeroes_the_old_block() {
+        let mut buf = Vec::with_capacity(8);
+        buf.extend_from_slice(b"secret!!");
+        let old = grow_wiping(&mut buf, 8);
+        assert_eq!(buf, b"secret!!");
+        assert!(buf.capacity() >= 16);
+        assert_eq!(old.len(), 8);
+        assert!(old.iter().all(|&b| b == 0), "{old:?}");
+        let mut buf = b"pass".to_vec();
+        extend_wiping(&mut buf, b"word, and more than four bytes", true);
+        assert_eq!(buf, b"password, and more than four bytes");
+        #[cfg(feature = "ws")]
+        {
+            let mut s = String::with_capacity(2);
+            s.push_str("ab");
+            push_str_wiping(&mut s, "cdefgh", true);
+            assert_eq!(s, "abcdefgh");
+        }
+        let mut out = OutBuf::new();
+        out.wipe = true;
+        out.push(&[7; 100]);
+        out.push(&[8; 1000]);
+        assert_eq!(out.len(), 1100);
+    }
 
     #[test]
     fn test_outbuf_clear_and_wipe() {

@@ -53,6 +53,8 @@ pub struct ListenerSpec {
     pub(crate) backlog: Option<u32>,
     pub(crate) max_connections: Option<u32>,
     pub(crate) public_bind: Option<&'static str>,
+    /// Why a request may name another host than the TLS server name.
+    pub(crate) sni_mismatch: Option<&'static str>,
     pub(crate) broad_trust: Option<&'static str>,
     pub(crate) unix_mode: UnixMode,
     pub(crate) world_writable: Option<&'static str>,
@@ -113,6 +115,7 @@ impl ListenerSpec {
             backlog: None,
             max_connections: None,
             public_bind: None,
+            sni_mismatch: None,
             broad_trust: None,
             unix_mode: UnixMode::default(),
             world_writable: None,
@@ -233,6 +236,18 @@ impl ListenerSpec {
     /// The listener's soft connection cap.
     pub fn max_connections(mut self, n: u32) -> Self {
         self.max_connections = Some(n);
+        self
+    }
+
+    /// Serves a request whose authority (`Host`) names another host than
+    /// the server name the client asked the TLS layer for. By default such
+    /// a request is answered `421 Misdirected Request` before `head` runs,
+    /// because a TLS acceptor may choose its policy (client certificates,
+    /// ALPN, ciphers) by that name (T-42). Turn the check off only when every
+    /// host behind this listener has the same TLS policy, and give the
+    /// reason. The names stay readable through `Envelope::tls`.
+    pub fn allow_sni_mismatch(mut self, reason: &'static str) -> Self {
+        self.sni_mismatch = Some(reason);
         self
     }
 

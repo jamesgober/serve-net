@@ -118,6 +118,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             r.status = Some(101);
             r.bytes_out += self.out.len() as u64;
         }
+        // The 101 is a reply: a gate may still deny it until its first byte
+        // leaves, and the HTTP refusal then goes out in its place.
+        io.begin_reply();
         // The engine switched; what followed the request is the new protocol's.
         let _ = self.engine.poll();
         let outbox = Arc::new(crate::ws::Outbox::new(
@@ -138,9 +141,17 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let Some(mut link) = self.ws.take() else {
             return (input.len(), Step::Close);
         };
-        let r = self.ws_drive(io, &mut link, input);
+        // The service runs inside: whatever it does, the link goes back
+        // before an unwind continues, so the close that follows still shuts
+        // the outbox, leaves the drain registry, and calls `closed` (D-111).
+        // Nothing is caught that the option would not catch: the unwind
+        // resumes, and net-io closes the connection as before.
+        let r = catch_unwind(AssertUnwindSafe(|| self.ws_drive(io, &mut link, input)));
         self.ws = Some(link);
-        r
+        match r {
+            Ok(r) => r,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     /// The client closed its sending side: whatever it sent is handled, then
@@ -221,14 +232,13 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         if link.opened {
             link.service.closed(&self.env, link.code);
         }
-        link.clear_message(self.wipe, 0);
-        if self.wipe {
-            crate::engine::wipe_bytes(&mut link.backlog);
-        }
+        link.release(self.wipe);
     }
 
     fn ws_drive<I: Io>(&mut self, io: &mut I, link: &mut WsLink, input: &[u8]) -> (usize, Step) {
-        // The 101 first, then the upgrade request is done.
+        // The 101 first. The upgrade request is done, and the service hears
+        // of the switch, only once the 101 has left past the gate: a denial
+        // before then is answered as HTTP and nothing is opened.
         while self.out_sent < self.out.len() {
             let n = io.push(&self.out.as_slice()[self.out_sent..]);
             if n == 0 {
@@ -242,6 +252,10 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             self.out.clear(self.wipe);
             self.out.shrink(0);
             self.out_sent = 0;
+            if self.request.is_some() {
+                io.set_phase(Phase::Sending);
+                return (0, Step::Write);
+            }
         }
         if self.request.is_some() {
             self.finish_request(RequestEnd::Upgraded);
@@ -325,7 +339,6 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     /// After the 101 left: `upgraded`, the HTTP engine's memory back, the
     /// timers, and `opened`.
     fn ws_open<I: Io>(&mut self, io: &mut I, link: &mut WsLink) {
-        link.opened = true;
         // A drain tells this connection, so it can send its 1001 (D-092).
         self.shared
             .control
@@ -336,7 +349,15 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             protocol: "websocket",
             subprotocol: link.subprotocol,
         };
-        shared.service.upgraded(&self.env, conn);
+        let catch = shared.catch_panics;
+        if catch {
+            let env = &self.env;
+            if catch_unwind(AssertUnwindSafe(|| shared.service.upgraded(env, conn))).is_err() {
+                self.ws_panicked(link);
+            }
+        } else {
+            shared.service.upgraded(&self.env, conn);
+        }
         // The HTTP engine and the body buffer are not used again.
         self.engine.reset();
         let _ = self.engine.shrink_idle();
@@ -346,7 +367,12 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         link.timer = now + link.interval;
         io.set_idle_timeout(Some(link.interval * 2 + CLOSE_WAIT));
         Self::ws_idle(io, link);
-        let catch = shared.catch_panics;
+        if link.finish || link.conn.state() != ws_net::State::Open {
+            // `upgraded` panicked: the socket closes without `opened`.
+            return;
+        }
+        // From here `closed` follows, whatever `opened` does.
+        link.opened = true;
         let env = &self.env;
         let mut wc = WebSocketConn {
             conn: &mut link.conn,
@@ -393,13 +419,13 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 Ok(ws_net::Event::Text(t)) => {
                     link.partial_since = None;
                     link.text.clear();
-                    link.text.push_str(t);
+                    crate::engine::push_str_wiping(&mut link.text, t, self.wipe);
                     true
                 }
                 Ok(ws_net::Event::Binary(b)) => {
                     link.partial_since = None;
                     link.scratch.clear();
-                    link.scratch.extend_from_slice(b);
+                    crate::engine::extend_wiping(&mut link.scratch, b, self.wipe);
                     false
                 }
                 Ok(ws_net::Event::Close(frame)) => {

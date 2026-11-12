@@ -447,6 +447,7 @@ where
         proxy,
         declared_scheme: scheme,
         unix: None,
+        sni_check: true,
         cap: crate::conn::session::Cap::new(None),
     };
     let shared = Shared {

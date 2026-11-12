@@ -6,7 +6,7 @@
 //! busy refusal is written by the session before anything is read (D-013).
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use net_io::{
@@ -14,7 +14,7 @@ use net_io::{
     TimeoutKind,
 };
 
-use super::{Conn, Io, Phase, Shared, Step, Timeout};
+use super::{Conn, Io, Phase, Shared, Step, Tables, Timeout};
 use crate::client::{ClientInfo, IngressKind, Scheme};
 use crate::config::{EngineChoice, ProxyKind};
 use crate::engine::{Family, Service};
@@ -22,6 +22,7 @@ use crate::error::EndReason;
 use crate::hooks::{Hooks, JobService, Observer};
 use crate::net::{ConnectionId, WorkerId};
 use crate::reply::{PostFail, Waker};
+use crate::snapshot::SnapshotReader;
 use crate::stats::Count;
 
 /// A worker's completion queue as the machine's waker.
@@ -323,7 +324,15 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::Session for ServeSess
 pub(crate) struct Factory<F: Family, S: Service<F>, H: Hooks> {
     pub(crate) shared: Arc<Shared<F, S, H>>,
     pub(crate) rt: Arc<Runtime>,
+    /// One cached view of the tables per worker: an accept reads one
+    /// atomic when nothing changed, instead of taking the snapshot's lock.
+    pub(crate) readers: Box<[TableReader]>,
 }
+
+/// A worker's view of the tables. Only that worker locks it, so the lock is
+/// never contended; padded so workers do not share a cache line.
+#[repr(align(64))]
+pub(crate) struct TableReader(pub(crate) crate::sync::Mutex<SnapshotReader<Tables>>);
 
 impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::SessionFactory for Factory<F, S, H> {
     type Session = ServeSession<F, S, H>;
@@ -341,7 +350,14 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::SessionFactory for Fa
 impl<F: Family, S: Service<F> + 'static, H: Hooks> Factory<F, S, H> {
     fn session(&self, info: &ConnectionInfo) -> Result<ServeSession<F, S, H>, RefusalCause> {
         let listener = info.listener.map_or(0, |l| usize::from(l.get()));
-        let tables = self.shared.tables.load();
+        let (tables, version) = match self.readers.get(usize::from(info.worker.get())) {
+            Some(reader) => {
+                let mut reader = reader.0.lock().unwrap_or_else(PoisonError::into_inner);
+                let (tables, version) = reader.current(&self.shared.tables);
+                (Arc::clone(tables), version)
+            }
+            None => (self.shared.tables.load(), self.shared.tables.version()),
+        };
         let Some(runtime) = tables.listeners.get(listener).and_then(Option::as_ref) else {
             return Err(RefusalCause::Session);
         };
@@ -407,8 +423,10 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> Factory<F, S, H> {
                 .observer
                 .capacity_refused(&runtime.name, runtime.profile);
         }
-        let mut conn = Conn::new(
+        let proxy_facts = proxy_protocol.is_some().then(|| info.proxy.clone());
+        let mut conn = Conn::with_tables(
             Arc::clone(&self.shared),
+            (tables, version),
             listener,
             info.id,
             client,
@@ -416,8 +434,11 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> Factory<F, S, H> {
             info.worker,
         );
         conn.set_gate_tag(info.gate);
-        if proxy_protocol.is_some() {
-            conn.set_proxy_facts(info.proxy.clone());
+        if let Some(tls) = &info.tls {
+            conn.set_tls(Some(Arc::clone(tls)));
+        }
+        if let Some(facts) = proxy_facts {
+            conn.set_proxy_facts(facts);
         }
         conn.offload_through(Arc::clone(&self.shared) as Arc<dyn JobService<F>>);
         Ok(ServeSession {

@@ -674,8 +674,12 @@ fn test_loopback_proxy_from_untrusted_peer_is_closed_unread() {
 /// A listening socket released by another server, as a supervisor would
 /// hand it over.
 fn released() -> (net_io::Server, SocketAddr, net_io::ListenerHandle) {
+    released_on("127.0.0.1:0")
+}
+
+fn released_on(bind: &str) -> (net_io::Server, SocketAddr, net_io::ListenerHandle) {
     let old = net_io::ServerBuilder::new()
-        .listener(net_io::ListenerSpec::tcp("127.0.0.1:0"))
+        .listener(net_io::ListenerSpec::tcp(bind))
         .handler(|_c: &mut net_io::TcpConnection| Ok(()))
         .gate(net_io::AllowAll)
         .build()
@@ -906,6 +910,19 @@ fn test_loopback_transport_limits_reach_net_io() {
     }
 }
 
+/// Waits until the server has taken `bytes` from its clients, so a manual
+/// clock moved afterwards moves past times the connection already holds: its
+/// accept time and its first bytes. Moving it earlier on a slow machine moves
+/// the accept itself into the future, and the deadline with it.
+#[cfg(not(target_os = "linux"))]
+fn wait_for_bytes_in(server: &serve_net::Running, bytes: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while server.stats().bytes_in < bytes && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(server.stats().bytes_in >= bytes, "{:?}", server.stats());
+}
+
 // A worker blocked in a read learns of a manual clock when woken, which needs
 // net-io's wait before each receive: Windows and macOS. Linux receives block
 // under SO_RCVTIMEO.
@@ -929,9 +946,9 @@ fn test_loopback_a_slow_body_is_answered_by_the_request_deadline() {
         }))
         .unwrap();
     let mut c = connect(server.local_addr().unwrap());
-    c.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(100));
+    let sent = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc";
+    c.write_all(sent).unwrap();
+    wait_for_bytes_in(&server, sent.len() as u64);
     // Longer than net-io's default read timeout, shorter than the deadline.
     clock.advance(Duration::from_secs(60));
     server.server_handle().wake_all();
@@ -1001,7 +1018,7 @@ fn test_loopback_manual_clock_drives_the_head_deadline() {
         .unwrap();
     let mut c = connect(server.local_addr().unwrap());
     c.write_all(b"GET / HT").unwrap();
-    std::thread::sleep(Duration::from_millis(100));
+    wait_for_bytes_in(&server, 8);
     // No real time passes; the clock says the deadline did.
     clock.advance(Duration::from_secs(6));
     // A worker blocked in a read learns of it when woken. A wake can land
@@ -1030,10 +1047,13 @@ fn test_loopback_timeouts_answer_on_real_sockets() {
     use serve_net::{Limits, ListenerSpec, Server};
     let server = Server::builder()
         .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        // Deadlines a loaded machine can meet: the head's runs from accept,
+        // and a worker that reaches the bytes only after it passed closes
+        // quietly instead of answering 408.
         .limits(
             Limits::new()
-                .head_timeout(Duration::from_millis(200))
-                .request_timeout(Duration::from_millis(400))
+                .head_timeout(Duration::from_secs(1))
+                .request_timeout(Duration::from_secs(2))
                 .min_rate(0, Duration::from_secs(10)),
         )
         .serve(serve_net::handler(|_r, reply| {
@@ -1043,12 +1063,16 @@ fn test_loopback_timeouts_answer_on_real_sockets() {
     let addr = server.local_addr().unwrap();
     // A head that never finishes.
     let mut head = connect(addr);
+    head.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
     head.write_all(b"GET / HT").unwrap();
     let mut got = String::new();
     let _ = head.read_to_string(&mut got);
     assert!(got.starts_with("HTTP/1.1 408"), "head: {got}");
     // A body that never finishes.
     let mut body = connect(addr);
+    body.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
     body.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
         .unwrap();
     let mut got = String::new();
@@ -1266,5 +1290,39 @@ fn test_t32_descriptor_exhaustion_does_not_spin_the_accept_loop() {
     }
     assert!(served, "nothing served after descriptors came free");
     drop(held);
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+/// A socket handed over by a supervisor on an unspecified address, for a
+/// listener that trusts a front end: refused at bind, once its address is
+/// known, as a bound one is at build. `allow_public_bind` lets it through.
+#[test]
+fn test_loopback_handed_off_public_socket_behind_a_proxy_is_refused() {
+    use serve_net::{Ingress, ListenerSpec, ProxySource, RuleId, Server, TrustedProxies};
+    let behind = || Ingress::Proxy(ProxySource::forwarded_for(TrustedProxies::loopback()));
+    let (old, _addr, handle) = released_on("0.0.0.0:0");
+    let _ = old.shutdown(std::time::Instant::now());
+    let err = Server::builder()
+        .listener(ListenerSpec::handed_off("web", handle).ingress(behind()))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "x");
+        }))
+        .unwrap_err();
+    assert!(
+        matches!(&err, serve_net::ServeError::Config(e) if e.has(RuleId::PublicBind)),
+        "{err}"
+    );
+    let (old, _addr, handle) = released_on("0.0.0.0:0");
+    let _ = old.shutdown(std::time::Instant::now());
+    let server = Server::builder()
+        .listener(
+            ListenerSpec::handed_off("web", handle)
+                .ingress(behind())
+                .allow_public_bind("a test of the override"),
+        )
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "x");
+        }))
+        .unwrap();
     let _ = server.drain(Duration::from_secs(2));
 }

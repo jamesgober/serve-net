@@ -89,6 +89,13 @@ impl<T: Send + Sync> SnapshotReader<T> {
         }
         &self.cached
     }
+
+    /// The value as a shared handle, with the version it was read at.
+    #[inline]
+    pub(crate) fn current(&mut self, source: &Snapshot<T>) -> (&Arc<T>, u64) {
+        let _ = self.get(source);
+        (&self.cached, self.version)
+    }
 }
 
 #[cfg(test)]
