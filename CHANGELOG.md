@@ -15,12 +15,12 @@
 
 ## [0.8.1] - 2026-11-12
 
-net-io 0.7.2, its security release (D-113).
+net-io 0.7.2, its security release.
 
 ### Security
 
-- net-io 0.7.2 (from 0.7.1) fixes two critical and three high defects found by
-  an independent review: on Windows, a crash or memory corruption when the gate
+- net-io 0.7.2 (from 0.7.1) fixes two critical and three high-severity bugs: on
+  Windows, a crash or memory corruption when the gate
   denied a write on a named-pipe connection, and a forged listener hand-off
   message; on the reactor with TLS, silent connections holding the shared
   buffer budget; Unix sockets bound in a directory other users can write to;
@@ -35,9 +35,9 @@ net-io 0.7.2, its security release (D-113).
 
 ## [0.8.0] - 2026-11-11
 
-The findings of an independent review of 0.7.1, each fixed with a test that
-fails without it, on top of the 0.8 work below. FastCGI, net-io 0.8, and the
-production-site exit move to 0.9.0 (D-112).
+Security fixes on the edges a client controls, and the 0.8 work below, each
+with a regression test. FastCGI, net-io 0.8, and the production-site exit
+move to 0.9.0.
 
 ### Security
 
