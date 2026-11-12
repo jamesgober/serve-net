@@ -94,6 +94,8 @@ pub(crate) struct WorkerCounters {
     progress: AtomicU64,
     /// Inside a service call.
     in_call: AtomicBool,
+    /// Requests parked for a deferred reply now (written by this worker only).
+    parked: AtomicU64,
 }
 
 #[inline]
@@ -182,6 +184,31 @@ impl Counters {
             }
         }
         s
+    }
+
+    /// Takes a parked-request place on `worker`; `false` when `cap` are taken.
+    /// Only the worker that owns a connection parks or unparks it, so a load
+    /// and a store suffice.
+    #[inline]
+    pub(crate) fn park(&self, worker: u16, cap: u32) -> bool {
+        let Some(w) = self.workers.get(usize::from(worker)) else {
+            return true;
+        };
+        let now = w.parked.load(Ordering::Relaxed);
+        if now >= u64::from(cap) {
+            return false;
+        }
+        w.parked.store(now + 1, Ordering::Relaxed);
+        true
+    }
+
+    /// Gives back a place `park` took.
+    #[inline]
+    pub(crate) fn unpark(&self, worker: u16) {
+        if let Some(w) = self.workers.get(usize::from(worker)) {
+            let now = w.parked.load(Ordering::Relaxed);
+            w.parked.store(now.saturating_sub(1), Ordering::Relaxed);
+        }
     }
 
     /// Marks `worker` inside or outside a service call.

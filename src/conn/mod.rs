@@ -321,6 +321,8 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     reply: Reply<F>,
     out: OutBuf,
     out_sent: usize,
+    /// This connection holds one of its worker's parked-request places.
+    parked: bool,
     /// Bytes of the reply body sent from the reply data after `out`
     /// (`Family::reply_body`); `None` when nothing follows.
     tail: Option<usize>,
@@ -442,6 +444,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             },
             out_sent: 0,
             tail: None,
+            parked: false,
             seq: 0,
             accepted_at: now,
             clock_base: (now, unix),
@@ -674,6 +677,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 }
             }
         };
+        if taken.is_some() {
+            self.unpark();
+        }
         match taken {
             None => Step::Park { until },
             Some(Some((parts, close))) => {
@@ -1557,6 +1563,28 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                     .observer
                     .service_error(&self.env, "reply deferred but call did not return Deferred");
             }
+            let worker = self.env.worker.get();
+            let cap = self.limits().max_deferred_per_worker;
+            if !self.shared.counters.park(worker, cap) {
+                // Past the per-worker cap (T-26): the token can only expire,
+                // and the client gets the busy refusal (D-111).
+                self.cancel_deferred();
+                self.reply.link = None;
+                self.end = Some(EndReason::Shed);
+                let shed = Shed {
+                    retry_after: None,
+                    close: true,
+                };
+                self.shared.observer.request_shed(&self.env, &shed);
+                return self.refuse(
+                    io,
+                    RefusalKind::Busy,
+                    503,
+                    Some(Duration::from_secs(1)),
+                    RequestEnd::Shed,
+                );
+            }
+            self.parked = true;
             self.count(io, Count::Deferred);
             let until = io.now() + self.limits().reply_timeout;
             self.state = State::Parked {
@@ -1895,6 +1923,15 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     fn cancel_deferred(&mut self) {
         if let Some(slot) = &self.defer {
             *slot.lock() = SlotState::Idle;
+        }
+        self.unpark();
+    }
+
+    /// Gives back the worker's parked-request place, if this connection holds one.
+    fn unpark(&mut self) {
+        if self.parked {
+            self.parked = false;
+            self.shared.counters.unpark(self.env.worker.get());
         }
     }
 

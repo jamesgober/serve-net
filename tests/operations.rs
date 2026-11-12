@@ -525,3 +525,76 @@ fn test_offload_quick_service_stays_on_the_worker() {
     assert!(ask(server.local_addr().unwrap(), GET).ends_with("ok"));
     let _ = server.drain(Duration::from_secs(2));
 }
+
+/// T-26: `max_deferred_per_worker` caps the requests parked on a worker.
+/// It only sized net-io's completion queue: every deferral parked. Past the
+/// cap a deferral is answered with the busy refusal and its token can only
+/// expire; a place comes back when a parked reply leaves (D-111).
+#[test]
+fn test_t26_deferrals_past_the_per_worker_cap_are_refused() {
+    struct Defer(Arc<Mutex<Vec<serve_net::ReplyToken>>>);
+    impl HttpService for Defer {
+        fn call(&self, _req: &HttpRequest<'_>, _env: &Envelope, reply: &mut HttpReply) -> Outcome {
+            let mut token = reply.defer();
+            token.reply().text(200, "late");
+            self.0.lock().unwrap().push(token);
+            Outcome::Deferred
+        }
+    }
+    let tokens = Arc::new(Mutex::new(Vec::new()));
+    let server = Server::builder()
+        .listener(ListenerSpec::tcp("web", "127.0.0.1:0"))
+        .workers(serve_net::Workers::reactor(1))
+        .limits(serve_net::Limits::new().max_deferred_per_worker(2))
+        .serve(Defer(Arc::clone(&tokens)))
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let ask = || {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    };
+    let read_all = |mut s: TcpStream| {
+        let mut got = String::new();
+        let _ = s.read_to_string(&mut got);
+        got
+    };
+    let parked: Vec<TcpStream> = (0..2).map(|_| ask()).collect();
+    let wait = Instant::now();
+    while tokens.lock().unwrap().len() < 2 && wait.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // A third deferral on the same worker: refused at once.
+    let third = read_all(ask());
+    assert!(third.starts_with("HTTP/1.1 503"), "{third}");
+    let refused = tokens.lock().unwrap().pop().expect("the third token");
+    assert!(refused.is_cancelled());
+    assert!(matches!(
+        refused.complete(),
+        Err(serve_net::CompleteError::Expired(_))
+    ));
+    // The two parked replies complete; their places come back.
+    for t in tokens.lock().unwrap().drain(..) {
+        assert!(t.complete().is_ok());
+    }
+    for s in parked {
+        let got = read_all(s);
+        assert!(
+            got.starts_with("HTTP/1.1 200") && got.ends_with("late"),
+            "{got}"
+        );
+    }
+    let s = ask();
+    let wait = Instant::now();
+    while tokens.lock().unwrap().is_empty() && wait.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for t in tokens.lock().unwrap().drain(..) {
+        assert!(t.complete().is_ok());
+    }
+    let got = read_all(s);
+    assert!(got.starts_with("HTTP/1.1 200"), "{got}");
+    let _ = server.drain(Duration::from_secs(2));
+}

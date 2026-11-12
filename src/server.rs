@@ -761,6 +761,38 @@ where
                 }
             }
         }
+        // A socket passed in (systemd, a supervisor) has an address only now:
+        // one that trusts a front end on a public address is refused before
+        // the door opens, as a bound one is at build (D-111).
+        let exposed: Vec<ConfigError> = server
+            .listeners()
+            .iter()
+            .filter_map(|info| {
+                let spec = listeners.get(usize::from(info.id.get()))?;
+                let net_io::Endpoint::Ip(addr) = info.local else {
+                    return None;
+                };
+                let passed = matches!(
+                    spec.source,
+                    ListenerSource::Inherited { .. } | ListenerSource::HandedOff
+                );
+                (passed
+                    && matches!(spec.ingress, Ingress::Proxy(_))
+                    && spec.public_bind.is_none()
+                    && validate::is_public(addr.ip()))
+                .then(|| {
+                    ConfigError::new(
+                        RuleId::PublicBind,
+                        Subject::Listener(spec.name.clone()),
+                        validate::PUBLIC_BIND.0,
+                        validate::PUBLIC_BIND.1,
+                    )
+                })
+            })
+            .collect();
+        if let Some(errors) = ConfigErrors::from_vec(exposed) {
+            return Err(ServeError::Config(errors));
+        }
         let listeners = listeners
             .iter()
             .zip(net_limits)

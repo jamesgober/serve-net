@@ -674,8 +674,12 @@ fn test_loopback_proxy_from_untrusted_peer_is_closed_unread() {
 /// A listening socket released by another server, as a supervisor would
 /// hand it over.
 fn released() -> (net_io::Server, SocketAddr, net_io::ListenerHandle) {
+    released_on("127.0.0.1:0")
+}
+
+fn released_on(bind: &str) -> (net_io::Server, SocketAddr, net_io::ListenerHandle) {
     let old = net_io::ServerBuilder::new()
-        .listener(net_io::ListenerSpec::tcp("127.0.0.1:0"))
+        .listener(net_io::ListenerSpec::tcp(bind))
         .handler(|_c: &mut net_io::TcpConnection| Ok(()))
         .gate(net_io::AllowAll)
         .build()
@@ -1279,5 +1283,39 @@ fn test_t32_descriptor_exhaustion_does_not_spin_the_accept_loop() {
     }
     assert!(served, "nothing served after descriptors came free");
     drop(held);
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+/// A socket handed over by a supervisor on an unspecified address, for a
+/// listener that trusts a front end: refused at bind, once its address is
+/// known, as a bound one is at build. `allow_public_bind` lets it through.
+#[test]
+fn test_loopback_handed_off_public_socket_behind_a_proxy_is_refused() {
+    use serve_net::{Ingress, ListenerSpec, ProxySource, RuleId, Server, TrustedProxies};
+    let behind = || Ingress::Proxy(ProxySource::forwarded_for(TrustedProxies::loopback()));
+    let (old, _addr, handle) = released_on("0.0.0.0:0");
+    let _ = old.shutdown(std::time::Instant::now());
+    let err = Server::builder()
+        .listener(ListenerSpec::handed_off("web", handle).ingress(behind()))
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "x");
+        }))
+        .unwrap_err();
+    assert!(
+        matches!(&err, serve_net::ServeError::Config(e) if e.has(RuleId::PublicBind)),
+        "{err}"
+    );
+    let (old, _addr, handle) = released_on("0.0.0.0:0");
+    let _ = old.shutdown(std::time::Instant::now());
+    let server = Server::builder()
+        .listener(
+            ListenerSpec::handed_off("web", handle)
+                .ingress(behind())
+                .allow_public_bind("a test of the override"),
+        )
+        .serve(serve_net::handler(|_req, reply| {
+            reply.text(200, "x");
+        }))
+        .unwrap();
     let _ = server.drain(Duration::from_secs(2));
 }
