@@ -53,6 +53,7 @@ move to 0.9.0.
   open a socket with the visitor's cookies (cross-site WebSocket hijacking).
   Upgrades are now same-origin by default (`WebSocketTarget::origins`, below).
   Affects 0.6.0 to 0.7.1 with feature `ws`. Advisory: [GHSA-cjcj-vccf-cxfj](https://github.com/jamesgober/serve-net/security/advisories/GHSA-cjcj-vccf-cxfj).
+  0.4.0 to 0.7.1 are yanked from crates.io.
 - A panic in `done` (or the observer) kept the request's admission for the
   life of the server, so a few such requests made every later one a 503.
   Admission is now released on every path, a panic included.
