@@ -128,17 +128,22 @@ mod restart {
         REFUSALS.lock().map(|r| r.clone()).unwrap_or_default()
     }
 
-    /// A connect that timed out. With four clients each holding at most one
-    /// connection the backlog cannot fill, so an unanswered handshake is the
-    /// host's, not the server's: Windows loopback drops a connect whose port
-    /// pair is still in TIME_WAIT from an earlier request (net-io R-44). Not
-    /// counted as a loss; a refusal or a reset still is.
-    const HOST_TIMEOUT: &str = "connect timed out";
+    /// A connect the client's own host failed. With four clients each holding
+    /// at most one connection the backlog cannot fill, so an unanswered
+    /// handshake is the host's, not the server's: Windows loopback drops a
+    /// connect whose port pair is still in TIME_WAIT from an earlier request
+    /// (net-io R-44). WSAENOBUFS (10055) on connect is the client's host out of
+    /// socket resources after thousands of short connections; CI saw it once.
+    /// Neither is counted as a loss; a refusal or a reset still is.
+    const HOST_TIMEOUT: &str = "connect failed on the client's host";
+
+    /// Windows' WSAENOBUFS.
+    const WSAENOBUFS: i32 = 10055;
 
     /// One request on a new connection; a whole 200, or what went wrong.
     fn one_request(addr: SocketAddr) -> Result<(), String> {
         let mut s = TcpStream::connect(addr).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::TimedOut {
+            if e.kind() == std::io::ErrorKind::TimedOut || e.raw_os_error() == Some(WSAENOBUFS) {
                 format!("{HOST_TIMEOUT}: {e}")
             } else {
                 format!("connect: {e}")
