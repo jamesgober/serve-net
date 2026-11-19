@@ -55,6 +55,37 @@ fn served(addr: SocketAddr) -> bool {
     matches!(c.read(&mut [0u8; 64]), Ok(n) if n > 0)
 }
 
+/// The server closing the connection, as the client sees it: macOS can
+/// report a close at accept as a reset to `connect` itself, and any system
+/// can report it to a write or a read.
+fn closed(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
+    matches!(e.kind(), ConnectionReset | BrokenPipe | ConnectionAborted)
+}
+
+/// Sends `request` on a new connection: `true` when any reply comes back,
+/// `false` when the server closed the connection without one. Anything else
+/// (a timeout, another error) fails the test.
+fn answered(addr: SocketAddr, request: &[u8]) -> bool {
+    let mut c = match TcpStream::connect(addr) {
+        Ok(c) => c,
+        Err(e) if closed(&e) => return false,
+        Err(e) => panic!("connect: {e}"),
+    };
+    // A socket the server already reset can refuse the option (macOS).
+    let _ = c.set_read_timeout(Some(Duration::from_secs(5)));
+    match c.write_all(request) {
+        Ok(()) => {}
+        Err(e) if closed(&e) => return false,
+        Err(e) => panic!("write: {e}"),
+    }
+    match c.read(&mut [0u8; 64]) {
+        Ok(n) => n > 0,
+        Err(e) if closed(&e) => false,
+        Err(e) => panic!("read: {e}"),
+    }
+}
+
 fn connect(addr: SocketAddr) -> TcpStream {
     let s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -668,12 +699,10 @@ fn test_loopback_proxy_from_untrusted_peer_is_closed_unread() {
         serve_net::TrustedProxies::parse("10.0.0.0/8").unwrap(),
     );
     let addr = server.local_addr().unwrap();
-    let mut c = connect(addr);
-    let _ = c.write_all(
+    let served = answered(
+        addr,
         b"PROXY TCP4 203.0.113.7 127.0.0.1 51000 80\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n",
     );
-    let mut buf = [0u8; 64];
-    let served = matches!(c.read(&mut buf), Ok(n) if n > 0);
     assert!(!served, "a connection from an untrusted proxy was served");
     let stats = server.stats();
     assert_eq!(stats.requests, 0, "{stats:?}");
