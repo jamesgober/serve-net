@@ -13,6 +13,18 @@
 
 ---
 
+## [0.8.2] - 2026-11-18
+
+### Added
+
+- A reply can be read back: `reply.parts()` gives `status()`, `header()`,
+  `header_all()`, `headers()`, `body()`, `is_streamed()`, `closes()`, and
+  `retry_after()`, as the service set them. Useful for caching whole pages
+  and in tests. The fields serve-net adds on the wire (`content-length`,
+  `date`, `retry-after`, `connection`) are not among them.
+
+---
+
 ## [0.8.1] - 2026-11-12
 
 net-io 0.7.2, its security release.
@@ -551,7 +563,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/jamesgober/serve-net/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/jamesgober/serve-net/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/jamesgober/serve-net/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/jamesgober/serve-net/compare/v0.7.0...v0.7.1

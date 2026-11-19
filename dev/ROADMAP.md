@@ -160,7 +160,8 @@ Exit: every finding of the independent review of 0.7.1 fixed with a test that fa
 
 ## v0.8.x - Patches
 - [x] 0.8.1 (2026-11-12): net-io 0.7.2, its security release (D-113). No serve-net 0.7.x patch for net-io 0.6.3: serve-net 0.7's `net-io = "0.6.2"` already takes it with `cargo update`.
-- ws-net 0.10 when published (its own review found a frame-header reservation defect on 0.9).
+- [x] 0.8.2 (2026-11-18): read-only accessors on `HttpParts` so a reply can be read back (D-114).
+- ws-net 0.10 when published (it fixes a frame-header reservation bug in 0.9).
 
 ## v0.9.0 - Beta
 Exit: a production site served for two weeks without a serve-net defect; no API change needed by the first real wrapper that is not already made; no API change across two beta releases; every document complete.

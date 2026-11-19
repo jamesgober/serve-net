@@ -1474,10 +1474,24 @@ impl ReplyStream<'_> {
     pub fn send(&mut self, bytes: &[u8]) -> &mut Self;   // copied; leaves when call returns
     pub fn sent(&self) -> u64;                           // bytes in earlier parts
 }
-// From the generic Reply<F> (all families): defer(&mut self) -> ReplyToken<F>, see ReplyToken.
+// From the generic Reply<F> (all families): defer(&mut self) -> ReplyToken<F>, see ReplyToken;
+// parts(&self) -> &HttpParts, to read the reply back.
+
+impl HttpParts {                                         // 0.8.2: read back what the service set
+    pub fn status(&self) -> u16;                         // 200 until set
+    pub fn header(&self, name: &str) -> Option<&[u8]>;   // first match, any letter case
+    pub fn header_all<'s, 'n>(&'s self, name: &'n str) -> impl Iterator<Item = &'s [u8]>;
+    pub fn headers(&self) -> Fields<'_>;                 // (name, value) in the order set
+    pub fn body(&self) -> &[u8];                         // the static body itself, or the copy
+    pub fn is_streamed(&self) -> bool;
+    pub fn closes(&self) -> bool;
+    pub fn retry_after(&self) -> Option<Duration>;
+}
 ```
 
 The reply a service writes. `HttpReply` is the HTTP family's form of the generic [`Reply`](#family-httpfamily), so deferral works the same for every family. Buffered: nothing reaches the network until `call` returns, so the connection gate's egress check and a `Checkpoint` denial see the whole reply before any byte leaves. `stream` is the exception, for bodies too large to hold or not yet known: the service calls it in every `call` of the reply and adds a part; `Outcome::More` asks to be called again once the client has taken that part, so a slow reader holds back the service and not memory, and `Outcome::Done` or `Close` ends the reply with the last part. The body is chunked (close-delimited to an HTTP/1.0 client); a `HEAD` request gets the head alone and one call. Status and fields go with the first part; each part passes `BeforeDispatch`, `BeforeReply`, and the connection gate. After the head no refusal can follow, so a panic, a denial, or an encoding error closes the connection abortively and the client sees a truncated body. A streamed reply cannot be deferred once its head has left. It stays on the worker: a service that streams its reply does not run under `Offload`, and `Outcome::More` from a job is answered with the 500 refusal. A reply the service did not touch is `200` with an empty body. Invalid field names or values (a CR or LF in a value, a non-token name, a framing field such as `content-length`) are recorded and turn the reply into the 500 refusal when it is written, never into a malformed response. `Date` is added unless set; no `Server` field is added. The buffer is reused across requests (no allocation in steady state) and wiped on return when the profile wipes.
+
+`reply.parts()` reads the reply back (0.8.2), for a cache that keeps whole pages or a test: the status, the fields set with `header`, `text`, and `html`, the body, and whether the reply streams, closes, or carries `Retry-After`. serve-net adds `content-length`, `date`, `retry-after`, and `connection` when it writes the reply, so they are not among the fields, and an invalid field still turns the reply into the 500 refusal then. Reading costs nothing: the accessors borrow the reply's own buffers.
 
 | Grade | Tier | Version | Cost |
 |---|---|---|---|
@@ -2582,7 +2596,7 @@ impl<F: Family> Reply<F> {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HttpFamily;   // feature http1: Head = HttpHead, Request = HttpRequest, Parts = HttpParts
 impl Family for HttpFamily;
-pub struct HttpParts { /* opaque: services use HttpReply's methods */ }
+pub struct HttpParts { /* services set it through HttpReply's methods and read it back with its own (0.8.2) */ }
 ```
 
 A family is a set of engines that produce the same request view; that is what makes "one request regardless of ingress" a type fact. The HTTP family (http1, FastCGI, h2) is built in. A custom family brings its own engine, head, request, and reply types; its listeners use the socket-level ingress modes (direct, PROXY, Unix), since forwarded headers and FastCGI parameters are HTTP's (`RuleId::IngressNeedsHttp`). A service fills a `Reply<F>`: the family's reply data plus the link serve-net needs to defer it. Replies are pooled per worker: `clear_parts` readies one for reuse. P0, Tier 3, `0.3.0`.
