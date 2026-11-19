@@ -92,13 +92,16 @@ pub(crate) struct Runtime {
     pub(crate) global: Arc<Cap>,
     /// One waker per worker, made on first use (no allocation per connection).
     wakers: Box<[OnceLock<Arc<dyn Waker>>]>,
+    /// The blocking driver runs the server (see [`ServeSession::rearm`]).
+    blocking: bool,
 }
 
 impl Runtime {
-    pub(crate) fn new(global: Option<u32>, workers: u16) -> Runtime {
+    pub(crate) fn new(global: Option<u32>, workers: u16, blocking: bool) -> Runtime {
         Runtime {
             global: Cap::new(global),
             wakers: (0..workers.max(1)).map(|_| OnceLock::new()).collect(),
+            blocking,
         }
     }
 }
@@ -187,7 +190,12 @@ impl Io for NetIo<'_, '_> {
         self.cx.worker()
     }
     fn waker(&self) -> Arc<dyn Waker> {
-        let made = || Arc::new(CompleterWaker(self.cx.completer())) as Arc<dyn Waker>;
+        // Taking the completer is also what tells net-io this connection
+        // waits for posts while it reads (the blocking driver on Linux only
+        // polls for them then), so it is taken for every connection that
+        // asks, even when the worker's waker was made already (D-115).
+        let completer = self.cx.completer();
+        let made = || Arc::new(CompleterWaker(completer)) as Arc<dyn Waker>;
         match self.rt.wakers.get(usize::from(self.cx.worker().get())) {
             Some(cell) => Arc::clone(cell.get_or_init(made)),
             None => made(),
@@ -227,7 +235,29 @@ pub(crate) struct ServeSession<F: Family, S: Service<F>, H: Hooks> {
     over_cap: bool,
     /// The step a flush forced by [`handed`] interrupted.
     resume: Option<Step>,
+    /// A park of no length after a write on an upgraded connection under
+    /// the blocking driver is out (D-115): its timeout goes on with
+    /// `on_writable`.
+    rearm: bool,
     _seat: Seat,
+}
+
+impl<F: Family, S: Service<F>, H: Hooks> ServeSession<F, S, H> {
+    /// The step after a write on an upgraded connection. Under the blocking
+    /// driver net-io 0.7 can lose a post while it waits for the socket to
+    /// take a write: the wait consumes the wake, the post stays queued, and
+    /// no later post wakes the worker until one is taken. A park of no
+    /// length takes it (and clears what holds the later ones back) before
+    /// the worker waits for input again, so a `WsSender` push never waits
+    /// for the next ping. A post it finds comes in as `on_wake`; none, as
+    /// the park's timeout, which goes on as this write's `on_writable` did.
+    fn rearm(&mut self, s: net_io::Step, now: Instant) -> net_io::Step {
+        if self.rt.blocking && s == net_io::Step::Read && self.conn.is_upgraded() {
+            self.rearm = true;
+            return net_io::Step::Park { until: Some(now) };
+        }
+        s
+    }
 }
 
 impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::Session for ServeSession<F, S, H> {
@@ -263,10 +293,13 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::Session for ServeSess
             rt: &self.rt,
         };
         let s = self.conn.on_writable(&mut io);
-        handed(s, cx, &mut self.resume)
+        let s = handed(s, cx, &mut self.resume);
+        let now = cx.now();
+        self.rearm(s, now)
     }
 
     fn on_wake(&mut self, cx: &mut SessionContext<'_>, token: u32, value: u64) -> net_io::Step {
+        self.rearm = false;
         let mut io = NetIo {
             cx: &mut *cx,
             rt: &self.rt,
@@ -276,6 +309,16 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> net_io::Session for ServeSess
     }
 
     fn on_timeout(&mut self, cx: &mut SessionContext<'_>, which: TimeoutKind) -> net_io::Step {
+        if core::mem::take(&mut self.rearm) && which == TimeoutKind::Park {
+            // The park after a write found no post: on as after the write,
+            // once (a read follows unless more output waits).
+            let mut io = NetIo {
+                cx: &mut *cx,
+                rt: &self.rt,
+            };
+            let s = self.conn.on_writable(&mut io);
+            return handed(s, cx, &mut self.resume);
+        }
         let which = match which {
             TimeoutKind::Exchange => Timeout::Exchange,
             TimeoutKind::Park => Timeout::Park,
@@ -447,6 +490,7 @@ impl<F: Family, S: Service<F> + 'static, H: Hooks> Factory<F, S, H> {
             worker: info.worker,
             over_cap,
             resume: None,
+            rearm: false,
             _seat: seat,
         })
     }

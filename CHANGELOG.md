@@ -13,6 +13,22 @@
 
 ---
 
+## [0.8.3] - 2026-11-19
+
+### Fixed
+
+- WebSocket messages queued through `WsSender` could wait for the next ping
+  before going out, most often while the client was sending too. Every send
+  returned `Ok`, so nothing reported the delay. On the blocking driver there
+  were two causes: a worker's completion queue could lose a wake when two
+  arrived close together, and a wake that came in while the worker waited
+  to write was used up without being seen. Both are fixed.
+- A WebSocket whose output budget filled part-way through the client's
+  input could leave the rest of that input unread until the client sent
+  more. It is now read as soon as the output drains, on both drivers.
+
+---
+
 ## [0.8.2] - 2026-11-18
 
 ### Added
@@ -563,7 +579,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/jamesgober/serve-net/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/jamesgober/serve-net/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/jamesgober/serve-net/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/jamesgober/serve-net/compare/v0.7.1...v0.8.0

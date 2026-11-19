@@ -615,16 +615,30 @@ where
             .iter()
             .map(|p| p.budget.dedicated.map(|n| Cap::new(Some(u32::from(n)))))
             .collect();
-        let rt = Arc::new(Runtime::new(Some(shared_seats(soft, &profiles)), threads));
+        let rt = Arc::new(Runtime::new(
+            Some(shared_seats(soft, &profiles)),
+            threads,
+            workers.resolved() == DriverKind::Blocking,
+        ));
 
         let mut global = transport
             .as_ref()
             .map_or_else(net_io::Limits::builder, net_io::Limits::to_builder)
             .drain_timeout(drain_deadline);
         let reactor = workers.resolved() == DriverKind::Reactor;
-        if reactor {
-            global = global.completion_queue(limits.max_deferred_per_worker);
-        }
+        // Every worker's completion queue holds at least MIN_COMPLETIONS
+        // posts: net-io 0.7's queue cannot hold one post safely in one slot
+        // (a second post before the first is taken overwrites it, and none
+        // is seen again), and its blocking default is one slot (D-115).
+        let completions = if reactor {
+            limits.max_deferred_per_worker
+        } else {
+            transport
+                .as_ref()
+                .and_then(net_io::Limits::completion_queue)
+                .unwrap_or(0)
+        };
+        global = global.completion_queue(completions.max(MIN_COMPLETIONS));
         // The hard cap is always serve-net's, so the soft cap sits under it
         // and the busy refusal is written before net-io refuses (D-108).
         global = global.max_connections(hard);
@@ -885,6 +899,12 @@ pub(crate) fn engine_family(
         })
         .collect()
 }
+
+/// The fewest posts a worker's completion queue holds (D-115). A blocking
+/// worker has one connection at a time, and it posts for a deferred reply,
+/// a `WsSender` push, and a drain: four covers those with one to spare, at
+/// 32 bytes a slot.
+const MIN_COMPLETIONS: u32 = 4;
 
 /// The soft connection cap, net-io's hard cap, and the pool size, under
 /// `descriptors` (the process's soft `RLIMIT_NOFILE`, `None` when unlimited
