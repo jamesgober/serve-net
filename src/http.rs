@@ -153,6 +153,12 @@ pub struct Fields<'a> {
 enum FieldSource<'a> {
     Head(Headers<'a>),
     Copy(&'a [u8], core::slice::Iter<'a, (Span, Span)>),
+    /// A reply's fields: names, values, and the spans into each.
+    Reply(
+        &'a [u8],
+        &'a [u8],
+        core::slice::Iter<'a, (u32, u32, u32, u32)>,
+    ),
 }
 
 impl<'a> Iterator for Fields<'a> {
@@ -165,12 +171,19 @@ impl<'a> Iterator for Fields<'a> {
                 let name = core::str::from_utf8(name.of(bytes)).unwrap_or("");
                 Some((name, value.of(bytes)))
             }
+            FieldSource::Reply(names, values, spans) => {
+                let &(ns, ne, vs, ve) = spans.next()?;
+                let name = names.get(ns as usize..ne as usize).unwrap_or(&[]);
+                let name = core::str::from_utf8(name).unwrap_or("");
+                Some((name, values.get(vs as usize..ve as usize).unwrap_or(&[])))
+            }
         }
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         match &self.inner {
             FieldSource::Head(h) => h.size_hint(),
             FieldSource::Copy(_, spans) => spans.size_hint(),
+            FieldSource::Reply(_, _, spans) => spans.size_hint(),
         }
     }
 }
@@ -510,7 +523,67 @@ pub struct HttpParts {
     send_body: bool,
 }
 
+/// Reading a reply back, through [`Reply::parts`](crate::Reply::parts): what
+/// the service set so far, for a cache or a test. The fields are the ones set
+/// with `header`, `text`, and `html`; serve-net adds `content-length`, `date`,
+/// `retry-after`, and `connection` when it writes the reply, and an invalid
+/// field still turns the reply into the 500 refusal then.
 impl HttpParts {
+    /// The status: 200 until the service sets one.
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        if self.status == 0 { 200 } else { self.status }
+    }
+
+    /// The first field with this name, compared without letter case.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&[u8]> {
+        self.header_all(name).next()
+    }
+
+    /// Every field with this name, in the order set.
+    pub fn header_all<'s, 'n>(
+        &'s self,
+        name: &'n str,
+    ) -> impl Iterator<Item = &'s [u8]> + use<'s, 'n> {
+        self.headers()
+            .filter(move |(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    }
+
+    /// Every field in the order set: `(name, value)`.
+    #[must_use]
+    pub fn headers(&self) -> Fields<'_> {
+        Fields {
+            inner: FieldSource::Reply(&self.names, &self.values, self.spans.iter()),
+        }
+    }
+
+    /// The body: the static one, or the bytes copied in. For a streamed
+    /// reply, the part not yet sent.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        self.body_static.unwrap_or(&self.body)
+    }
+
+    /// Whether the service opened a streamed reply ([`Reply::stream`](crate::Reply::stream)).
+    #[must_use]
+    pub fn is_streamed(&self) -> bool {
+        self.streaming
+    }
+
+    /// Whether the connection ends after this reply (`close`).
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.close
+    }
+
+    /// The `Retry-After` set, in whole seconds.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after.map(Duration::from_secs)
+    }
+
     /// Keeps the stream open and drops the part already encoded.
     fn next_part(&mut self, wipe: bool) {
         self.sent += self.body.len() as u64;
