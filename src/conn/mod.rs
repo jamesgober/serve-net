@@ -868,6 +868,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         self.body.clear();
     }
 
+    /// The connection switched protocols (a WebSocket, after its 101).
+    pub(crate) fn is_upgraded(&self) -> bool {
+        self.state == State::Upgraded
+    }
+
     fn current_step(&self) -> Step {
         match self.state {
             State::Parked { until, .. } => Step::Park { until },

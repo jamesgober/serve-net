@@ -147,6 +147,19 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         // Nothing is caught that the option would not catch: the unwind
         // resumes, and net-io closes the connection as before.
         let r = catch_unwind(AssertUnwindSafe(|| self.ws_drive(io, &mut link, input)));
+        let r = match r {
+            Ok((consumed, Step::Write)) if consumed < input.len() => {
+                // The output budget stopped the drive part-way. net-io hands
+                // input left in its buffer back only when more arrives, not
+                // after the write, so what is left waits in the backlog,
+                // which a drive takes first (D-115). At most one read buffer:
+                // input arrives only while the connection reads, and it reads
+                // again only once a drive emptied the backlog.
+                crate::engine::extend_wiping(&mut link.backlog, &input[consumed..], self.wipe);
+                Ok((input.len(), Step::Write))
+            }
+            other => other,
+        };
         self.ws = Some(link);
         match r {
             Ok(r) => r,
@@ -265,16 +278,27 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         if !self.ws_push(io, link) {
             return (0, Step::Write);
         }
-        let consumed = if link.finish {
-            input.len()
-        } else {
-            match self.ws_read(io, link, input) {
-                Some(n) => n,
-                None => return (input.len(), self.kill_upgraded()),
+        let mut consumed = 0;
+        loop {
+            let before = (consumed, link.backlog.len());
+            if link.finish {
+                consumed = input.len();
+            } else {
+                match self.ws_read(io, link, &input[consumed..]) {
+                    Some(n) => consumed += n,
+                    None => return (input.len(), self.kill_upgraded()),
+                }
             }
-        };
-        if !self.ws_push(io, link) {
-            return (consumed, Step::Write);
+            if !self.ws_push(io, link) {
+                return (consumed, Step::Write);
+            }
+            // The budget stopped the read and the transport took it all:
+            // read on, since nothing else calls back for what is left.
+            let left = !link.backlog.is_empty() || consumed < input.len();
+            let moved = (consumed, link.backlog.len()) != before;
+            if !left || !moved || link.finish || link.conn.state() != ws_net::State::Open {
+                break;
+            }
         }
         if link.finish || link.conn.state() == ws_net::State::Closed {
             self.state = State::Closed;
