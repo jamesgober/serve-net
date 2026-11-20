@@ -140,9 +140,27 @@ mod restart {
     /// Windows' WSAENOBUFS.
     const WSAENOBUFS: i32 = 10055;
 
+    /// How long a connect may take. A loopback connect completes in the
+    /// kernel even while no server accepts, so only a dropped handshake takes
+    /// this long. Windows retries a dropped one for about 21 s; two of those
+    /// in a row outlast the 30 s the kill tests wait for a request begun after
+    /// the kill, which is how `test_i9_kill_before_the_new_server_starts`
+    /// failed on CI with nothing served. Cut short, the next try takes a new
+    /// port pair.
+    const CONNECT_WAIT: Duration = Duration::from_secs(2);
+
+    /// The pause between one client's requests. Every request is a new
+    /// connection the server closes, and each leaves a TIME_WAIT pair for
+    /// 2 minutes on Windows. Unpaced, a test opened about 1,500 connections,
+    /// and a CI job runs the suite four times within minutes on one host:
+    /// later runs got server ports whose pairs with most client ports were
+    /// still in TIME_WAIT, so most connects collided. Paced, a test opens a
+    /// few hundred, still dozens in every step of a hand-off.
+    const PACE: Duration = Duration::from_millis(5);
+
     /// One request on a new connection; a whole 200, or what went wrong.
     fn one_request(addr: SocketAddr) -> Result<(), String> {
-        let mut s = TcpStream::connect(addr).map_err(|e| {
+        let mut s = TcpStream::connect_timeout(&addr, CONNECT_WAIT).map_err(|e| {
             if e.kind() == std::io::ErrorKind::TimedOut || e.raw_os_error() == Some(WSAENOBUFS) {
                 format!("{HOST_TIMEOUT}: {e}")
             } else {
@@ -225,6 +243,7 @@ mod restart {
                                 0
                             }
                         };
+                        std::thread::sleep(PACE);
                     }
                 })
             })
@@ -288,6 +307,7 @@ mod restart {
                         let begun = std::time::Instant::now();
                         let r = one_request(addr);
                         log.lock().unwrap().push((begun, r));
+                        std::thread::sleep(PACE);
                     }
                 })
             })
@@ -368,7 +388,15 @@ mod restart {
             .iter()
             .filter(|(begun, r)| *begun > killed_at && r.is_ok())
             .count();
-        assert!(served_after > 0, "{at:?}: nothing served after the kill");
+        let after: Vec<_> = log
+            .iter()
+            .filter(|(begun, _)| *begun > killed_at)
+            .map(|(begun, r)| (begun.duration_since(killed_at), r))
+            .collect();
+        assert!(
+            served_after > 0,
+            "{at:?}: nothing served after the kill; attempts after it (began after the kill, result): {after:?}"
+        );
         let _ = new.drain(Duration::from_secs(2));
     }
 
