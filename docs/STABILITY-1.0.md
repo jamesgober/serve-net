@@ -1,7 +1,7 @@
 # 1.0 readiness
 
 What must be true before any `1.0.0` release candidate, and what is known to stand in the way. The
-full audit (API, docs, tests, benchmarks, security) is recorded here at the v0.9.x polish exit
+full audit (API, docs, tests, benchmarks, security) is recorded here at the v0.10.x polish exit
 (`dev/ROADMAP.md`); until then this note lists the blockers as they become known.
 
 ## Blockers
@@ -13,4 +13,4 @@ full audit (API, docs, tests, benchmarks, security) is recorded here at the v0.9
 | The overload targets are not measured (P-6, P-7, NFR-6; P-12 on the blocking driver) | 0.6.0 (D-081) | the same hardware and load generator |
 
 Every other open item is in the pre-1.0 polish register in `dev/ROADMAP.md`, which this note absorbs at
-the v0.9.x exit.
+the v0.10.x exit.
