@@ -11,6 +11,15 @@
 
 ## [Unreleased]
 
+### Changed
+
+- http-net 0.10, re-exported as `serve_net::http_net`. Code that uses the
+  re-export directly follows http-net's migration guide: `Asked` is gone and
+  `parse_response_head` takes the request's `Method`; incoming trailers no
+  longer carry `content-length`, `transfer-encoding`, or `host`; `Debug`
+  redacts more credential fields. Nothing in serve-net's own API changed.
+  The next release is 0.9.0 because of the re-export.
+
 ---
 
 ## [0.8.4] - 2026-11-19

@@ -62,7 +62,7 @@ ws = ["http1", "dep:ws-net"]
 # First-party crates at published versions only (dev/PLAN.md section 3.2).
 # net-io: the transport (required).
 net-io = "0.7.2"
-http-net = { version = "0.9", default-features = false, optional = true }
+http-net = { version = "0.10", default-features = false, optional = true }
 ws-net = { version = "0.9", default-features = false, optional = true }
 
 
