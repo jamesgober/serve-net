@@ -1008,6 +1008,28 @@ impl Family for HttpFamily {
         }
     }
 
+    #[cfg(feature = "h2")]
+    fn h2_head<'a>(
+        &self,
+        raw: http_net::RequestHead<'a>,
+        cx: &HeadContext<'a>,
+    ) -> Option<Result<(HttpHead<'a>, ClientInfo), EngineError>> {
+        Some(self.head(raw, cx))
+    }
+
+    #[cfg(feature = "h2")]
+    fn h2_reply<'p>(&self, parts: &'p HttpParts) -> Option<crate::engine::H2Reply<'p>> {
+        Some(crate::engine::H2Reply {
+            status: parts.status(),
+            fields: parts.headers().collect(),
+            body: parts.body(),
+            streamed: parts.streaming,
+            close: parts.close,
+            retry_after: parts.retry_after,
+            invalid: parts.invalid,
+        })
+    }
+
     fn upgrade_allowed(
         &self,
         head: &HttpHead<'_>,

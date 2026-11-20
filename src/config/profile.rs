@@ -75,11 +75,18 @@ pub enum EngineChoice {
     #[default]
     Http1,
     /// The engine the TLS handshake's ALPN result names: HTTP/1.1 for
-    /// `http/1.1` or no ALPN. `h2` needs the HTTP/2 engine, which is not
-    /// built yet, so a connection that negotiated it is closed with
-    /// `EndReason::NoEngine`; offer only `http/1.1` on the acceptor until
-    /// then. Only on TLS listeners (`RuleId::AlpnWithoutTls`).
+    /// `http/1.1` or no ALPN, HTTP/2 for `h2` with the `h2` feature. Without
+    /// the feature a connection that negotiated `h2` is closed with
+    /// `EndReason::NoEngine`, so offer `h2` on the acceptor only in a build
+    /// with it. Only on TLS listeners (`RuleId::AlpnWithoutTls`).
     Http1OrH2ByAlpn,
+    /// HTTP/1.1, or HTTP/2 when a connection's first bytes are the HTTP/2
+    /// connection preface (cleartext HTTP/2 with prior knowledge, RFC 9113
+    /// section 3.3). Only on a listener whose ingress is a trusted proxy
+    /// (`RuleId::PriorKnowledgeWithoutProxy`): on an open port it would
+    /// let any client skip TLS. `Upgrade: h2c` is still never honoured.
+    #[cfg(feature = "h2")]
+    Http1OrH2ByPreface,
     /// A custom family given to `bind_family`; the ALPN ids it serves.
     Custom {
         /// The ALPN protocol ids offered on TLS listeners.
@@ -94,9 +101,12 @@ impl EngineChoice {
     pub(crate) fn admits(self, alpn: Option<&[u8]>) -> bool {
         match (self, alpn) {
             (_, None) => true,
+            (EngineChoice::Http1OrH2ByAlpn, Some(b"h2")) => cfg!(feature = "h2"),
             (EngineChoice::Http1 | EngineChoice::Http1OrH2ByAlpn, Some(p)) => {
                 p == b"http/1.1" || p == b"http/1.0"
             }
+            #[cfg(feature = "h2")]
+            (EngineChoice::Http1OrH2ByPreface, Some(p)) => p == b"http/1.1" || p == b"http/1.0",
             (EngineChoice::Custom { alpn: ids }, Some(p)) => {
                 ids.iter().any(|id| id.as_bytes() == p)
             }
@@ -313,8 +323,9 @@ mod tests {
             assert!(choice.admits(None));
             assert!(choice.admits(Some(b"http/1.1")));
             assert!(choice.admits(Some(b"http/1.0")));
-            // No HTTP/2 engine yet: h2 has nothing to run it.
-            assert!(!choice.admits(Some(b"h2")));
+            // h2 runs only under the by-ALPN choice, in a build with HTTP/2.
+            let h2 = choice == EngineChoice::Http1OrH2ByAlpn && cfg!(feature = "h2");
+            assert_eq!(choice.admits(Some(b"h2")), h2, "{choice:?}");
             assert!(!choice.admits(Some(b"acme-tls/1")));
             assert!(
                 !choice.admits(Some(b"HTTP/1.1")),

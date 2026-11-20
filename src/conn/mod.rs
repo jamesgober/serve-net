@@ -38,6 +38,7 @@ use crate::stats::{Count, Counters};
 use exchange::{Admission, Exchange, Gate, Start};
 
 mod exchange;
+mod h2;
 pub(crate) mod session;
 #[cfg(all(test, feature = "http1"))]
 mod tests;
@@ -269,6 +270,9 @@ enum State {
     Closing,
     /// The connection switched protocols (`HeadAction::Upgrade`).
     Upgraded,
+    /// HTTP/2: the streams are h2-net's and the exchanges' (D-120).
+    #[cfg_attr(not(feature = "h2"), allow(dead_code))]
+    Http2,
     /// Finished.
     Closed,
 }
@@ -361,6 +365,9 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     /// The WebSocket after a switch.
     #[cfg(feature = "ws")]
     ws: Option<Box<crate::ws::WsLink>>,
+    /// The HTTP/2 side, on a connection that negotiated `h2`.
+    #[cfg(feature = "h2")]
+    h2: Option<Box<h2::H2Link<F>>>,
 }
 
 impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
@@ -481,6 +488,8 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             upgrade: None,
             #[cfg(feature = "ws")]
             ws: None,
+            #[cfg(feature = "h2")]
+            h2: None,
         }
     }
 
@@ -586,6 +595,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         // run on a socket that never speaks (a browser's spare preconnect):
         // the deadline closes that one, not the rate (D-116). The phase
         // first: setting Idle clears the deadline.
+        if self.wants_h2() {
+            return self.h2_open(io);
+        }
         let head = self.limits().head_timeout;
         io.set_phase(Phase::Idle);
         io.set_exchange_deadline(Some(self.accepted_at + head));
@@ -619,7 +631,17 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 self.count(io, Count::BytesIn(n as u64));
                 return (n, step);
             }
+            State::Http2 => {
+                let (n, step) = self.h2_drive(io, input);
+                self.count(io, Count::BytesIn(n as u64));
+                return (n, step);
+            }
             State::AwaitHead | State::ReadBody => {}
+        }
+        if self.state == State::AwaitHead && self.seq == 0 {
+            if let Some(taken) = self.h2_sniff(io, input) {
+                return taken;
+            }
         }
         let (n, step) = self.process(io, input);
         self.count(io, Count::BytesIn(n as u64));
@@ -639,6 +661,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         if self.state == State::Upgraded {
             return self.upgraded_peer_closed(io);
         }
+        if self.state == State::Http2 {
+            return self.h2_peer_closed(io);
+        }
         self.engine.feed_eof();
         if matches!(
             self.state,
@@ -654,6 +679,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     pub(crate) fn on_writable<I: Io>(&mut self, io: &mut I) -> Step {
         if self.state == State::Upgraded {
             return self.upgraded_data(io, &[]).1;
+        }
+        if self.state == State::Http2 {
+            return self.h2_writable(io);
         }
         if self.state == State::Streaming && self.out_sent >= self.out.len() && !self.body_open {
             // The client took the last part: the service makes the next.
@@ -672,6 +700,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     pub(crate) fn on_wake<I: Io>(&mut self, io: &mut I, token: u32, value: u64) -> Step {
         if self.state == State::Upgraded {
             return self.upgraded_wake(io, token);
+        }
+        if self.state == State::Http2 {
+            return self.h2_wake(io, token, value);
         }
         let State::Parked { generation, until } = self.state else {
             return self.current_step();
@@ -765,6 +796,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 Step::Abort
             }
             (Timeout::Exchange, State::Upgraded) => self.upgraded_timer(io),
+            (which, State::Http2) => self.h2_timeout(io, which),
             (Timeout::Transport(reason), _) => {
                 self.end.get_or_insert(EndReason::Transport(reason));
                 Step::Close
@@ -786,6 +818,12 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             // closes it. Before then the upgrade request still waits for
             // its answer, and the refusal below replaces the 101.
             self.end = Some(EndReason::Denied);
+            self.state = State::Closed;
+            return &[];
+        }
+        if self.state == State::Http2 {
+            self.end = Some(EndReason::Denied);
+            self.h2_closed(false);
             self.state = State::Closed;
             return &[];
         }
@@ -845,6 +883,9 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             (true, None) => EndReason::Transport(reason),
             (false, None) => EndReason::Drained,
         };
+        if self.state == State::Http2 {
+            self.h2_closed(transport);
+        }
         self.state = State::Closed;
         self.upgraded_closed();
         self.shared

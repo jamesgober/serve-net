@@ -313,6 +313,22 @@ fn tls(l: &ListenerSpec, d: &Draft<'_>, f: &mut Findings) {
             "use Ingress::DirectTls, or a profile without ALPN ids",
         );
     }
+    #[cfg(feature = "h2")]
+    {
+        let preface = d
+            .profiles
+            .iter()
+            .find(|p| p.id == l.profile)
+            .is_some_and(|p| matches!(p.engine, crate::config::EngineChoice::Http1OrH2ByPreface));
+        if preface && l.ingress.proxy().is_none() {
+            f.error(
+                RuleId::PriorKnowledgeWithoutProxy,
+                Subject::Listener(l.name.clone()),
+                "the profile takes cleartext HTTP/2 on a listener that is not behind a trusted proxy",
+                "use Ingress::Proxy (or a Unix socket with a proxy source), or Http1OrH2ByAlpn with TLS",
+            );
+        }
+    }
 }
 
 /// The rules of Unix listeners: the ingress fits the socket, the mode is not

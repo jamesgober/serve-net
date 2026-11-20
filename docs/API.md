@@ -151,7 +151,7 @@ Every cost is a target on reference hardware. Numbers marked **[est.]** are esti
 | `http1` | on | the HTTP family over http-net: `HttpService`, `HttpRequest`, `HttpReply`, `engine::Http1`, the Tier 1 functions `http` and `http_behind_proxy`, `testing` | `0.3.0` |
 | `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.9.0` |
 | `ws` | off | WebSocket upgrades over ws-net: `UpgradeTarget::WebSocket`, `WebSocketTarget`, `WebSocketService`, `WebSocketConn`, `WsMessage`, `WsSendError`, the `ws_net` re-export (implies `http1`) | `0.6.0` |
-| `h2` | off | HTTP/2 over h2-net: `engine::H2`, ALPN `h2` | after `1.0.0`, or earlier as a minor version when h2-net reaches its 0.3 |
+| `h2` | off | HTTP/2 over h2-net: ALPN `h2` under `EngineChoice::Http1OrH2ByAlpn` | built on h2-net 0.3.1; ships in the next release |
 
 Features are additive. `--no-default-features` builds the server with custom families only and passes CI on its own. The crate has no third-party runtime dependency in any feature combination; its first-party dependencies are net-io (always), http-net, fcgi-net, ws-net, and h2-net (by feature), each at a published version.
 
@@ -1255,7 +1255,7 @@ pub enum EngineChoice {
 }
 ```
 
-The engine a profile's connections start with, chosen by the TLS handshake's ALPN result. The acceptor (tls-net, or any `net_io::TlsAcceptor`) decides what is offered; serve-net reads what was negotiated, after the handshake and before any byte reaches an engine. `Http1` and `Http1OrH2ByAlpn` run HTTP/1.1 for `http/1.1`, `http/1.0`, or no ALPN; `Custom` runs its family for no ALPN or one of its ids. An ALPN result with no compiled engine closes the connection (`EndReason::NoEngine`); until the HTTP/2 engine exists that includes `h2`, so offer only `http/1.1` on the acceptor. ALPN choices on a listener without TLS are refused (`RuleId::AlpnWithoutTls`). P0 (`Http1`, `Custom`) `0.3.0`, P1 (`Http1OrH2ByAlpn` `0.7.0`, `FastCgi` `0.9.0`), Tier 2.
+The engine a profile's connections start with, chosen by the TLS handshake's ALPN result. The acceptor (tls-net, or any `net_io::TlsAcceptor`) decides what is offered; serve-net reads what was negotiated, after the handshake and before any byte reaches an engine. `Http1` and `Http1OrH2ByAlpn` run HTTP/1.1 for `http/1.1`, `http/1.0`, or no ALPN; `Custom` runs its family for no ALPN or one of its ids. `Http1OrH2ByAlpn` runs HTTP/2 for `h2` in a build with the `h2` feature. `Http1OrH2ByPreface` (feature `h2`) serves cleartext HTTP/2 with prior knowledge: a connection whose first bytes are the HTTP/2 preface is HTTP/2, any other is HTTP/1.1; it is refused on a listener whose ingress is not a trusted proxy (`RuleId::PriorKnowledgeWithoutProxy`). An ALPN result with no compiled engine closes the connection (`EndReason::NoEngine`): `h2` under `Http1`, or in a build without the feature, so offer `h2` on the acceptor only where it runs. ALPN choices on a listener without TLS are refused (`RuleId::AlpnWithoutTls`). P0 (`Http1`, `Custom`) `0.3.0`, P1 (`Http1OrH2ByAlpn` `0.7.0`, `FastCgi` `0.9.0`), Tier 2.
 
 ---
 
@@ -2657,7 +2657,7 @@ The WebSocket side of a connection after an upgrade is ws-net's `Connection::ser
 
 ### `engine::H2`
 
-The HTTP/2 engine over h2-net: one connection, many streams; each stream becomes an `HttpRequest` with its own `Envelope` (`RequestSeq` is the stream id); flow control and settings limits from the profile. The engine trait, `Envelope`, and `ReplyToken` already allow several requests in flight per connection. P3, Tier 3, after `1.0.0`, or earlier as a minor version when h2-net reaches its 0.3. Feature `h2`.
+HTTP/2 over h2-net: one connection, many streams; each stream is an `HttpRequest` with its own `Envelope` (`RequestSeq` is the stream id) through the same `head`, admission, checkpoints, and service as an HTTP/1.1 request, and a deferred reply works per stream. h2-net runs the protocol and its budgets against HTTP/2 attacks; one that is crossed ends the connection as `EndReason::Abuse`. Settings come from the profile's limits. A refusal answers its own stream; the connection goes on. Cleartext HTTP/2 with prior knowledge behind a trusted proxy through `EngineChoice::Http1OrH2ByPreface`. Not yet: a streamed request body or a streamed reply over HTTP/2, and upgrades. P3, Tier 3, feature `h2`.
 
 ---
 
