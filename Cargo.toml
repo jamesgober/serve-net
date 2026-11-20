@@ -67,7 +67,7 @@ h2 = ["http1", "dep:h2-net"]
 net-io = "0.7.2"
 http-net = { version = "0.10", default-features = false, optional = true }
 ws-net = { version = "0.9", default-features = false, optional = true }
-h2-net = { version = "0.3", default-features = false, optional = true }
+h2-net = { version = "0.3.1", default-features = false, optional = true }
 
 
 # DEV DEPENDENCIES

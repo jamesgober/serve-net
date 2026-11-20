@@ -151,7 +151,7 @@ Every cost is a target on reference hardware. Numbers marked **[est.]** are esti
 | `http1` | on | the HTTP family over http-net: `HttpService`, `HttpRequest`, `HttpReply`, `engine::Http1`, the Tier 1 functions `http` and `http_behind_proxy`, `testing` | `0.3.0` |
 | `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.9.0` |
 | `ws` | off | WebSocket upgrades over ws-net: `UpgradeTarget::WebSocket`, `WebSocketTarget`, `WebSocketService`, `WebSocketConn`, `WsMessage`, `WsSendError`, the `ws_net` re-export (implies `http1`) | `0.6.0` |
-| `h2` | off | HTTP/2 over h2-net: ALPN `h2` under `EngineChoice::Http1OrH2ByAlpn` | the first version is built; it ships once h2-net is on crates.io |
+| `h2` | off | HTTP/2 over h2-net: ALPN `h2` under `EngineChoice::Http1OrH2ByAlpn` | built on h2-net 0.3.1; ships in the next release |
 
 Features are additive. `--no-default-features` builds the server with custom families only and passes CI on its own. The crate has no third-party runtime dependency in any feature combination; its first-party dependencies are net-io (always), http-net, fcgi-net, ws-net, and h2-net (by feature), each at a published version.
 

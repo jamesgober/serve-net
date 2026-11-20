@@ -179,7 +179,8 @@ h2-net reached 0.3, so HTTP/2 comes before 1.0 as a minor version.
 - [x] A request's state in an exchange record, one per request in flight (D-119).
 - [x] ALPN `h2` under `Http1OrH2ByAlpn`; each stream an `HttpRequest` through the same head, hooks, admission, checkpoints, and service; deferred replies per stream; refusals per stream; deadlines, drain, and stop; h2-net's abuse budgets end the connection as `EndReason::Abuse`.
 - [x] End-to-end tests over TLS on both drivers, rapid reset included.
-- [ ] Release: waits on h2-net's first publish on crates.io (serve-net takes dependencies at published versions only, never by path).
+- [x] On a published h2-net: 0.3.1, the first on crates.io (2026-11-20).
+- [ ] Release: with the next serve-net release.
 - [ ] A streamed request body and a streamed reply over HTTP/2.
 - [x] Prior-knowledge cleartext HTTP/2 behind a trusted proxy: `EngineChoice::Http1OrH2ByPreface`, refused elsewhere by validation (D-121).
 - [ ] Priority signals (RFC 9218) used by the order replies are written in.
