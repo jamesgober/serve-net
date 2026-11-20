@@ -177,9 +177,10 @@ impl TestReply {
 
     fn parse(bytes: &[u8], asked_head: bool) -> TestReply {
         let mut fields = [http_net::FieldSpan::default(); 128];
-        let asked = http_net::Asked {
-            head: asked_head,
-            connect: false,
+        let asked = if asked_head {
+            http_net::Method::Head
+        } else {
+            http_net::Method::Get
         };
         let mut at = 0;
         // Skip interim responses (100 Continue).
@@ -343,10 +344,7 @@ impl<S: HttpService> core::fmt::Debug for TestConnection<S> {
 /// The length of the first response in `bytes` (head plus content-length body).
 fn reply_len(bytes: &[u8]) -> usize {
     let mut fields = [http_net::FieldSpan::default(); 128];
-    let asked = http_net::Asked {
-        head: false,
-        connect: false,
-    };
+    let asked = http_net::Method::Get;
     let mut at = 0;
     loop {
         let Ok(http_net::Parsed::Complete { head, len }) = http_net::parse_response_head(
