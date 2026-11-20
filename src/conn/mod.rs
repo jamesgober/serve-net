@@ -592,9 +592,13 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             self.end = Some(EndReason::Drained);
             return Step::Abort;
         }
-        // The first request's head deadline runs from accept (idea I-1).
+        // The first request's head deadline runs from accept (idea I-1). The
+        // phase stays Idle until the first byte, so the inbound rate does not
+        // run on a socket that never speaks (a browser's spare preconnect):
+        // the deadline closes that one, not the rate (D-116). The phase
+        // first: setting Idle clears the deadline.
         let head = self.limits().head_timeout;
-        io.set_phase(Phase::Receiving);
+        io.set_phase(Phase::Idle);
         io.set_exchange_deadline(Some(self.accepted_at + head));
         Step::Read
     }
@@ -1023,13 +1027,14 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                     self.head_reads = self.head_reads.saturating_add(1);
                 }
                 if fed > 0 && self.state == State::AwaitHead && self.first_byte.is_none() {
-                    // The first byte of a head: its deadline starts now
-                    // (the first request's started at accept).
+                    // The first byte of a head starts the exchange and the
+                    // inbound rate. Its deadline starts now, except the first
+                    // request's, which runs from accept.
                     let now = io.now();
                     self.first_byte = Some(now);
                     self.trim_armed = false;
+                    io.set_phase(Phase::Receiving);
                     if self.seq > 0 {
-                        io.set_phase(Phase::Receiving);
                         io.set_exchange_deadline(Some(now + self.limits().head_timeout));
                     }
                 }
