@@ -453,7 +453,8 @@ pub enum EndReason {
     Denied,
     /// `Checkpoint` killed the connection.
     CheckpointKill,
-    /// The service returned `Outcome::Close`.
+    /// The service returned `Outcome::Close`, or closed a WebSocket through
+    /// `WsSender::close`.
     ServiceClosed,
     /// The service panicked.
     ServicePanic,

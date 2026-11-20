@@ -98,6 +98,9 @@ pub struct WebSocketConn<'a> {
 /// order, after anything the service sent from its own calls. A full queue
 /// refuses with [`WsSendError::Full`]; a connection that closed refuses with
 /// [`WsSendError::Closed`]. Each message is copied once into the queue.
+///
+/// [`close`](Self::close) ends the connection from any thread with the close
+/// handshake, as a revocation does.
 #[derive(Clone)]
 pub struct WsSender {
     outbox: Arc<Outbox>,
@@ -123,10 +126,42 @@ impl WsSender {
         self.outbox.push(Queued::Binary(bytes.to_vec()))
     }
 
-    /// Whether the connection closed: every send is refused from then on.
+    /// Closes the connection with the close handshake, from any thread.
+    ///
+    /// The Close frame (`code`, `reason`) is queued after the messages
+    /// already queued, and every send is refused with
+    /// [`WsSendError::Closed`] from now on. The worker sends what was queued
+    /// first, then the Close, and ends the connection when the client
+    /// answers, or 5 s after the Close went out. A client that does not
+    /// read, so the messages ahead of the Close never leave, is closed 5 s
+    /// after the worker took the request, without the handshake. The service
+    /// hears [`closed`](WebSocketService::closed) with `code` once the
+    /// connection ends, and the connection ends as
+    /// `EndReason::ServiceClosed` unless the client closed first.
+    ///
+    /// Calling it again, or after the connection closed or began closing
+    /// from either side, changes nothing and returns `Ok`: the first close
+    /// wins.
+    ///
+    /// # Errors
+    ///
+    /// [`WsSendError::Invalid`] for a code that may not be sent (1000 to
+    /// 1003, 1007 to 1014, and 3000 to 4999 may) or a reason over 123 bytes;
+    /// nothing is queued then.
+    pub fn close(&self, code: u16, reason: &str) -> Result<(), WsSendError> {
+        if !ws_net::CloseCode::new(code).is_sendable() || reason.len() > MAX_CLOSE_REASON {
+            return Err(WsSendError::Invalid);
+        }
+        self.outbox.request_close(code, reason);
+        Ok(())
+    }
+
+    /// Whether the connection closed, or a [`close`](Self::close) was asked
+    /// for: every send is refused from then on.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.outbox.lock().closed
+        let state = self.outbox.lock();
+        state.closed || state.closing
     }
 }
 
@@ -136,6 +171,7 @@ impl fmt::Debug for WsSender {
         f.debug_struct("WsSender")
             .field("queued", &state.items.len())
             .field("closed", &state.closed)
+            .field("closing", &state.closing)
             .finish()
     }
 }
@@ -155,10 +191,19 @@ impl Queued {
     }
 }
 
+/// The longest reason a Close frame carries: 125 bytes of payload less the
+/// code.
+const MAX_CLOSE_REASON: usize = 123;
+
 pub(crate) struct OutboxState {
     pub(crate) items: std::collections::VecDeque<Queued>,
     pub(crate) bytes: usize,
+    /// The connection ended.
     pub(crate) closed: bool,
+    /// A `WsSender` asked for a close: sends are refused from then on.
+    pub(crate) closing: bool,
+    /// That close, until the worker takes it: the code and the reason.
+    pub(crate) close: Option<(u16, String)>,
 }
 
 /// The queue between `WsSender`s and the connection's worker.
@@ -180,6 +225,8 @@ impl Outbox {
                 items: std::collections::VecDeque::new(),
                 bytes: 0,
                 closed: false,
+                closing: false,
+                close: None,
             }),
             waker,
             connection,
@@ -202,7 +249,7 @@ impl Outbox {
     fn push(&self, message: Queued) -> Result<(), WsSendError> {
         let len = message.len();
         let mut state = self.lock();
-        if state.closed {
+        if state.closed || state.closing {
             return Err(WsSendError::Closed);
         }
         if state.bytes.saturating_add(len) > self.max_bytes {
@@ -217,6 +264,19 @@ impl Outbox {
             let _ = self.waker.post(self.connection, crate::reply::WAKE_PUSH, 0);
         }
         Ok(())
+    }
+
+    /// Queues a close after what is queued, once: a repeat, or a close
+    /// after the connection ended, does nothing.
+    pub(crate) fn request_close(&self, code: u16, reason: &str) {
+        let mut state = self.lock();
+        if state.closed || state.closing {
+            return;
+        }
+        state.closing = true;
+        state.close = Some((code, reason.to_owned()));
+        drop(state);
+        let _ = self.waker.post(self.connection, crate::reply::WAKE_PUSH, 0);
     }
 
     /// The connection closed: refuse from now on and drop what waits,
@@ -238,6 +298,7 @@ impl Outbox {
         }
         state.items.clear();
         state.bytes = 0;
+        state.close = None;
     }
 }
 
@@ -471,6 +532,9 @@ pub(crate) struct WsLink {
     pub(crate) opened: bool,
     /// The connection ends once the output is flushed.
     pub(crate) finish: bool,
+    /// A `WsSender` close waits behind queued messages; past this time the
+    /// connection ends without the handshake.
+    pub(crate) close_due: Option<Instant>,
 }
 
 impl WsLink {
@@ -498,14 +562,16 @@ impl WsLink {
             code: None,
             opened: false,
             finish: false,
+            close_due: None,
         }
     }
 }
 
 impl WsLink {
-    /// The next deadline: `base`, or the end of the current message's time
-    /// if that comes first.
+    /// The next deadline: `base`, the end of the current message's time, or
+    /// the end of a `WsSender` close's wait, whichever comes first.
     pub(crate) fn deadline(&self, base: Instant) -> Instant {
+        let base = self.close_due.map_or(base, |due| base.min(due));
         self.partial_since
             .map_or(base, |since| base.min(since + self.message_timeout))
     }

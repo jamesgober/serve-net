@@ -40,6 +40,17 @@ const CLOSE_WAIT: Duration = Duration::from_secs(5);
 #[cfg(feature = "ws")]
 const MESSAGE_RETAIN: usize = 64 * 1024;
 
+/// What the worker does about a close a `WsSender` asked for.
+#[cfg(feature = "ws")]
+enum SenderClose {
+    /// None asked for, or the connection is closing already.
+    None,
+    /// Messages queued before it still wait for room.
+    Waiting,
+    /// Everything ahead of it went to ws-net: send it now.
+    Now(u16, String),
+}
+
 /// What a message's checks decided.
 #[cfg(feature = "ws")]
 enum Gate {
@@ -195,6 +206,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let step = if link.finish || link.conn.state() != ws_net::State::Open {
             self.end.get_or_insert(EndReason::ClientClose);
             Step::Close
+        } else if link.close_due.is_some_and(|due| now >= due) {
+            // A `WsSender` close waited behind messages the client never
+            // read: no handshake to wait for.
+            self.end = Some(EndReason::ServiceClosed);
+            Step::Close
         } else if slow {
             // A message trickled past its time: 1008, then the close wait.
             self.ws_close(
@@ -223,7 +239,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         } else {
             let _ = link.conn.send_ping(&[]);
             link.ping_at = Some(now);
-            link.timer = now + link.interval;
+            link.timer = link.deadline(now + link.interval);
             if self.ws_push(io, &mut link) {
                 Self::ws_idle(io, &link);
                 Step::Read
@@ -274,7 +290,25 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             self.finish_request(RequestEnd::Upgraded);
             self.ws_open(io, link);
         }
-        Self::ws_take_outbox(link);
+        match Self::ws_take_outbox(link) {
+            SenderClose::None => {}
+            SenderClose::Waiting => {
+                // The close waits behind messages; it is bounded all the same.
+                if link.close_due.is_none() {
+                    let due = io.now() + CLOSE_WAIT;
+                    link.close_due = Some(due);
+                    link.timer = link.timer.min(due);
+                    io.set_exchange_deadline(Some(link.timer));
+                }
+            }
+            SenderClose::Now(code, reason) => {
+                self.ws_close(link, ws_net::CloseCode::new(code), &reason);
+                self.end.get_or_insert(EndReason::ServiceClosed);
+                link.close_due = None;
+                link.timer = io.now() + CLOSE_WAIT;
+                io.set_exchange_deadline(Some(link.timer));
+            }
+        }
         if !self.ws_push(io, link) {
             return (0, Step::Write);
         }
@@ -310,11 +344,14 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
 
     /// Moves what `WsSender`s queued into ws-net, in order, while the output
     /// budget has room; the rest waits for the next drive (a write finished).
-    fn ws_take_outbox(link: &mut WsLink) {
-        if link.conn.state() != ws_net::State::Open {
-            return;
-        }
+    /// A close asked for comes last, once everything ahead of it moved.
+    fn ws_take_outbox(link: &mut WsLink) -> SenderClose {
         let mut state = link.outbox.lock();
+        if link.conn.state() != ws_net::State::Open {
+            // Closing from either side already: that handshake stands.
+            state.close = None;
+            return SenderClose::None;
+        }
         while let Some(next) = state.items.front() {
             if link.conn.output().len().saturating_add(next.len()) > link.max_pending {
                 break;
@@ -327,6 +364,18 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 crate::ws::Queued::Text(t) => link.conn.send_text(t),
                 crate::ws::Queued::Binary(b) => link.conn.send_binary(b),
             };
+        }
+        if state.close.is_none() {
+            SenderClose::None
+        } else if !state.items.is_empty() {
+            SenderClose::Waiting
+        } else {
+            state
+                .close
+                .take()
+                .map_or(SenderClose::None, |(code, reason)| {
+                    SenderClose::Now(code, reason)
+                })
         }
     }
 

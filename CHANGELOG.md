@@ -11,6 +11,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- `WsSender::close(code, reason)` closes a WebSocket from any thread with
+  the close handshake: the Close goes out after the messages already
+  queued, the client's answer ends the connection, and a client that does
+  not answer, or does not read, is closed after 5 s. Calling it again, or
+  after the connection closed, does nothing.
+
 ### Changed
 
 - http-net 0.10, re-exported as `serve_net::http_net`. Code that uses the
