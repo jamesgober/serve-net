@@ -172,6 +172,20 @@ Exit: a production site served for two weeks without a serve-net defect; no API 
 - Moved from 0.8 (D-112): adopt net-io 0.8: the drain grace for a connection that has not sent its first byte (its D-189, `Limits::first_request_grace`), `Session::on_drain`, `ListenerSpec::workers`, and the linger after a reply sent while idle (its D-192), which makes D-102's `set_phase(Sending)` redundant; keep it (harmless) unless the tests show a reason. Rerun `tests/restart.rs`, the soft-cap loopback test, and the 24 h soak on it (D-108).
 - API freeze candidate; one non-HTTP service end to end; the Windows service status adapter (outside serve-net) exercised.
 
+## HTTP/2 (feature `h2`, D-120)
+
+h2-net reached 0.3, so HTTP/2 comes before 1.0 as a minor version.
+
+- [x] A request's state in an exchange record, one per request in flight (D-119).
+- [x] ALPN `h2` under `Http1OrH2ByAlpn`; each stream an `HttpRequest` through the same head, hooks, admission, checkpoints, and service; deferred replies per stream; refusals per stream; deadlines, drain, and stop; h2-net's abuse budgets end the connection as `EndReason::Abuse`.
+- [x] End-to-end tests over TLS on both drivers, rapid reset included.
+- [x] On a published h2-net: 0.3.1, the first on crates.io (2026-11-20).
+- [ ] Release: with the next serve-net release.
+- [ ] A streamed request body and a streamed reply over HTTP/2.
+- [x] Prior-knowledge cleartext HTTP/2 behind a trusted proxy: `EngineChoice::Http1OrH2ByPreface`, refused elsewhere by validation (D-121).
+- [ ] Priority signals (RFC 9218) used by the order replies are written in.
+- [ ] WebSocket over HTTP/2 (RFC 8441).
+
 ## v0.9.x - Pre-1.0 polish (before any 1.0 release candidate)
 James's standing rule (2026-10-29): "make sure to go back and fix any issues / perf tune / etc before we get close to release." Nothing accepted during the 0.x series becomes final silently: each item below is fixed, measured, or written into the 1.0 readiness note for James with the reason it stays.
 
@@ -239,7 +253,7 @@ Exit: every item in the register below is closed or carried into `docs/STABILITY
 - API frozen until 2.0; the full audit (API, docs, tests, benchmarks, security) recorded in `docs/STABILITY-1.0.md`; `dev/DIRECTIVES.md` definition of done item 10 satisfied. James decides the release.
 
 ## After 1.0
-`engine::H2` (earlier as a minor version if h2-net reaches its 0.3 first), multiplexed FastCGI, systemd `FDSTORE`, lane queues with weighted deficit round robin, mod_fcgid on Windows (named pipes), cleartext HTTP/2 with prior knowledge, `Workers::uring`.
+`engine::H2` beyond its first version (see the HTTP/2 section above), multiplexed FastCGI, systemd `FDSTORE`, lane queues with weighted deficit round robin, mod_fcgid on Windows (named pipes), cleartext HTTP/2 with prior knowledge, `Workers::uring`.
 
 ---
 

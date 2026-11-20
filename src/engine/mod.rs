@@ -501,6 +501,47 @@ pub trait Family: Send + Sync + 'static {
             status: 500,
         })
     }
+    /// The head view of an HTTP/2 request, which h2-net hands over as
+    /// http-net's request head. `None`: this family does not speak HTTP/2
+    /// (the default; only the HTTP family does).
+    #[cfg(feature = "h2")]
+    #[doc(hidden)]
+    fn h2_head<'a>(
+        &self,
+        raw: http_net::RequestHead<'a>,
+        cx: &HeadContext<'a>,
+    ) -> Option<Result<(Self::Head<'a>, ClientInfo), EngineError>> {
+        let _ = (raw, cx);
+        None
+    }
+    /// A reply as HTTP/2 writes it. `None` for a family without HTTP/2.
+    #[cfg(feature = "h2")]
+    #[doc(hidden)]
+    fn h2_reply<'p>(&self, parts: &'p Self::Parts) -> Option<H2Reply<'p>> {
+        let _ = parts;
+        None
+    }
+}
+
+/// A reply as HTTP/2 writes it: the status, the fields, and the body.
+#[cfg(feature = "h2")]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct H2Reply<'p> {
+    /// The status.
+    pub status: u16,
+    /// The fields, as the service set them.
+    pub fields: Vec<(&'p str, &'p [u8])>,
+    /// The whole body.
+    pub body: &'p [u8],
+    /// The service started a streamed reply.
+    pub streamed: bool,
+    /// The service asked for the connection to close after this reply.
+    pub close: bool,
+    /// `Retry-After`, in seconds.
+    pub retry_after: Option<u64>,
+    /// A field the service set was refused when it was set.
+    pub invalid: bool,
 }
 
 /// An owned copy of a family's request.
