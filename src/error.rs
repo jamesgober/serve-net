@@ -463,6 +463,10 @@ pub enum EndReason {
     NoEngine,
     /// The service refused the request in `head`.
     Refused,
+    /// The peer crossed one of the protocol's abuse budgets (HTTP/2: rapid
+    /// reset, a `CONTINUATION` or control frame flood, a peer that does not
+    /// read): what a connection gate counts against the address.
+    Abuse,
 }
 
 impl EndReason {
@@ -489,6 +493,7 @@ impl EndReason {
             EndReason::ReplyDropped => "reply_dropped",
             EndReason::NoEngine => "no_engine",
             EndReason::Refused => "refused",
+            EndReason::Abuse => "abuse",
         }
     }
 

@@ -197,11 +197,16 @@ fn test_alpn_http11_and_no_alpn_run_http1_under_by_alpn() {
     let _ = server.drain(Duration::from_secs(2));
 }
 
-/// No HTTP/2 engine is built yet: a connection that negotiated `h2` is
-/// closed with `NoEngine` before any byte reaches the HTTP/1 parser.
+/// A connection that negotiated `h2` where no HTTP/2 engine runs (a profile
+/// that picks HTTP/1.1, or a build without the `h2` feature) is closed with
+/// `NoEngine` before any byte reaches the HTTP/1 parser.
 #[test]
 fn test_alpn_h2_without_an_engine_is_closed_with_no_engine() {
-    for engine in [EngineChoice::Http1OrH2ByAlpn, EngineChoice::Http1] {
+    let mut engines = vec![EngineChoice::Http1];
+    if !cfg!(feature = "h2") {
+        engines.push(EngineChoice::Http1OrH2ByAlpn);
+    }
+    for engine in engines {
         let seen = NoEngine::default();
         let server = serve(&[Alpn::H2, Alpn::HTTP_1_1], engine, seen.clone());
         let addr = server.local_addr().unwrap();

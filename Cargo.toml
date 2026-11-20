@@ -54,6 +54,9 @@ http1 = ["dep:http-net"]
 # WebSocket upgrades over ws-net: UpgradeTarget::WebSocket, WebSocketService,
 # WebSocketTarget, WebSocketConn.
 ws = ["http1", "dep:ws-net"]
+# HTTP/2 over h2-net: ALPN `h2` under `EngineChoice::Http1OrH2ByAlpn`,
+# each stream an HttpRequest with its own Envelope.
+h2 = ["http1", "dep:h2-net"]
 
 
 # DEPENDENCIES
@@ -64,6 +67,7 @@ ws = ["http1", "dep:ws-net"]
 net-io = "0.7.2"
 http-net = { version = "0.10", default-features = false, optional = true }
 ws-net = { version = "0.9", default-features = false, optional = true }
+h2-net = { version = "0.3", default-features = false, optional = true }
 
 
 # DEV DEPENDENCIES

@@ -11,8 +11,22 @@
 
 ## [Unreleased]
 
+### Added
+
+- HTTP/2 over h2-net (feature `h2`): a TLS connection that negotiates `h2`
+  under `EngineChoice::Http1OrH2ByAlpn` is served as HTTP/2. Each stream is
+  an `HttpRequest` through the same `head`, admission, checkpoints, and
+  service as an HTTP/1.1 request, with its own `Envelope` (`RequestSeq` is
+  the stream id); deferred replies work per stream, and a refusal answers
+  its own stream. h2-net's budgets against HTTP/2 attacks (rapid reset,
+  `CONTINUATION` and control frame floods, a peer that does not read) end
+  the connection as the new `EndReason::Abuse`. A streamed request body or
+  reply over HTTP/2, and cleartext HTTP/2, come later.
+
 ### Changed
 
+- A request's state moved into an exchange record inside the connection.
+  No change in behaviour.
 - http-net 0.10, re-exported as `serve_net::http_net`. Code that uses the
   re-export directly follows http-net's migration guide: `Asked` is gone and
   `parse_response_head` takes the request's `Method`; incoming trailers no
