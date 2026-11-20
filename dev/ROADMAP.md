@@ -162,6 +162,7 @@ Exit: every finding of the independent review of 0.7.1 fixed with a test that fa
 - [x] 0.8.1 (2026-11-12): net-io 0.7.2, its security release (D-113). No serve-net 0.7.x patch for net-io 0.6.3: serve-net 0.7's `net-io = "0.6.2"` already takes it with `cargo update`.
 - [x] 0.8.2 (2026-11-18): read-only accessors on `HttpParts` so a reply can be read back (D-114).
 - [x] 0.8.3 (2026-11-19): `WsSender` pushes no longer wait for the next ping while the client sends; a WebSocket's input left by a full output budget is read once the output drains (D-115). `tests/ws_push.rs` covers ws and wss on both drivers.
+- [x] 0.8.4 (2026-11-19): a connection that never sends a byte closes on the head deadline, not as a slow peer; the inbound rate starts with the first byte (D-116). `tests/preconnect.rs` covers it.
 - ws-net 0.10 when published (it fixes a frame-header reservation bug in 0.9).
 
 ## v0.9.0 - Beta

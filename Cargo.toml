@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "serve-net"
-version = "0.8.3"
+version = "0.8.4"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"

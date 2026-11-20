@@ -13,6 +13,21 @@
 
 ---
 
+## [0.8.4] - 2026-11-19
+
+### Fixed
+
+- A connection that never sent a byte closed as a slow peer after 5 s,
+  because the inbound rate check ran from accept. Browsers open a spare
+  connection ahead of need and often never use it, so every page load could
+  look like a slow peer to a connection gate, and repeat visitors could be
+  banned. The rate check now starts with the first byte. A silent connection
+  closes on the head deadline (10 s from accept by default), which is not a
+  slow-peer close. A peer that sends a byte and then stalls is still closed
+  as a slow peer.
+
+---
+
 ## [0.8.3] - 2026-11-19
 
 ### Fixed

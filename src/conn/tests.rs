@@ -249,6 +249,20 @@ fn test_head_deadline_no_bytes_quiet_close() {
 }
 
 #[test]
+fn test_first_request_waits_idle_until_its_first_byte() {
+    let (mut c, mut io) = conn(Counting::default(), Profile::new(ProfileId(0)));
+    let accept = io.now;
+    assert_eq!(c.on_open(&mut io, false), Step::Read);
+    // No inbound rate before a byte, only the head deadline from accept.
+    assert_eq!(io.phase, Phase::Idle);
+    assert_eq!(io.deadline, Some(accept + Duration::from_secs(10)));
+    io.advance(Duration::from_secs(3));
+    let _ = c.on_data(&mut io, b"G");
+    assert_eq!(io.phase, Phase::Receiving);
+    assert_eq!(io.deadline, Some(accept + Duration::from_secs(10)));
+}
+
+#[test]
 fn test_later_request_head_deadline_from_first_byte() {
     let (mut c, mut io) = conn(Counting::default(), Profile::new(ProfileId(0)));
     c.on_open(&mut io, false);
