@@ -168,6 +168,40 @@ fn loom_drain_races_an_upgraded_connection_closing() {
 
 #[cfg(feature = "ws")]
 #[test]
+fn loom_sender_close_races_a_close_and_the_end() {
+    // Two `WsSender::close` calls race the connection ending: at most one
+    // close is ever queued, and none is left once the connection ended.
+    use crate::ws::Outbox;
+    loom::model(|| {
+        let outbox = Arc::new(Outbox::new(
+            Arc::new(Quiet),
+            ConnectionId::new(1).unwrap(),
+            1024,
+        ));
+        let first = {
+            let outbox = Arc::clone(&outbox);
+            thread::spawn(move || outbox.request_close(4001, "a"))
+        };
+        let second = {
+            let outbox = Arc::clone(&outbox);
+            thread::spawn(move || outbox.request_close(4002, "b"))
+        };
+        outbox.close(false);
+        first.join().unwrap();
+        second.join().unwrap();
+        let state = outbox.lock();
+        assert!(state.closed);
+        assert!(state.close.is_none(), "a close survived the end");
+        drop(state);
+        assert_eq!(
+            outbox.push_text_for_tests("late"),
+            Err(crate::ws::WsSendError::Closed)
+        );
+    });
+}
+
+#[cfg(feature = "ws")]
+#[test]
 fn loom_sender_races_the_connection_closing() {
     // A `WsSender` pushes while the connection closes: a push either lands
     // before the close (and is dropped with the queue) or is refused; nothing

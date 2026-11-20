@@ -13,6 +13,11 @@
 
 ### Added
 
+- `WsSender::close(code, reason)` closes a WebSocket from any thread with
+  the close handshake: the Close goes out after the messages already
+  queued, the client's answer ends the connection, and a client that does
+  not answer, or does not read, is closed after 5 s. Calling it again, or
+  after the connection closed, does nothing.
 - HTTP/2 over h2-net (feature `h2`): a TLS connection that negotiates `h2`
   under `EngineChoice::Http1OrH2ByAlpn` is served as HTTP/2. Each stream is
   an `HttpRequest` through the same `head`, admission, checkpoints, and
