@@ -11,6 +11,13 @@
 
 ## [Unreleased]
 
+---
+
+## [0.9.0] - 2026-11-20
+
+HTTP/2, and closing a WebSocket from any thread. A minor version because
+of http-net 0.10, which serve-net re-exports.
+
 ### Added
 
 - `WsSender::close(code, reason)` closes a WebSocket from any thread with
@@ -42,7 +49,6 @@
   `parse_response_head` takes the request's `Method`; incoming trailers no
   longer carry `content-length`, `transfer-encoding`, or `host`; `Debug`
   redacts more credential fields. Nothing in serve-net's own API changed.
-  The next release is 0.9.0 because of the re-export.
 
 ---
 
@@ -627,7 +633,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/jamesgober/serve-net/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/serve-net/compare/v0.8.4...v0.9.0
 [0.8.3]: https://github.com/jamesgober/serve-net/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/jamesgober/serve-net/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/jamesgober/serve-net/compare/v0.8.0...v0.8.1

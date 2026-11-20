@@ -165,7 +165,13 @@ Exit: every finding of the independent review of 0.7.1 fixed with a test that fa
 - [x] 0.8.4 (2026-11-19): a connection that never sends a byte closes on the head deadline, not as a slow peer; the inbound rate starts with the first byte (D-116). `tests/preconnect.rs` covers it.
 - ws-net 0.10 when published (it fixes a frame-header reservation bug in 0.9).
 
-## v0.9.0 - Beta
+## v0.9.0 - HTTP/2 (DONE, 2026-11-20)
+A minor version because http-net 0.10 changes what serve-net re-exports; the beta moves to 0.10.0 (D-123).
+- [x] HTTP/2 over h2-net 0.3.1 (feature `h2`): ALPN `h2`, and cleartext with prior knowledge behind a trusted proxy (D-120, D-121). The HTTP/2 section below has what is left.
+- [x] `WsSender::close`: a WebSocket closed from any thread with the close handshake (D-122).
+- [x] A request's state in an exchange record (D-119); http-net 0.10 (D-118).
+
+## v0.10.0 - Beta
 Exit: a production site served for two weeks without a serve-net defect; no API change needed by the first real wrapper that is not already made; no API change across two beta releases; every document complete.
 - Moved from 0.8 (D-112), with 0.8's reasons. When fcgi-net is published: FastCGI on Linux and macOS first (`fastcgi`, `FastCgiListen`, `FastCgiIngress`, `Ingress::FastCgi`, `engine::FastCgi`, `ListenerSpec::fastcgi_descriptor_zero`, T-19, the `fastcgi_mapping` fuzz target, the T-19 attack test, `mod_proxy_fcgi`, nginx `fastcgi_pass`, `mod_fcgid` descriptor 0). Windows waits for the decision on a Windows FastCGI deployment.
 - Moved from 0.8 (D-112): a real application wrapper built on serve-net's hooks.
@@ -180,13 +186,13 @@ h2-net reached 0.3, so HTTP/2 comes before 1.0 as a minor version.
 - [x] ALPN `h2` under `Http1OrH2ByAlpn`; each stream an `HttpRequest` through the same head, hooks, admission, checkpoints, and service; deferred replies per stream; refusals per stream; deadlines, drain, and stop; h2-net's abuse budgets end the connection as `EndReason::Abuse`.
 - [x] End-to-end tests over TLS on both drivers, rapid reset included.
 - [x] On a published h2-net: 0.3.1, the first on crates.io (2026-11-20).
-- [ ] Release: with the next serve-net release.
+- [x] Released in 0.9.0 (2026-11-20).
 - [ ] A streamed request body and a streamed reply over HTTP/2.
 - [x] Prior-knowledge cleartext HTTP/2 behind a trusted proxy: `EngineChoice::Http1OrH2ByPreface`, refused elsewhere by validation (D-121).
 - [ ] Priority signals (RFC 9218) used by the order replies are written in.
 - [ ] WebSocket over HTTP/2 (RFC 8441).
 
-## v0.9.x - Pre-1.0 polish (before any 1.0 release candidate)
+## v0.10.x - Pre-1.0 polish (before any 1.0 release candidate)
 James's standing rule (2026-10-29): "make sure to go back and fix any issues / perf tune / etc before we get close to release." Nothing accepted during the 0.x series becomes final silently: each item below is fixed, measured, or written into the 1.0 readiness note for James with the reason it stays.
 
 Exit: every item in the register below is closed or carried into `docs/STABILITY-1.0.md` (the 1.0 readiness note) with a reason and a cost; the performance pass and the security and edge-case review are recorded; no `-rc` tag before this exit.
@@ -249,11 +255,11 @@ Exit: every item in the register below is closed or carried into `docs/STABILITY
 **3. Re-run the security and edge-case review.** Every threat T-1 to T-40 re-tested against the release candidate's code, every validation rule V-1 to V-26, the fuzz targets with a long run on an out-of-repository corpus, the loom models, the leak test at 100k connections (NFR-19), and an adversarial review of every hook seam; findings fixed test first.
 
 ## v1.0.0 - Stable
-- Release candidates (`1.0.0-rc.N`) only after the v0.9.x polish exit, with no API change across two of them.
+- Release candidates (`1.0.0-rc.N`) only after the v0.10.x polish exit, with no API change across two of them.
 - API frozen until 2.0; the full audit (API, docs, tests, benchmarks, security) recorded in `docs/STABILITY-1.0.md`; `dev/DIRECTIVES.md` definition of done item 10 satisfied. James decides the release.
 
 ## After 1.0
-`engine::H2` beyond its first version (see the HTTP/2 section above), multiplexed FastCGI, systemd `FDSTORE`, lane queues with weighted deficit round robin, mod_fcgid on Windows (named pipes), cleartext HTTP/2 with prior knowledge, `Workers::uring`.
+`engine::H2` beyond its first version (see the HTTP/2 section above), multiplexed FastCGI, systemd `FDSTORE`, lane queues with weighted deficit round robin, mod_fcgid on Windows (named pipes), `Workers::uring`.
 
 ---
 

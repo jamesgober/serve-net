@@ -48,7 +48,7 @@ What remains, and the plan: one real clock read per request for `Finished::repli
 this machine, kept because a cached time would make every quick reply look instant), the reply built
 through `HttpReply` and re-encoded, the second view of the head for the call, the per-worker counters,
 and the test transport's copy. Closing the gap needs a profile on a Linux host with `perf`, which this
-machine does not have; it is in the v0.9.x performance pass (`dev/ROADMAP.md`).
+machine does not have; it is in the v0.10.x performance pass (`dev/ROADMAP.md`).
 
 ## Defences (section 10.3)
 
@@ -129,4 +129,4 @@ at full load through 0.7. NFR-5 is a 1.0 blocker (`docs/STABILITY-1.0.md`).
 | Idea I-6: a damper while refusing | measured on the overload benchmark | with P-6 |
 | P-12: the blocking driver against http-net's blocking server | needs a load generator | with the competitor runs |
 | P-13, NFR-4: idle wake-ups | needs a wake-up counter from net-io | 0.7 soak |
-| WebSocket idle memory and per-message cost (D-079) | needs a socket benchmark beside the idle test | v0.9.x pass |
+| WebSocket idle memory and per-message cost (D-079) | needs a socket benchmark beside the idle test | v0.10.x pass |

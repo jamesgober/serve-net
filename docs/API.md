@@ -149,9 +149,9 @@ Every cost is a target on reference hardware. Numbers marked **[est.]** are esti
 |---|---|---|---|
 | (none) | always | the server, listeners, ingress, profiles, limits, hooks, snapshots, the engine and family traits | `0.3.0` |
 | `http1` | on | the HTTP family over http-net: `HttpService`, `HttpRequest`, `HttpReply`, `engine::Http1`, the Tier 1 functions `http` and `http_behind_proxy`, `testing` | `0.3.0` |
-| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.9.0` |
+| `fastcgi` | off | FastCGI over fcgi-net: `engine::FastCgi`, `fastcgi`, `Ingress::FastCgi` (implies the HTTP family types) | `0.10.0` |
 | `ws` | off | WebSocket upgrades over ws-net: `UpgradeTarget::WebSocket`, `WebSocketTarget`, `WebSocketService`, `WebSocketConn`, `WsMessage`, `WsSendError`, the `ws_net` re-export (implies `http1`) | `0.6.0` |
-| `h2` | off | HTTP/2 over h2-net: ALPN `h2` under `EngineChoice::Http1OrH2ByAlpn` | built on h2-net 0.3.1; ships in the next release |
+| `h2` | off | HTTP/2 over h2-net: ALPN `h2` under `EngineChoice::Http1OrH2ByAlpn` | `0.9.0`, on h2-net 0.3.1 |
 
 Features are additive. `--no-default-features` builds the server with custom families only and passes CI on its own. The crate has no third-party runtime dependency in any feature combination; its first-party dependencies are net-io (always), http-net, fcgi-net, ws-net, and h2-net (by feature), each at a published version.
 
@@ -308,7 +308,7 @@ A FastCGI responder for Apache (`mod_fcgid`, `mod_proxy_fcgi`) or nginx (`fastcg
 
 | Grade | Tier | Version | Feature |
 |---|---|---|---|
-| P1 | 1 | `0.9.0` | `fastcgi` |
+| P1 | 1 | `0.10.0` | `fastcgi` |
 
 Errors: `ServeError::Inherited` ("descriptor 0 is not a listening socket: the process was not started by a FastCGI process manager; use FastCgiListen::Tcp or Unix"), `ServeError::Bind`, `ServeError::Config` (`PublicBind`). `DescriptorZero` and `Unix` are Unix only (mod_fcgid on Windows uses named pipes, after `1.0.0`).
 
@@ -787,7 +787,7 @@ impl ListenerSpec {
     pub fn tcp<A: ToSocketAddrs>(name: &str, addr: A) -> Self;
     pub fn unix(name: &str, path: impl Into<PathBuf>) -> Self;                     // P1, 0.4.0
     pub fn inherited(name: &str) -> Self;                                           // P1, 0.4.0
-    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.9.0, Unix
+    pub fn fastcgi_descriptor_zero(name: &str) -> Self;                             // P1, 0.10.0, Unix
     pub fn handed_off(name: &str, listener: net_io::ListenerHandle) -> Self;        // P0, 0.4.0
 }
 ```
@@ -915,7 +915,7 @@ pub enum Ingress {
     DirectTls,                                  // P0, 0.4.0: the same over TLS (net-io's TLS seam)
     Proxy(ProxySource),                         // behind a reverse proxy or load balancer
     Unix(UnixPeerTrust, Option<ProxySource>),   // P1, 0.4.0: None means the local peer is the client
-    FastCgi(FastCgiIngress),                    // P1, 0.9.0, feature fastcgi
+    FastCgi(FastCgiIngress),                    // P1, 0.10.0, feature fastcgi
 }
 impl Default for Ingress;   // Direct
 ```
@@ -932,7 +932,7 @@ How clients reach a listener, and therefore where the real client comes from. Ex
 
 | Grade | Tier | Version |
 |---|---|---|
-| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`); `0.9.0` (`FastCgi`) |
+| P0 | 2 | `0.3.0` (`Direct`, `Proxy` with forwarded headers); `0.4.0` (`DirectTls`, `Proxy` with PROXY protocol, `Unix`); `0.10.0` (`FastCgi`) |
 
 Errors (at `build`): `ForwardedOnDirect`, `TwoClientSources`, `PublicBind`, `TrustEmpty`, `TrustWildcard`, `TrustTooBroad`, `FastCgiTrust`, `TlsOnFastCgi`, `TlsWithoutAcceptor`, `PeerCredentialsUnavailable`.
 
@@ -1038,7 +1038,7 @@ impl FastCgiIngress {
 }
 ```
 
-The FastCGI ingress options. `REMOTE_ADDR` is believed only because only trusted front ends can connect (rule `FastCgiTrust` refuses an empty list on TCP). P1, Tier 2, `0.9.0`, feature `fastcgi`.
+The FastCGI ingress options. `REMOTE_ADDR` is believed only because only trusted front ends can connect (rule `FastCgiTrust` refuses an empty list on TCP). P1, Tier 2, `0.10.0`, feature `fastcgi`.
 
 ---
 
@@ -1249,7 +1249,7 @@ The compiled, immutable table, published through a [`Snapshot`](#snapshot) so a 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EngineChoice {
     #[default] Http1,
-    FastCgi,                                       // P1, 0.9.0
+    FastCgi,                                       // P1, 0.10.0
     Http1OrH2ByAlpn,                               // P1, 0.7.0 (h2 with feature h2)
     Custom { alpn: &'static [&'static str] },      // a family given to bind_family; ALPN ids it serves
 }
