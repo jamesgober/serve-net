@@ -80,6 +80,13 @@ pub enum EngineChoice {
     /// `EndReason::NoEngine`, so offer `h2` on the acceptor only in a build
     /// with it. Only on TLS listeners (`RuleId::AlpnWithoutTls`).
     Http1OrH2ByAlpn,
+    /// HTTP/1.1, or HTTP/2 when a connection's first bytes are the HTTP/2
+    /// connection preface (cleartext HTTP/2 with prior knowledge, RFC 9113
+    /// section 3.3). Only on a listener whose ingress is a trusted proxy
+    /// (`RuleId::PriorKnowledgeWithoutProxy`): on an open port it would
+    /// let any client skip TLS. `Upgrade: h2c` is still never honoured.
+    #[cfg(feature = "h2")]
+    Http1OrH2ByPreface,
     /// A custom family given to `bind_family`; the ALPN ids it serves.
     Custom {
         /// The ALPN protocol ids offered on TLS listeners.
@@ -98,6 +105,8 @@ impl EngineChoice {
             (EngineChoice::Http1 | EngineChoice::Http1OrH2ByAlpn, Some(p)) => {
                 p == b"http/1.1" || p == b"http/1.0"
             }
+            #[cfg(feature = "h2")]
+            (EngineChoice::Http1OrH2ByPreface, Some(p)) => p == b"http/1.1" || p == b"http/1.0",
             (EngineChoice::Custom { alpn: ids }, Some(p)) => {
                 ids.iter().any(|id| id.as_bytes() == p)
             }

@@ -21,7 +21,12 @@
   its own stream. h2-net's budgets against HTTP/2 attacks (rapid reset,
   `CONTINUATION` and control frame floods, a peer that does not read) end
   the connection as the new `EndReason::Abuse`. A streamed request body or
-  reply over HTTP/2, and cleartext HTTP/2, come later.
+  reply over HTTP/2 comes later.
+- `EngineChoice::Http1OrH2ByPreface` (feature `h2`): cleartext HTTP/2 with
+  prior knowledge behind a trusted proxy. A connection whose first bytes
+  are the HTTP/2 preface is HTTP/2, any other HTTP/1.1. Validation refuses
+  it on a listener that is not behind a trusted proxy
+  (`RuleId::PriorKnowledgeWithoutProxy`).
 
 ### Changed
 

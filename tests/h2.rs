@@ -512,3 +512,144 @@ fn test_h2_rapid_reset_ends_the_connection_as_abuse() {
     );
     let _ = server.drain(Duration::from_secs(2));
 }
+
+// ---- Cleartext HTTP/2 with prior knowledge, behind a trusted proxy.
+
+fn serve_cleartext() -> serve_net::Running {
+    use serve_net::{ProxySource, TrustedProxies};
+    Server::builder()
+        .listener(
+            ListenerSpec::tcp("edge", "127.0.0.1:0").ingress(Ingress::Proxy(
+                ProxySource::forwarded_for(TrustedProxies::loopback()),
+            )),
+        )
+        .profile(Profile::new(ProfileId(0)).engine(EngineChoice::Http1OrH2ByPreface))
+        .serve(serve_net::handler(|req, reply| {
+            let client = req
+                .client()
+                .addr()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            reply.text(200, &format!("{} from {client}", req.path()));
+        }))
+        .unwrap()
+}
+
+/// Sends `wire` over plain TCP and reads frames until stream 1 ends or the
+/// connection closes; returns stream 1's status and body.
+fn cleartext_exchange(addr: SocketAddr, wire: &[u8]) -> (Option<u16>, Vec<u8>) {
+    let mut sock = TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    sock.write_all(wire).unwrap();
+    let mut buf = Vec::new();
+    let mut dec = Decoder::new(4096);
+    let (mut status, mut body, mut ended) = (None, Vec::new(), false);
+    let mut chunk = [0u8; 16 * 1024];
+    while !ended {
+        let n = match sock.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        while let Ok(Decoded::Frame { frame, len }) = frame::decode(&buf, 1 << 24) {
+            match frame {
+                Frame::Settings(s) if !s.is_ack() => {
+                    let mut ack = Vec::new();
+                    frame::encode(&Frame::Settings(frame::Settings::ack()), 16_384, &mut ack)
+                        .unwrap();
+                    let _ = sock.write_all(&ack);
+                }
+                Frame::Headers {
+                    stream,
+                    fragment,
+                    end_stream,
+                    ..
+                } if stream.value() == 1 => {
+                    let mut list = HeaderList::new(1 << 20);
+                    dec.decode(fragment, &mut list).unwrap();
+                    status = list
+                        .get(":status")
+                        .and_then(|v| std::str::from_utf8(v).ok()?.parse().ok());
+                    ended |= end_stream;
+                }
+                Frame::Data {
+                    stream,
+                    data,
+                    end_stream,
+                    ..
+                } if stream.value() == 1 => {
+                    body.extend_from_slice(data);
+                    ended |= end_stream;
+                }
+                _ => {}
+            }
+            buf.drain(..len);
+        }
+    }
+    (status, body)
+}
+
+#[test]
+fn test_h2c_prior_knowledge_behind_a_trusted_proxy() {
+    let server = serve_cleartext();
+    let mut wire = frame::PREFACE.to_vec();
+    frame::settings_frame(&[], 16_384, &mut wire).unwrap();
+    let mut block = Vec::new();
+    Encoder::new(4096).encode(
+        [
+            HeaderField::new(b":method", b"GET"),
+            HeaderField::new(b":scheme", b"http"),
+            HeaderField::new(b":authority", b"example.test"),
+            HeaderField::new(b":path", b"/clear"),
+            HeaderField::new(b"x-forwarded-for", b"203.0.113.9"),
+        ],
+        &mut block,
+    );
+    frame::encode(
+        &Frame::Headers {
+            stream: StreamId::new(1).unwrap(),
+            end_stream: true,
+            end_headers: true,
+            priority: None,
+            fragment: &block,
+            padding: None,
+        },
+        16_384,
+        &mut wire,
+    )
+    .unwrap();
+    let (status, body) = cleartext_exchange(server.local_addr().unwrap(), &wire);
+    assert_eq!(status, Some(200));
+    // The forwarded client, as for HTTP/1.1 behind the same proxy.
+    assert_eq!(String::from_utf8_lossy(&body), "/clear from 203.0.113.9");
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+#[test]
+fn test_h2c_listener_still_serves_http1() {
+    let server = serve_cleartext();
+    let mut sock = TcpStream::connect(server.local_addr().unwrap()).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    sock.write_all(
+        b"GET /old HTTP/1.1\r\nHost: example.test\r\nX-Forwarded-For: 203.0.113.9\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    let mut got = String::new();
+    let _ = sock.read_to_string(&mut got);
+    assert!(got.starts_with("HTTP/1.1 200"), "{got}");
+    assert!(got.ends_with("/old from 203.0.113.9"), "{got}");
+    let _ = server.drain(Duration::from_secs(2));
+}
+
+#[test]
+fn test_prior_knowledge_needs_a_trusted_proxy() {
+    let err = Server::builder()
+        .listener(ListenerSpec::tcp("open", "127.0.0.1:0"))
+        .profile(Profile::new(ProfileId(0)).engine(EngineChoice::Http1OrH2ByPreface))
+        .build()
+        .unwrap_err();
+    assert!(
+        err.has(serve_net::RuleId::PriorKnowledgeWithoutProxy),
+        "{err}"
+    );
+}

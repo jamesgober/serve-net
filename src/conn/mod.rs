@@ -638,6 +638,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             }
             State::AwaitHead | State::ReadBody => {}
         }
+        if self.state == State::AwaitHead && self.seq == 0 {
+            if let Some(taken) = self.h2_sniff(io, input) {
+                return taken;
+            }
+        }
         let (n, step) = self.process(io, input);
         self.count(io, Count::BytesIn(n as u64));
         (n, step)

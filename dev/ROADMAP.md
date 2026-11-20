@@ -181,7 +181,7 @@ h2-net reached 0.3, so HTTP/2 comes before 1.0 as a minor version.
 - [x] End-to-end tests over TLS on both drivers, rapid reset included.
 - [ ] Release: waits on h2-net's first publish on crates.io (serve-net takes dependencies at published versions only, never by path).
 - [ ] A streamed request body and a streamed reply over HTTP/2.
-- [ ] Prior-knowledge cleartext HTTP/2 behind a trusted proxy (a profile opts in; the first bytes are the preface).
+- [x] Prior-knowledge cleartext HTTP/2 behind a trusted proxy: `EngineChoice::Http1OrH2ByPreface`, refused elsewhere by validation (D-121).
 - [ ] Priority signals (RFC 9218) used by the order replies are written in.
 - [ ] WebSocket over HTTP/2 (RFC 8441).
 

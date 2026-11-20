@@ -65,6 +65,9 @@ pub enum RuleId {
     DrainRange,
     /// ALPN engine choice on a listener without TLS.
     AlpnWithoutTls,
+    /// Cleartext HTTP/2 with prior knowledge on a listener whose ingress is
+    /// not a trusted proxy.
+    PriorKnowledgeWithoutProxy,
     /// TLS on a FastCGI listener.
     TlsOnFastCgi,
     /// `trust_scheme` or `trust_host` with no source that can carry them.
@@ -136,6 +139,7 @@ impl RuleId {
             RuleId::ReloadListener => "reload_listener",
             RuleId::DrainRange => "drain_range",
             RuleId::AlpnWithoutTls => "alpn_without_tls",
+            RuleId::PriorKnowledgeWithoutProxy => "prior_knowledge_without_proxy",
             RuleId::TlsOnFastCgi => "tls_on_fastcgi",
             RuleId::SchemeTrustWithoutSource => "scheme_trust_without_source",
             RuleId::AnyLocalPeerForwarded => "any_local_peer_forwarded",

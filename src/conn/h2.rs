@@ -85,6 +85,39 @@ mod imp {
             by_alpn && h2
         }
 
+        /// Whether this connection's profile takes cleartext HTTP/2 when the
+        /// first bytes are its preface.
+        pub(crate) fn by_preface(&self) -> bool {
+            self.compiled()
+                .is_some_and(|c| c.profile.engine == EngineChoice::Http1OrH2ByPreface)
+        }
+
+        /// Prior knowledge (RFC 9113 section 3.3): on a profile that takes
+        /// cleartext HTTP/2, the first 24 bytes say which protocol this
+        /// connection speaks. `None` means HTTP/1.1 goes on.
+        pub(crate) fn h2_sniff<I: Io>(
+            &mut self,
+            io: &mut I,
+            input: &[u8],
+        ) -> Option<(usize, Step)> {
+            if !self.by_preface() {
+                return None;
+            }
+            match http_net::is_h2_preface(input) {
+                None => Some((0, Step::Read)),
+                Some(true) => {
+                    let step = self.h2_open(io);
+                    if matches!(step, Step::Close | Step::Abort) {
+                        return Some((input.len(), step));
+                    }
+                    let (n, step) = self.h2_drive(io, input);
+                    self.count(io, Count::BytesIn(n as u64));
+                    Some((n, step))
+                }
+                Some(false) => None,
+            }
+        }
+
         /// Opens the HTTP/2 side: the server's settings go out at once.
         pub(crate) fn h2_open<I: Io>(&mut self, io: &mut I) -> Step {
             let limits = self.limits();
@@ -1073,6 +1106,9 @@ pub(crate) use imp::H2Link;
 impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     pub(crate) fn wants_h2(&self) -> bool {
         false
+    }
+    pub(crate) fn h2_sniff<I: Io>(&mut self, _io: &mut I, _input: &[u8]) -> Option<(usize, Step)> {
+        None
     }
     pub(crate) fn h2_open<I: Io>(&mut self, _io: &mut I) -> Step {
         Step::Close
