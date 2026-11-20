@@ -16,7 +16,6 @@
 //! 5. A reply is handed to the transport whole before the next request is
 //!    processed.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -29,14 +28,16 @@ use crate::engine::{
 use crate::envelope::{Envelope, RequestSeq};
 use crate::error::EndReason;
 use crate::hooks::{
-    Admit, Admitted, Checkpoint, CheckpointAt, Dispatch, Hooks, JobService, Observer, Shed, Verdict,
+    Admitted, Checkpoint, CheckpointAt, Hooks, JobService, Observer, Shed, Verdict,
 };
 use crate::net::{CloseReason, ConnectionId, ControlLine, ControlState, WorkerId};
-use crate::reply::{DeferSlot, Link, Reply, SlotState, WAKE_REPLY, Waker};
-use crate::service::{BodyPolicy, Finished, HeadAction, Outcome, RequestEnd, UpgradeTarget};
+use crate::reply::{Reply, SlotState, WAKE_REPLY, Waker};
+use crate::service::{BodyPolicy, Outcome, RequestEnd, UpgradeTarget};
 use crate::snapshot::Snapshot;
 use crate::stats::{Count, Counters};
+use exchange::{Admission, Exchange, Gate, Start};
 
+mod exchange;
 pub(crate) mod session;
 #[cfg(all(test, feature = "http1"))]
 mod tests;
@@ -318,15 +319,11 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     connection: ConnectionId,
     engine: F::Engine,
     client: ClientInfo,
-    env: Envelope,
+    /// The request in progress (one at a time on this path).
+    ex: Exchange<F>,
     state: State,
-    request: Option<Request>,
-    body: Vec<u8>,
-    reply: Reply<F>,
     out: OutBuf,
     out_sent: usize,
-    /// This connection holds one of its worker's parked-request places.
-    parked: bool,
     /// Bytes of the reply body sent from the reply data after `out`
     /// (`Family::reply_body`); `None` when nothing follows.
     tail: Option<usize>,
@@ -335,8 +332,6 @@ pub(crate) struct Conn<F: Family, S: Service<F>, H: Hooks> {
     clock_base: (Instant, u64),
     epoch: u64,
     control: ControlState,
-    defer: Option<Arc<DeferSlot<F::Parts>>>,
-    generation: u64,
     end: Option<EndReason>,
     closing_after_write: bool,
     /// The piece of a streamed body this dispatch hands over: whether it is
@@ -458,25 +453,19 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             connection,
             engine,
             client,
-            env,
+            ex: Exchange::new(env, parts),
             state: State::AwaitHead,
-            request: None,
-            body: Vec::new(),
-            reply: Reply::new(parts),
             out: OutBuf {
                 bytes: Vec::with_capacity(OUT_INITIAL),
                 wipe,
             },
             out_sent: 0,
             tail: None,
-            parked: false,
             seq: 0,
             accepted_at: now,
             clock_base: (now, unix),
             epoch,
             control,
-            defer: None,
-            generation: 0,
             end: None,
             closing_after_write: false,
             chunk: None,
@@ -497,11 +486,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
 
     /// The facts net-io read from the connection's PROXY header.
     pub(crate) fn set_gate_tag(&mut self, tag: crate::net::GateTag) {
-        self.env.gate = tag;
+        self.ex.env.gate = tag;
     }
 
     pub(crate) fn set_tls(&mut self, tls: Option<Arc<net_io::TlsInfo>>) {
-        self.env.tls.clone_from(&tls);
+        self.ex.env.tls.clone_from(&tls);
         self.tls = tls;
     }
 
@@ -510,7 +499,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     }
 
     fn compiled(&self) -> Option<&Compiled> {
-        self.tables.profiles.compiled(self.env.profile)
+        self.tables.profiles.compiled(self.ex.env.profile)
     }
 
     fn limits(&self) -> crate::config::Limits {
@@ -605,7 +594,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
 
     /// Lets `Offload` run this connection's service on a pool.
     pub(crate) fn offload_through(&mut self, service: Arc<dyn JobService<F>>) {
-        self.reply.job = Some(service);
+        self.ex.reply.job = Some(service);
     }
 
     /// The connection is past `on_open`: a drain can no longer take it for idle.
@@ -690,7 +679,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         if token != WAKE_REPLY || value != generation {
             return Step::Park { until };
         }
-        let Some(slot) = self.defer.clone() else {
+        let Some(slot) = self.ex.defer.clone() else {
             return Step::Park { until };
         };
         let taken = {
@@ -712,7 +701,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         match taken {
             None => Step::Park { until },
             Some(Some((parts, close))) => {
-                let mut old = core::mem::replace(&mut self.reply.parts, parts);
+                let mut old = core::mem::replace(&mut self.ex.reply.parts, parts);
                 self.shared.family.clear_parts(&mut old, self.wipe);
                 drop(old);
                 self.state = State::Writing;
@@ -792,7 +781,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     /// refusal for `status` replaces it, and the connection closes (net-io
     /// closes it with `EgressDenied`).
     pub(crate) fn on_denied(&mut self, status: u16, worker: WorkerId) -> &[u8] {
-        if self.state == State::Upgraded && self.request.is_none() {
+        if self.state == State::Upgraded && self.ex.request.is_none() {
             // The 101 left: another protocol, no HTTP refusal fits; net-io
             // closes it. Before then the upgrade request still waits for
             // its answer, and the refusal below replaces the 101.
@@ -824,7 +813,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 draining: self.draining_seen,
             },
         );
-        if let Some(r) = self.request.as_mut() {
+        if let Some(r) = self.ex.request.as_mut() {
             r.status = Some(refusal.status);
         }
         self.finish_request(RequestEnd::Denied);
@@ -843,7 +832,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         if matches!(self.state, State::Parked { .. }) {
             self.cancel_deferred();
         }
-        if self.request.is_some() {
+        if self.ex.request.is_some() {
             let end = if transport {
                 RequestEnd::PeerGone
             } else {
@@ -865,11 +854,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         self.tail = None;
         self.shared
             .family
-            .clear_parts(&mut self.reply.parts, self.wipe);
+            .clear_parts(&mut self.ex.reply.parts, self.wipe);
         if self.wipe {
-            crate::engine::wipe_bytes(&mut self.body);
+            crate::engine::wipe_bytes(&mut self.ex.body);
         }
-        self.body.clear();
+        self.ex.body.clear();
     }
 
     /// The connection switched protocols (a WebSocket, after its 101).
@@ -912,7 +901,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         if let Some(mut sent) = self.tail {
             // The body from the reply data, as the transport's budget takes
             // it: the connection holds no copy of it (D-111).
-            let body = self.shared.family.reply_body(&self.reply.parts);
+            let body = self.shared.family.reply_body(&self.ex.reply.parts);
             let start = sent;
             let mut blocked = false;
             while sent < body.len() {
@@ -938,7 +927,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             State::Streaming if self.body_open => {
                 self.state = State::ReadBody;
                 io.set_phase(Phase::Receiving);
-                io.set_exchange_deadline(Some(self.env.deadline));
+                io.set_exchange_deadline(Some(self.ex.env.deadline));
                 Step::Read
             }
             // A step of its own, so a long reply never recurses.
@@ -962,8 +951,8 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     fn idle<I: Io>(&mut self, io: &mut I) -> Step {
         self.first_byte = None;
         self.head_reads = 0;
-        if self.body.capacity() > BODY_RETAIN {
-            self.body.shrink_to(BODY_RETAIN);
+        if self.ex.body.capacity() > BODY_RETAIN {
+            self.ex.body.shrink_to(BODY_RETAIN);
         }
         match self.checkpoint() {
             ControlState::Stopping => {
@@ -1004,12 +993,12 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         self.trim_armed = false;
         let _ = self.engine.shrink_idle();
         self.out.shrink(0);
-        self.body = Vec::new();
-        self.reply.parts = self.shared.family.new_parts();
+        self.ex.body = Vec::new();
+        self.ex.reply.parts = self.shared.family.new_parts();
         // The deferral slot too: a wake only acts on a parked connection, and a
         // token from an earlier request keeps its own reference to the old slot.
-        self.reply.link = None;
-        self.defer = None;
+        self.ex.reply.link = None;
+        self.ex.defer = None;
         io.set_exchange_deadline(None);
         Step::Read
     }
@@ -1043,7 +1032,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 Ok(e) => e,
                 Err(e) => {
                     self.end = Some(EndReason::ProtocolError);
-                    let step = if self.request.is_some() {
+                    let step = if self.ex.request.is_some() {
                         self.refuse(io, e.kind, e.status, None, RequestEnd::Refused(e.kind))
                     } else {
                         self.refuse_without_request(io, e.kind, e.status, None)
@@ -1067,12 +1056,12 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 EngineEvent::Head => self.on_head(io),
                 EngineEvent::Body(bytes) => {
                     let n = bytes.len() as u64;
-                    match self.request.as_mut() {
+                    match self.ex.request.as_mut() {
                         Some(r) => {
                             r.bytes_in = r.bytes_in.saturating_add(n);
                             match r.policy {
                                 BodyPolicy::Buffer { max } => {
-                                    if (self.body.len() as u64).saturating_add(n) > max {
+                                    if (self.ex.body.len() as u64).saturating_add(n) > max {
                                         self.end = Some(EndReason::ProtocolError);
                                         let step = self.refuse(
                                             io,
@@ -1083,7 +1072,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                                         );
                                         return (input.len(), step);
                                     }
-                                    crate::engine::extend_wiping(&mut self.body, bytes, self.wipe);
+                                    crate::engine::extend_wiping(
+                                        &mut self.ex.body,
+                                        bytes,
+                                        self.wipe,
+                                    );
                                     None
                                 }
                                 BodyPolicy::Discard { max } => {
@@ -1107,10 +1100,14 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                                 }
                                 BodyPolicy::Stream if self.state == State::ReadBody => {
                                     if self.wipe {
-                                        crate::engine::wipe_bytes(&mut self.body);
+                                        crate::engine::wipe_bytes(&mut self.ex.body);
                                     }
-                                    self.body.clear();
-                                    crate::engine::extend_wiping(&mut self.body, bytes, self.wipe);
+                                    self.ex.body.clear();
+                                    crate::engine::extend_wiping(
+                                        &mut self.ex.body,
+                                        bytes,
+                                        self.wipe,
+                                    );
                                     Some(self.stream_piece(io, false))
                                 }
                                 BodyPolicy::Stream => None,
@@ -1120,7 +1117,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                     }
                 }
                 EngineEvent::BodyEnd => {
-                    if self.request.is_some() && self.state == State::ReadBody {
+                    if self.ex.request.is_some() && self.state == State::ReadBody {
                         if self.body_open {
                             self.body_open = false;
                             self.clear_body();
@@ -1186,18 +1183,16 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let limits = self.limits();
         let shared = &*self.shared;
         let tables = &*self.tables;
-        let compiled = tables.profiles.compiled(self.env.profile);
-        // Everything that borrows the engine's head happens in this block, so
-        // the borrow ends before any refusal is written.
-        let mut upgrade_refused = None;
-        let mut head_panicked = false;
+        let compiled = tables.profiles.compiled(self.ex.env.profile);
         let default_policy = compiled.map_or(
             BodyPolicy::Buffer {
                 max: limits.max_body,
             },
             |c| c.body,
         );
-        let viewed = {
+        // Everything that borrows the engine's head happens in this block, so
+        // the borrow ends before any refusal is written.
+        let decided = {
             let listener = tables.listeners.get(self.listener).and_then(Option::as_ref);
             let cx = HeadContext {
                 client: &self.client,
@@ -1215,181 +1210,64 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                     Ok((head, client)) => {
                         let arrived = self.first_byte.unwrap_or(now);
                         self.seq = self.seq.saturating_add(1);
-                        self.env.seq = RequestSeq(self.seq);
-                        self.env.client = client;
-                        self.env.lane =
-                            compiled.map_or(crate::config::DEFAULT_LANE, |c| c.profile.lane);
-                        self.env.lane_open = true;
-                        self.env.lane_late = false;
-                        self.env.arrived = arrived;
-                        self.env.deadline = arrived + limits.request_timeout;
-                        self.env.user_word = 0;
-                        // The record exists before `head` runs: `done` follows
-                        // every `head`, a panicking one included (D-111).
-                        let head_len = self.engine.head_len() as u64;
-                        self.request = Some(Request {
+                        let start = Start {
+                            seq: self.seq,
+                            client,
+                            lane: compiled.map_or(crate::config::DEFAULT_LANE, |c| c.profile.lane),
+                            arrived,
+                            deadline: arrived + limits.request_timeout,
                             head_reads: self.head_reads,
-                            admitted: None,
-                            head_at: arrived,
-                            admitted_at: None,
-                            bytes_in: head_len,
-                            head_bytes: head_len,
-                            bytes_in_limit: head_len.saturating_add(limits.max_body),
+                            head_len: self.engine.head_len() as u64,
+                            max_body: limits.max_body,
                             policy: default_policy,
-                            discard_over: false,
-                            status: None,
-                            bytes_out: 0,
-                        });
-                        shared.observer.request_head(&self.env);
-                        let env = &mut self.env;
-                        let action = if shared.catch_panics {
-                            let caught =
-                                catch_unwind(AssertUnwindSafe(|| shared.service.head(&head, env)));
-                            head_panicked = caught.is_err();
-                            caught.unwrap_or(HeadAction::Proceed)
-                        } else {
-                            shared.service.head(&head, env)
                         };
-                        self.env.lane_open = false;
-                        // An upgrade is judged on the head view, where the
-                        // trusted authority is known (a WebSocket origin).
-                        if let HeadAction::Upgrade(ref target) = action {
-                            upgrade_refused = shared.family.upgrade_allowed(&head, target).err();
-                        }
-                        Ok(action)
+                        Ok(self.ex.begin(shared, &head, start))
                     }
                 }),
             }
         };
-        let action = match viewed {
+        let decision = match decided {
             None => return None,
             Some(Err(e)) => {
                 self.end = Some(EndReason::IngressRefused);
                 return Some(self.refuse_without_request(io, e.kind, e.status, None));
             }
-            Some(Ok(action)) => action,
+            Some(Ok(decision)) => decision,
         };
-        if head_panicked {
-            self.shared
-                .observer
-                .service_error(&self.env, "the service panicked in head");
-            self.end = Some(EndReason::ServicePanic);
-            return Some(self.refuse(
-                io,
-                RefusalKind::Internal,
-                500,
-                None,
-                RequestEnd::ServicePanic,
-            ));
-        }
-        let declared = self.engine.declared_length();
+        let gate = Gate {
+            control,
+            critical: compiled.is_some_and(|c| c.profile.critical),
+            worker: io.worker(),
+            now,
+            declared: self.engine.declared_length(),
+        };
         let expects = self.engine.expects_continue();
-        let policy = match action {
-            HeadAction::Proceed => default_policy,
-            HeadAction::ProceedWith(p) => p,
-            HeadAction::Upgrade(target) => {
-                if let Some(e) = upgrade_refused {
-                    self.end = Some(EndReason::Refused);
-                    return Some(self.refuse(
-                        io,
-                        e.kind,
-                        e.status,
-                        None,
-                        RequestEnd::Refused(e.kind),
-                    ));
-                }
-                // The upgrade request carries no body: a declared one is 413.
+        let policy = match self.ex.admit(shared, decision, default_policy, &gate) {
+            Admission::Proceed(policy) => policy,
+            Admission::Upgrade(target) => {
                 self.upgrade = Some(Box::new(target));
                 BodyPolicy::Buffer { max: 0 }
             }
-            HeadAction::Refuse {
+            Admission::Refuse {
+                kind,
                 status,
                 retry_after,
+                end,
+                reason,
             } => {
-                self.end = Some(EndReason::Refused);
-                return Some(self.refuse(
-                    io,
-                    RefusalKind::Service,
-                    status,
-                    retry_after,
-                    RequestEnd::Refused(RefusalKind::Service),
-                ));
+                self.end = Some(reason);
+                return Some(self.refuse(io, kind, status, retry_after, end));
             }
+            Admission::Kill => return Some(self.kill()),
         };
-        // Control line: shed, lockdown, drain.
-        let critical = compiled.is_some_and(|c| c.profile.critical);
-        let refused_by_control = match control {
-            ControlState::Shed { from_lane } => self.env.lane >= from_lane,
-            ControlState::Lockdown => !critical,
-            _ => false,
-        };
-        if refused_by_control {
-            self.end = Some(EndReason::Shed);
-            let shed = Shed {
-                retry_after: None,
-                close: true,
-            };
-            shared.observer.request_shed(&self.env, &shed);
-            return Some(self.refuse(
-                io,
-                RefusalKind::Busy,
-                503,
-                Some(Duration::from_secs(1)),
-                RequestEnd::Shed,
-            ));
-        }
-        match shared.admit.admit(io.worker(), &self.env) {
-            Ok(a) => {
-                if let Some(r) = self.request.as_mut() {
-                    r.admitted = Some(a);
-                    r.admitted_at = Some(now);
-                }
-                shared.observer.request_admitted(&self.env);
-            }
-            Err(shed) => {
-                self.end = Some(EndReason::Shed);
-                shared.observer.request_shed(&self.env, &shed);
-                let retry = shed.retry_after.or(Some(Duration::from_secs(1)));
-                return Some(self.refuse(io, RefusalKind::Busy, 503, retry, RequestEnd::Shed));
-            }
-        }
-        match shared.checkpoint.check(&self.env, CheckpointAt::Admitted) {
-            Verdict::Pass => {}
-            Verdict::Deny { status } => {
-                self.end = Some(EndReason::Denied);
-                return Some(self.refuse(
-                    io,
-                    RefusalKind::Denied,
-                    status,
-                    None,
-                    RequestEnd::Denied,
-                ));
-            }
-            Verdict::Kill => return Some(self.kill()),
-        }
-        if let (BodyPolicy::Buffer { max }, Some(len)) = (policy, declared) {
-            if len > max {
-                self.end = Some(EndReason::ProtocolError);
-                return Some(self.refuse(
-                    io,
-                    RefusalKind::TooLarge,
-                    413,
-                    None,
-                    RequestEnd::Refused(RefusalKind::TooLarge),
-                ));
-            }
-        }
-        if let Some(r) = self.request.as_mut() {
-            r.policy = policy;
-        }
         if expects && self.engine.send_continue(&mut self.out).is_ok() {
             let _ = self.flush_partial(io);
         }
-        self.body.clear();
+        self.ex.body.clear();
         self.body_open = policy == BodyPolicy::Stream;
         self.state = State::ReadBody;
         io.set_phase(Phase::Receiving);
-        io.set_exchange_deadline(Some(self.env.deadline));
+        io.set_exchange_deadline(Some(self.ex.env.deadline));
         if control == ControlState::Draining || io.draining() {
             self.engine.close_after_reply();
         }
@@ -1416,7 +1294,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let shared = &*self.shared;
         match shared
             .checkpoint
-            .check(&self.env, CheckpointAt::BeforeDispatch)
+            .check(&self.ex.env, CheckpointAt::BeforeDispatch)
         {
             Verdict::Pass => {}
             Verdict::Deny { status } => {
@@ -1428,43 +1306,12 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         if let Some(target) = self.upgrade.take() {
             return self.switch(io, *target);
         }
-        // A deferral gets the next generation; the slot is made once per
-        // connection, and the reply keeps its link between calls (the reply
-        // is reachable only inside `call`), so only a deferral, which moves
-        // the link into its token, costs a clone.
-        self.generation = self.generation.wrapping_add(1);
-        match self.reply.link.as_mut() {
-            Some(link) => link.generation = self.generation,
-            None => {
-                let slot = match &self.defer {
-                    Some(s) => Arc::clone(s),
-                    None => {
-                        let mut s = DeferSlot::new(io.waker(), self.connection);
-                        if let (true, Some(job)) = (self.wipe, &self.reply.job) {
-                            s = s.wiping(Arc::new(crate::hooks::JobWiper(Arc::clone(job))));
-                        }
-                        let s = Arc::new(s);
-                        self.defer = Some(Arc::clone(&s));
-                        s
-                    }
-                };
-                self.reply.link = Some(Link {
-                    slot,
-                    generation: self.generation,
-                });
-            }
-        }
-        self.reply.deferred = false;
-        if self.reply_stream {
-            shared
-                .family
-                .next_stream_part(&mut self.reply.parts, self.wipe);
-        } else {
-            shared.family.clear_parts(&mut self.reply.parts, self.wipe);
-        }
+        let (connection, wipe, streaming) = (self.connection, self.wipe, self.reply_stream);
+        self.ex
+            .ready_reply(shared, || io.waker(), connection, wipe, streaming);
         // Streaming stays on the worker: its calls share the connection's state.
         let job = if self.chunk.is_some() || self.reply_stream {
-            self.reply.job.take()
+            self.ex.reply.job.take()
         } else {
             None
         };
@@ -1479,12 +1326,13 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 client: &self.client,
                 proxy: listener.and_then(|l| l.proxy.as_ref()),
                 declared_scheme: listener.map_or(Scheme::Http, |l| l.declared_scheme),
-                resolved: Some(self.env.client),
+                resolved: Some(self.ex.env.client),
                 proxy_facts: self.proxy_facts.as_deref(),
                 tls: self.tls.as_deref(),
                 sni_check: listener.is_none_or(|l| l.sni_check),
             };
             let discard = self
+                .ex
                 .request
                 .as_ref()
                 .is_some_and(|r| matches!(r.policy, BodyPolicy::Discard { .. }));
@@ -1494,49 +1342,27 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 Some(raw) => match shared.family.head(raw, &cx) {
                     Err(_) => None,
                     Ok((head, _)) => {
-                        let body: &[u8] = if discard { &[] } else { &self.body };
+                        let body: &[u8] = if discard { &[] } else { &self.ex.body };
                         let request = match self.chunk {
                             Some(last) => shared.family.request_chunk(head, body, last),
                             None => shared.family.request(head, body),
                         };
-                        // The misdeclared-service check is a debug build's:
-                        // a release build reads no clock here.
-                        let started = cfg!(debug_assertions).then(Instant::now);
-                        let worker = self.env.worker.get();
-                        let in_call = InCall::enter(&shared.counters, worker);
-                        let (env, reply) = (&self.env, &mut self.reply);
-                        let mut run = || shared.dispatch.run(&shared.service, &request, env, reply);
-                        let outcome = if shared.catch_panics {
-                            // The reply is cleared before the refusal is
-                            // written, so a half-built one never leaves.
-                            let caught = catch_unwind(AssertUnwindSafe(&mut run));
-                            panicked = caught.is_err();
-                            caught.unwrap_or(Outcome::Close)
-                        } else {
-                            run()
-                        };
-                        drop(in_call);
-                        if let Some(started) = started {
-                            let took = started.elapsed();
-                            if <S as Service<F>>::WORK == crate::service::WorkClass::Quick
-                                && took > Duration::from_millis(1)
-                            {
-                                shared.observer.service_misdeclared(&self.env, took);
-                            }
-                        }
-                        Some(outcome)
+                        let called =
+                            exchange::call(shared, &request, &self.ex.env, &mut self.ex.reply);
+                        panicked = called.panicked;
+                        Some(called.outcome)
                     }
                 },
             }
         };
         if job.is_some() {
-            self.reply.job = job;
+            self.ex.reply.job = job;
         }
         if panicked {
-            self.reply.link = None;
+            self.ex.reply.link = None;
             self.shared
                 .observer
-                .service_error(&self.env, "the service panicked");
+                .service_error(&self.ex.env, "the service panicked");
             self.end = Some(EndReason::ServicePanic);
             return self.refuse(
                 io,
@@ -1546,15 +1372,15 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 RequestEnd::ServicePanic,
             );
         }
-        if self.reply.pool_full {
-            self.reply.pool_full = false;
-            self.reply.link = None;
+        if self.ex.reply.pool_full {
+            self.ex.reply.pool_full = false;
+            self.ex.reply.link = None;
             self.end = Some(EndReason::Shed);
             let shed = Shed {
                 retry_after: None,
                 close: false,
             };
-            self.shared.observer.request_shed(&self.env, &shed);
+            self.shared.observer.request_shed(&self.ex.env, &shed);
             return self.refuse(
                 io,
                 RefusalKind::Busy,
@@ -1564,7 +1390,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             );
         }
         let Some(outcome) = outcome else {
-            self.reply.link = None;
+            self.ex.reply.link = None;
             return self.refuse(
                 io,
                 RefusalKind::Internal,
@@ -1573,18 +1399,18 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 RequestEnd::Refused(RefusalKind::Internal),
             );
         };
-        if self.env.lane_late {
+        if self.ex.env.lane_late {
             self.shared
                 .observer
-                .service_error(&self.env, "lane set after head");
+                .service_error(&self.ex.env, "lane set after head");
         }
         let mid_body = self.chunk == Some(false);
-        if self.reply.deferred {
+        if self.ex.reply.deferred {
             if self.reply_stream {
                 // A reply already on the wire cannot wait for a token.
                 self.shared
                     .observer
-                    .service_error(&self.env, "a streamed reply was deferred");
+                    .service_error(&self.ex.env, "a streamed reply was deferred");
                 self.cancel_deferred();
                 self.end = Some(EndReason::ServiceClosed);
                 return self.refuse(
@@ -1599,23 +1425,24 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 self.drop_rest_of_body();
             }
             if outcome != Outcome::Deferred {
-                self.shared
-                    .observer
-                    .service_error(&self.env, "reply deferred but call did not return Deferred");
+                self.shared.observer.service_error(
+                    &self.ex.env,
+                    "reply deferred but call did not return Deferred",
+                );
             }
-            let worker = self.env.worker.get();
+            let worker = self.ex.env.worker.get();
             let cap = self.limits().max_deferred_per_worker;
             if !self.shared.counters.park(worker, cap) {
                 // Past the per-worker cap (T-26): the token can only expire,
                 // and the client gets the busy refusal (D-111).
                 self.cancel_deferred();
-                self.reply.link = None;
+                self.ex.reply.link = None;
                 self.end = Some(EndReason::Shed);
                 let shed = Shed {
                     retry_after: None,
                     close: true,
                 };
-                self.shared.observer.request_shed(&self.env, &shed);
+                self.shared.observer.request_shed(&self.ex.env, &shed);
                 return self.refuse(
                     io,
                     RefusalKind::Busy,
@@ -1624,22 +1451,22 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                     RequestEnd::Shed,
                 );
             }
-            self.parked = true;
+            self.ex.parked = true;
             self.count(io, Count::Deferred);
             let until = io.now() + self.limits().reply_timeout;
             self.state = State::Parked {
-                generation: self.generation,
+                generation: self.ex.generation,
                 until,
             };
             io.set_exchange_deadline(None);
             // A completion that arrived while `call` ran is picked up at once.
             if self.slot_has_result() {
-                return self.on_wake(io, WAKE_REPLY, self.generation);
+                return self.on_wake(io, WAKE_REPLY, self.ex.generation);
             }
             return Step::Park { until };
         }
         if outcome == Outcome::More {
-            if self.shared.family.reply_stream(&self.reply.parts) {
+            if self.shared.family.reply_stream(&self.ex.reply.parts) {
                 return self.send_part(io, outcome);
             }
             if mid_body {
@@ -1647,7 +1474,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             }
             self.shared
                 .observer
-                .service_error(&self.env, "More returned with nothing left to wait for");
+                .service_error(&self.ex.env, "More returned with nothing left to wait for");
             self.end = Some(EndReason::ServiceClosed);
             return self.refuse(
                 io,
@@ -1663,7 +1490,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         if outcome == Outcome::Deferred {
             self.shared
                 .observer
-                .service_error(&self.env, "Deferred returned without reply.defer()");
+                .service_error(&self.ex.env, "Deferred returned without reply.defer()");
             self.end = Some(EndReason::ServiceClosed);
             return self.refuse(
                 io,
@@ -1688,16 +1515,16 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     /// so the connection closes after the reply.
     fn drop_rest_of_body(&mut self) {
         self.body_open = false;
-        if let Some(r) = self.request.as_mut() {
+        if let Some(r) = self.ex.request.as_mut() {
             r.discard_over = true;
         }
     }
 
     fn clear_body(&mut self) {
         if self.wipe {
-            crate::engine::wipe_bytes(&mut self.body);
+            crate::engine::wipe_bytes(&mut self.ex.body);
         }
-        self.body.clear();
+        self.ex.body.clear();
     }
 
     /// Encodes what the service answered: a whole reply or the head of a
@@ -1710,7 +1537,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let shared = Arc::clone(&self.shared);
         match shared
             .checkpoint
-            .check(&self.env, CheckpointAt::BeforeReply)
+            .check(&self.ex.env, CheckpointAt::BeforeReply)
         {
             Verdict::Pass => {}
             Verdict::Deny { status } => {
@@ -1723,7 +1550,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let before = self.out.len();
         if let Err(e) = shared.family.respond_stream(
             &mut self.engine,
-            &mut self.reply.parts,
+            &mut self.ex.reply.parts,
             false,
             last,
             0,
@@ -1731,12 +1558,12 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         ) {
             shared
                 .observer
-                .service_error(&self.env, "a reply part could not be encoded");
+                .service_error(&self.ex.env, "a reply part could not be encoded");
             self.end = Some(EndReason::ServiceClosed);
             return self.refuse(io, e.kind, e.status, None, RequestEnd::Refused(e.kind));
         }
         let written = (self.out.len() - before) as u64;
-        if let Some(r) = self.request.as_mut() {
+        if let Some(r) = self.ex.request.as_mut() {
             r.bytes_out = r.bytes_out.saturating_add(written);
         }
         if last {
@@ -1752,7 +1579,8 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     }
 
     fn slot_has_result(&self) -> bool {
-        self.defer
+        self.ex
+            .defer
             .as_ref()
             .is_some_and(|s| matches!(*s.lock(), SlotState::Completed(..) | SlotState::Dropped(_)))
     }
@@ -1765,7 +1593,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let shared = &*self.shared;
         match shared
             .checkpoint
-            .check(&self.env, CheckpointAt::BeforeReply)
+            .check(&self.ex.env, CheckpointAt::BeforeReply)
         {
             Verdict::Pass => {}
             Verdict::Deny { status } => {
@@ -1801,7 +1629,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             || io.draining()
             || pressured
             || matches!(control, ControlState::Draining | ControlState::Shed { .. })
-            || self.request.as_ref().is_some_and(|r| r.discard_over);
+            || self.ex.request.as_ref().is_some_and(|r| r.discard_over);
         if close {
             self.engine.close_after_reply();
             self.end.get_or_insert(if outcome == Outcome::Close {
@@ -1817,32 +1645,35 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             });
         }
         let unix = self.unix_secs(now);
-        let streamed = shared.family.reply_stream(&self.reply.parts);
+        let streamed = shared.family.reply_stream(&self.ex.reply.parts);
         let last = outcome != Outcome::More;
         let encoded = if streamed {
             shared.family.respond_stream(
                 &mut self.engine,
-                &mut self.reply.parts,
+                &mut self.ex.reply.parts,
                 true,
                 last,
                 unix,
                 &mut self.out,
             )
         } else {
-            shared
-                .family
-                .respond(&mut self.engine, &mut self.reply.parts, unix, &mut self.out)
+            shared.family.respond(
+                &mut self.engine,
+                &mut self.ex.reply.parts,
+                unix,
+                &mut self.out,
+            )
         };
         match encoded {
             Ok(status) => {
                 let body = if streamed {
                     0
                 } else {
-                    shared.family.reply_body(&self.reply.parts).len()
+                    shared.family.reply_body(&self.ex.reply.parts).len()
                 };
                 self.tail = (body > 0).then_some(0);
                 let n = (self.out.len() + body) as u64;
-                if let Some(r) = self.request.as_mut() {
+                if let Some(r) = self.ex.request.as_mut() {
                     r.status = Some(status);
                     r.bytes_out = n;
                 }
@@ -1850,14 +1681,14 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             Err(e) => {
                 shared
                     .observer
-                    .service_error(&self.env, "reply could not be encoded");
+                    .service_error(&self.ex.env, "reply could not be encoded");
                 self.end = Some(EndReason::ServiceClosed);
                 return self.refuse(io, e.kind, e.status, None, RequestEnd::Refused(e.kind));
             }
         }
         close |= !self.engine.keep_alive();
         self.closing_after_write = close;
-        self.reply_stream = !last && shared.family.reply_stream(&self.reply.parts);
+        self.reply_stream = !last && shared.family.reply_stream(&self.ex.reply.parts);
         self.state = if self.reply_stream {
             State::Streaming
         } else {
@@ -1885,7 +1716,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             self.state = State::Closed;
             return Step::Abort;
         }
-        if let Some(r) = self.request.as_mut() {
+        if let Some(r) = self.ex.request.as_mut() {
             r.status = Some(if (400..=599).contains(&status) {
                 status
             } else {
@@ -1904,7 +1735,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let draining = self.draining_now(io);
         self.count(io, Count::Refused { kind, draining });
         let n = self.out.len() as u64;
-        if let Some(r) = self.request.as_mut() {
+        if let Some(r) = self.ex.request.as_mut() {
             r.bytes_out = n;
         }
         self.finish_request(end);
@@ -1961,7 +1792,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     }
 
     fn cancel_deferred(&mut self) {
-        if let Some(slot) = &self.defer {
+        if let Some(slot) = &self.ex.defer {
             let left = core::mem::replace(&mut *slot.lock(), SlotState::Idle);
             if let SlotState::Completed(_, mut parts, _) = left {
                 // A reply that came and was never sent.
@@ -1973,80 +1804,30 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
 
     /// Gives back the worker's parked-request place, if this connection holds one.
     fn unpark(&mut self) {
-        if self.parked {
-            self.parked = false;
-            self.shared.counters.unpark(self.env.worker.get());
+        if self.ex.parked {
+            self.ex.parked = false;
+            self.shared.counters.unpark(self.ex.env.worker.get());
         }
     }
 
     /// Ends the current request: `done`, the observer, and admission release, once.
     fn finish_request(&mut self, end: RequestEnd) {
         self.upgrade = None;
-        let Some(r) = self.request.take() else { return };
-        let worker = self.env.worker.get();
-        let counters = &self.shared.counters;
-        counters.count(worker, Count::Requests);
-        match end {
-            RequestEnd::Replied => counters.count(worker, Count::Replied),
-            RequestEnd::Shed => counters.count(worker, Count::Shed),
-            RequestEnd::Denied => counters.count(worker, Count::Denied),
-            RequestEnd::TimedOut => counters.count(worker, Count::TimedOut),
-            _ => {}
+        if self.ex.request.is_none() {
+            return;
         }
         let live = matches!(
             self.checkpoint(),
             ControlState::Draining | ControlState::Stopping
         );
         self.draining_seen |= live;
-        let counters = &self.shared.counters;
-        if self.draining_seen {
-            counters.count(worker, Count::FinishedDraining);
-        }
-        let finished = Finished {
-            head_reads: r.head_reads,
-            status: r.status,
-            end,
-            bytes_in: r.bytes_in,
-            bytes_out: r.bytes_out,
-            head_at: r.head_at,
-            admitted_at: r.admitted_at,
-            replied_at: if end == RequestEnd::Replied {
-                Some(Instant::now())
-            } else {
-                None
-            },
-        };
-        let shared = &*self.shared;
-        // Released when this scope ends, after `done` and the observer, and
-        // on an unwind out of either: a permit is never lost (D-111).
-        let release = Release {
-            admit: &shared.admit,
-            env: &self.env,
-            admitted: r.admitted,
-        };
-        if shared.catch_panics {
-            let done = catch_unwind(AssertUnwindSafe(|| {
-                shared.service.done(&self.env, &finished)
-            }));
-            if done.is_err() {
-                shared
-                    .observer
-                    .service_error(&self.env, "the service panicked in done");
-            }
-        } else {
-            shared.service.done(&self.env, &finished);
-        }
-        shared.observer.request_finished(&self.env, &finished);
-        drop(release);
-        if self.wipe {
-            crate::engine::wipe_bytes(&mut self.body);
-        }
-        self.body.clear();
+        self.ex
+            .finish(&self.shared, end, self.draining_seen, self.wipe);
     }
 
     /// The current envelope (tests).
     #[cfg(test)]
     pub(crate) fn envelope(&self) -> &Envelope {
-        &self.env
+        &self.ex.env
     }
 }

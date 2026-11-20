@@ -78,11 +78,11 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let tables = Arc::clone(&self.tables);
         let Some(compiled) = tables
             .profiles
-            .compiled(ws.profile.unwrap_or(self.env.profile))
+            .compiled(ws.profile.unwrap_or(self.ex.env.profile))
         else {
             shared
                 .observer
-                .service_error(&self.env, "upgrade to a profile that does not exist");
+                .service_error(&self.ex.env, "upgrade to a profile that does not exist");
             self.end = Some(EndReason::Refused);
             return self.refuse(
                 io,
@@ -105,7 +105,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         {
             if e.kind == RefusalKind::Internal {
                 shared.observer.service_error(
-                    &self.env,
+                    &self.ex.env,
                     "an upgrade the request did not offer, or a subprotocol it did not offer",
                 );
                 self.end = Some(EndReason::Refused);
@@ -114,7 +114,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             }
             return self.refuse(io, e.kind, e.status, None, RequestEnd::Refused(e.kind));
         }
-        if let Some(r) = self.request.as_mut() {
+        if let Some(r) = self.ex.request.as_mut() {
             r.status = Some(101);
             r.bytes_out += self.out.len() as u64;
         }
@@ -243,7 +243,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         self.shared.control.unregister_upgraded(self.connection);
         link.outbox.close(self.wipe);
         if link.opened {
-            link.service.closed(&self.env, link.code);
+            link.service.closed(&self.ex.env, link.code);
         }
         link.release(self.wipe);
     }
@@ -265,12 +265,12 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             self.out.clear(self.wipe);
             self.out.shrink(0);
             self.out_sent = 0;
-            if self.request.is_some() {
+            if self.ex.request.is_some() {
                 io.set_phase(Phase::Sending);
                 return (0, Step::Write);
             }
         }
-        if self.request.is_some() {
+        if self.ex.request.is_some() {
             self.finish_request(RequestEnd::Upgraded);
             self.ws_open(io, link);
         }
@@ -369,23 +369,23 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
             .register_upgraded(self.connection, io.waker());
         let shared = Arc::clone(&self.shared);
         let conn = UpgradedConn {
-            env: self.env.clone(),
+            env: self.ex.env.clone(),
             protocol: "websocket",
             subprotocol: link.subprotocol,
         };
         let catch = shared.catch_panics;
         if catch {
-            let env = &self.env;
+            let env = &self.ex.env;
             if catch_unwind(AssertUnwindSafe(|| shared.service.upgraded(env, conn))).is_err() {
                 self.ws_panicked(link);
             }
         } else {
-            shared.service.upgraded(&self.env, conn);
+            shared.service.upgraded(&self.ex.env, conn);
         }
         // The HTTP engine and the body buffer are not used again.
         self.engine.reset();
         let _ = self.engine.shrink_idle();
-        self.body = Vec::new();
+        self.ex.body = Vec::new();
         let now = io.now();
         link.last_input = now;
         link.timer = now + link.interval;
@@ -397,7 +397,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         }
         // From here `closed` follows, whatever `opened` does.
         link.opened = true;
-        let env = &self.env;
+        let env = &self.ex.env;
         let mut wc = WebSocketConn {
             conn: &mut link.conn,
             max_pending: link.max_pending,
@@ -504,7 +504,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         let critical = self
             .tables
             .profiles
-            .compiled(self.env.profile)
+            .compiled(self.ex.env.profile)
             .is_some_and(|c| c.profile.critical);
         let refused = match self.checkpoint() {
             ControlState::Draining | ControlState::Stopping => {
@@ -515,7 +515,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 self.end = Some(EndReason::Shed);
                 Some((ws_net::CloseCode::TRY_AGAIN_LATER, "try again later"))
             }
-            ControlState::Shed { from_lane } if self.env.lane >= from_lane => {
+            ControlState::Shed { from_lane } if self.ex.env.lane >= from_lane => {
                 self.end = Some(EndReason::Shed);
                 Some((ws_net::CloseCode::TRY_AGAIN_LATER, "try again later"))
             }
@@ -529,7 +529,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
         match self
             .shared
             .checkpoint
-            .check(&self.env, CheckpointAt::BeforeDispatch)
+            .check(&self.ex.env, CheckpointAt::BeforeDispatch)
         {
             Verdict::Pass => Gate::Deliver,
             Verdict::Deny { .. } => {
@@ -566,7 +566,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
                 outbox,
             };
             let service = &**service;
-            let env = &self.env;
+            let env = &self.ex.env;
             if catch {
                 catch_unwind(AssertUnwindSafe(|| service.message(env, message, &mut wc))).is_err()
             } else {
@@ -583,7 +583,7 @@ impl<F: Family, S: Service<F>, H: Hooks> Conn<F, S, H> {
     fn ws_panicked(&mut self, link: &mut WsLink) {
         self.shared
             .observer
-            .service_error(&self.env, "the service panicked");
+            .service_error(&self.ex.env, "the service panicked");
         self.end = Some(EndReason::ServicePanic);
         self.ws_close(link, ws_net::CloseCode::INTERNAL_ERROR, "");
         link.timer = Instant::now() + CLOSE_WAIT;

@@ -8,10 +8,11 @@ use std::time::Duration;
 
 use super::*;
 use crate::config::{Budget, Profile};
-use crate::hooks::{HookSet, InFlightCap, Inline, NoCheckpoint, NoObserver};
+use crate::hooks::{Admit, HookSet, InFlightCap, Inline, NoCheckpoint, NoObserver};
 use crate::http::{HttpFamily, HttpHead, HttpReply, HttpRequest, HttpService};
 use crate::net::{Lane, NoControl, SimpleControl};
 use crate::reply::ReplyToken;
+use crate::service::{Finished, HeadAction};
 use crate::testing::{SimIo, TestReply, TestRequest, shared, shared_with};
 
 /// Counts calls so the `done`-exactly-once invariant can be checked.
@@ -119,7 +120,7 @@ fn test_idle_trim_keeps_the_connection_and_frees_its_buffers() {
     assert_eq!(io.phase, Phase::Idle);
     assert_eq!(io.deadline, None, "the trim does not re-arm");
     assert_eq!(c.out.capacity(), 0);
-    assert_eq!(c.body.capacity(), 0);
+    assert_eq!(c.ex.body.capacity(), 0);
     // The next request is served as before.
     io.written.clear();
     let _ = c.on_data(&mut io, GET);
@@ -822,7 +823,7 @@ fn test_wipe_buffers_pool_holds_only_zeroes() {
         &mut io,
         b"POST /s HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\n\r\nsecret",
     );
-    assert!(c.body.is_empty());
+    assert!(c.ex.body.is_empty());
     assert!(c.out.is_empty());
 }
 
